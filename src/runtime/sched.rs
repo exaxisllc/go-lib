@@ -671,10 +671,13 @@ mod tests {
     #[test]
     fn global_run_queue_round_trip() {
         use crate::runtime::g::{Stack, G};
+        use crate::runtime::p::GlobalRunQueue;
 
-        let s = sched();
-        // Drain any leftover entries from other tests.
-        while !unsafe { s.global_run_q.pop() }.is_null() {}
+        // Use a STANDALONE queue, not `sched().global_run_q`.
+        // The live global queue is shared with background M-threads that call
+        // findrunnable() and would immediately execute any G we push there —
+        // a fake G with a non-mmap'd stack would SIGSEGV on context switch.
+        let q = GlobalRunQueue::new();
 
         let lo    = 0x200000usize;
         let g1    = G::new(Stack { lo, hi: lo + 65536 }, 99);
@@ -682,11 +685,11 @@ mod tests {
 
         unsafe {
             (*g1_ptr).schedlink = ptr::null_mut();
-            s.global_run_q.push_batch(g1_ptr, g1_ptr, 1);
-            assert_eq!(s.global_run_q.len(), 1);
-            let got = s.global_run_q.pop();
+            q.push_batch(g1_ptr, g1_ptr, 1);
+            assert_eq!(q.len(), 1);
+            let got = q.pop();
             assert_eq!(got, g1_ptr);
-            assert_eq!(s.global_run_q.len(), 0);
+            assert_eq!(q.len(), 0);
             let _ = Box::from_raw(g1_ptr);
         }
     }
