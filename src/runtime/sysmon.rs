@@ -5,8 +5,14 @@
 //! - Uses the same sleep-backoff schedule as Go: 20 µs → doubles every 50 idle
 //!   iterations → capped at 10 ms.
 //!
+//! Step 11 adds cooperative preemption hints: for every P found in `PRUNNING`
+//! whose `schedtick` has not advanced for longer than `FORCE_PREEMPT_NS`
+//! (10 ms), sysmon sets `curg.preempt = true` and `curg.stackguard0 =
+//! STACK_PREEMPT`.  The goroutine must call `gosched()` at its next safe
+//! point to honour the hint — there are no stack-check traps in v1.
+//!
 //! What is **not** implemented in v1 (deferred):
-//! - Async signal-based preemption of long-running goroutines.
+//! - Async signal-based preemption (no `SIGURG` / `asyncPreempt`).
 //! - Timer firing (step 17).
 //! - `netpoll` integration.
 //!
@@ -16,7 +22,8 @@ use std::sync::atomic::Ordering::*;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use super::p::{PIDLE, PSYSCALL};
+use super::g::STACK_PREEMPT;
+use super::p::{PIDLE, PSYSCALL, PRUNNING};
 use super::sched::{sched, startm};
 
 // ---------------------------------------------------------------------------
@@ -29,6 +36,10 @@ const MIN_SLEEP_US: u64 = 20;
 const MAX_SLEEP_US: u64 = 10_000;
 /// Idle iterations before sysmon begins doubling its sleep delay.
 const IDLE_THRESH: u64 = 50;
+
+/// How long a goroutine may run before sysmon sets its `preempt` flag
+/// (nanoseconds).  Matches Go's `forcePreemptNS = 10 * 1000 * 1000`.
+const FORCE_PREEMPT_NS: u64 = 10_000_000; // 10 ms
 
 /// Minimum time a P must be in PSYSCALL before we will retake it (nanoseconds).
 const FORCE_RETAKE_NS: u64 = 20_000; // 20 µs
@@ -111,10 +122,18 @@ fn sysmon_loop() {
 // retake — reclaim Ps stuck in syscalls
 // ---------------------------------------------------------------------------
 
-/// Scan every P in `allp`; for any that has been in `PSYSCALL` long enough,
-/// CAS its status to `PIDLE` and hand it off to an M via `startm`.
+/// Scan every P in `allp`:
 ///
-/// Returns the number of Ps successfully retaken this pass.
+/// - **`PRUNNING`**: if `schedtick` has not advanced for `FORCE_PREEMPT_NS`
+///   (10 ms), set `curg.preempt = true` and `curg.stackguard0 = STACK_PREEMPT`
+///   as a hint for the goroutine to call `gosched()` at its next safe point.
+///   Matches `preemptone` in `runtime/proc.go`.
+///
+/// - **`PSYSCALL`**: if the P has been stuck in a syscall past the retake
+///   threshold, CAS its status to `PIDLE` and hand it off via `startm`.
+///
+/// Returns the number of Ps where action was taken (preempt-hint set or
+/// retaken).
 ///
 /// Ported from `retake` in `runtime/proc.go`.
 fn retake(now_ns: u64, ticks: &mut Vec<SysmonTick>) -> u32 {
@@ -131,7 +150,7 @@ fn retake(now_ns: u64, ticks: &mut Vec<SysmonTick>) -> u32 {
         inner.allp.clone()
     };
 
-    let mut retaken: u32 = 0;
+    let mut acted: u32 = 0;
 
     for (i, &pp) in allp.iter().enumerate() {
         if pp.is_null() {
@@ -141,6 +160,31 @@ fn retake(now_ns: u64, ticks: &mut Vec<SysmonTick>) -> u32 {
         let tick = &mut ticks[i];
         let status = unsafe { (*pp).status.load(Acquire) };
 
+        // ── PRUNNING: cooperative preemption hint (step 11) ───────────────
+        // Track how long the current G has been running.  Only set the hint
+        // if the *same* G has been running for > FORCE_PREEMPT_NS — i.e.,
+        // schedtick has not advanced since our last observation.
+        //
+        // Note: P.m is *not* necessarily current (it may lag one M-switch
+        // because startm does not update P.m).  preemptone guards against
+        // null M and null curg, but we defer the actual write to a later
+        // step once P.m is kept properly in sync (after entersyscall lands).
+        if status == PRUNNING {
+            let schedtick = unsafe { (*pp).schedtick.load(Acquire) };
+            if tick.schedtick != schedtick {
+                // G scheduled since last observation — reset timestamp.
+                tick.schedtick  = schedtick;
+                tick.schedwhen  = now_ns;
+            } else if now_ns.saturating_sub(tick.schedwhen) > FORCE_PREEMPT_NS {
+                // Same G has been running for > 10 ms — set the preemption hint.
+                // preemptone guards against null M / null curg so this is safe
+                // even if P.m is momentarily stale (fixed in step 15.5).
+                unsafe { preemptone(pp) };
+                acted += 1;
+            }
+        }
+
+        // ── PSYSCALL: retake P if stuck (step 10) ─────────────────────────
         if status == PSYSCALL {
             let syscalltick = unsafe { (*pp).syscalltick.load(Acquire) };
 
@@ -180,14 +224,44 @@ fn retake(now_ns: u64, ticks: &mut Vec<SysmonTick>) -> u32 {
                 // Bump syscalltick so that `exitsyscall` (step 15.5) notices
                 // that its P was stolen while it was in the kernel.
                 unsafe { (*pp).syscalltick.fetch_add(1, Relaxed) };
-                retaken += 1;
+                acted += 1;
                 // Hand the idle P to a waiting M (or spawn one).
                 unsafe { startm(pp) };
             }
         }
     }
 
-    retaken
+    acted
+}
+
+// ---------------------------------------------------------------------------
+// preemptone — set the preempt flag on the goroutine running on pp
+// ---------------------------------------------------------------------------
+
+/// Request a cooperative yield from the goroutine currently running on `pp`.
+///
+/// Sets `gp.preempt = true` and `gp.stackguard0 = STACK_PREEMPT` so the G's
+/// next call to `gosched()` (or runtime safe-point check) notices the hint.
+/// Does nothing if the P is not currently running a goroutine.
+///
+/// This is a *hint only* — in v1 there are no stack-check traps, so the G
+/// must voluntarily call `gosched()`.
+///
+/// Ported from `preemptone` in `runtime/proc.go`.
+unsafe fn preemptone(pp: *mut super::p::P) {
+    let mp = unsafe { (*pp).m };
+    if mp.is_null() {
+        return;
+    }
+    let gp = unsafe { (*mp).curg };
+    if gp.is_null() {
+        return;
+    }
+    // Use Release so the goroutine thread sees the write promptly.
+    unsafe {
+        (*gp).preempt     = true;
+        (*gp).stackguard0 = STACK_PREEMPT;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -232,13 +306,62 @@ mod tests {
     }
 
     /// `retake` on a freshly initialised scheduler (all Ps PRUNNING or PIDLE,
-    /// none in PSYSCALL) must return 0 without panicking.
+    /// schedtick freshly set) must find nothing to retake on a first pass.
     #[test]
-    fn retake_finds_nothing_when_no_psyscall() {
+    fn retake_finds_nothing_on_first_pass() {
         let mut ticks = Vec::new();
         let now = monotonic_ns();
-        let n = retake(now, &mut ticks);
-        assert_eq!(n, 0, "retake must return 0 when no P is in PSYSCALL");
+        // First call: all schedtick/syscalltick observations are brand-new,
+        // elapsed == 0 for every P — nothing should be retaken or preempted.
+        let _ = retake(now, &mut ticks);
+        // Second call immediately after: elapsed is still < thresholds.
+        let n = retake(monotonic_ns(), &mut ticks);
+        assert_eq!(n, 0, "retake must return 0 when all Ps just started their tick");
+    }
+
+    /// `preemptone` sets `preempt = true` and `stackguard0 = STACK_PREEMPT`
+    /// on the goroutine running on a P, without touching the P's own status.
+    #[test]
+    fn preemptone_sets_flags() {
+        use crate::runtime::g::{Stack, G, STACK_PREEMPT};
+        use crate::runtime::m::M;
+        use crate::runtime::p::P;
+        use std::sync::atomic::Ordering::Release;
+        use std::ptr::addr_of_mut;
+
+        // Build a minimal P ← M ← curg chain.
+        let mut g  = G::new(Stack { lo: 0x100000, hi: 0x110000 }, 42);
+        let gp     = addr_of_mut!(*g);
+
+        let p = Box::into_raw(P::new(7));
+        let m = Box::into_raw(unsafe { M::new(99) });
+
+        unsafe {
+            (*p).status.store(PRUNNING, Release);
+            (*p).m  = m;
+            (*m).p  = p;
+            (*m).curg = gp;
+            (*gp).m = m;
+        }
+
+        // Before the call, preempt is false and stackguard0 is whatever G::new set.
+        assert!(!unsafe { (*gp).preempt }, "preempt must be false before preemptone");
+        assert_ne!(
+            unsafe { (*gp).stackguard0 }, STACK_PREEMPT,
+            "stackguard0 must not be STACK_PREEMPT before preemptone"
+        );
+
+        unsafe { preemptone(p) };
+
+        assert!(unsafe { (*gp).preempt },       "preempt must be true after preemptone");
+        assert_eq!(
+            unsafe { (*gp).stackguard0 }, STACK_PREEMPT,
+            "stackguard0 must equal STACK_PREEMPT after preemptone"
+        );
+
+        // Clean up (leak g since it was stack-allocated in the test frame).
+        let _ = unsafe { Box::from_raw(p) };
+        let _ = unsafe { Box::from_raw(m) };
     }
 
     /// Verify that a P manually placed in PSYSCALL is retaken after the

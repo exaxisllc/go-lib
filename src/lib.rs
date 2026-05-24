@@ -43,3 +43,36 @@ mod go_macro;
 pub fn run<F: FnOnce() + Send + 'static>(f: F) {
     runtime::sched::run_impl(f);
 }
+
+/// Yield the CPU, giving other goroutines a chance to run.
+///
+/// Moves the current goroutine to the back of the global run queue and
+/// re-enters the scheduler.  Execution resumes at the next `gosched()` call
+/// site once the goroutine is rescheduled.
+///
+/// CPU-bound loops should call `gosched()` periodically.  The background
+/// sysmon thread also sets a preemption hint after 10 ms, but because v1 has
+/// no stack-check traps the goroutine must call `gosched()` voluntarily for
+/// the hint to take effect.
+///
+/// # Panics
+///
+/// Panics if called from outside a goroutine (e.g. from `main` before
+/// calling [`run`]).
+///
+/// # Example
+///
+/// ```no_run
+/// go_lib::run(|| {
+///     for i in 0..1_000_000 {
+///         if i % 10_000 == 0 {
+///             go_lib::gosched(); // let other goroutines run
+///         }
+///     }
+/// });
+/// ```
+pub fn gosched() {
+    // SAFETY: we are on a goroutine stack (enforced by the debug_assert inside
+    // the internal gosched that current_g() is non-null).
+    unsafe { runtime::sched::gosched() }
+}

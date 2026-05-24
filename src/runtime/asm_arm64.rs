@@ -72,7 +72,15 @@ unsafe extern "C" fn gogo_asm(buf: *mut Gobuf) -> ! {
 // ---------------------------------------------------------------------------
 
 /// Save the current goroutine's registers into `g_sched`, switch to g0's
-/// stack, and call `fn_ptr(g)`.  Never returns.
+/// stack, and call `fn_ptr(g)`.  Never returns via the normal path.
+///
+/// The return type is `()` (not `!`) deliberately: the Rust compiler must
+/// generate a proper epilogue (`ldp x29,x30,[sp],#16; ret`) for `mcall()`
+/// after the `blr mcall_asm` instruction.  `gogo_asm` resumes a goroutine
+/// by jumping to `g_sched.pc`, which is the LR value saved here — i.e., the
+/// address of that epilogue.  Executing it unwinds the `mcall` and caller
+/// (`gosched`/`gopark`) frames normally, returning control to the goroutine's
+/// user code — exactly the same sequence Go uses.
 ///
 /// Ported from `runtime·mcall` in `runtime/asm_arm64.s`.
 ///
@@ -81,7 +89,9 @@ unsafe extern "C" fn gogo_asm(buf: *mut Gobuf) -> ! {
 /// - `x1` = g_sched    (*mut Gobuf — &(*g).sched, pre-computed by wrapper)
 /// - `x2` = g0_gobuf   (*mut Gobuf — &(*g0).sched, from G0_SCHED TLS)
 /// - `x3` = fn_ptr     (unsafe extern "C" fn(*mut G))
-/// - `x30`= return address (caller's PC, saved as g_sched.pc)
+/// - `x30`= LR / return address — the return address of `blr mcall_asm`
+///          inside `mcall()`, i.e., the address of `mcall`'s epilogue.
+///          Saved as `g_sched.pc` so `gogo` can resume there.
 /// - `sp` = caller's stack pointer (saved as g_sched.sp)
 ///
 /// After the stack switch the call `blr x3` runs on g0's stack.  `fn_ptr`
@@ -93,7 +103,7 @@ unsafe extern "C" fn mcall_asm(
     _g_sched:  *mut Gobuf,
     _g0_gobuf: *mut Gobuf,
     _fn_ptr:   unsafe extern "C" fn(*mut G),
-) -> ! {
+) {
     core::arch::naked_asm!(
         // ── save current goroutine's context into g_sched (x1) ───────────
         // On AArch64 the return address is always in x30 (LR) on function
@@ -148,16 +158,21 @@ pub(crate) unsafe fn gogo(g: *mut G) -> ! {
 }
 
 /// Save the current goroutine's state into `g.sched` and switch to g0's
-/// stack, calling `fn_ptr(g)` there.  Never returns.
+/// stack, calling `fn_ptr(g)` there.
 ///
-/// `fn_ptr` must loop back into the scheduler (call `schedule()`) or hand
-/// off execution via `gogo()`.  It must not return to its caller.
+/// `fn_ptr` must eventually call `schedule()` or hand off via `gogo()` and
+/// must not return to its caller.
+///
+/// The return type is `()` (not `!`) for the same reason as `mcall_asm`: the
+/// compiler must emit an epilogue after `blr mcall_asm` so that `gogo` can
+/// resume the goroutine by jumping to that epilogue and returning through the
+/// call stack normally.
 ///
 /// Requires `G0_SCHED` to be initialised by `M::new` (step 6); panics in
 /// debug builds if it has not been set yet.
 ///
 /// Ported from `runtime·mcall` in `runtime/proc.go` + `runtime/asm_arm64.s`.
-pub(crate) unsafe fn mcall(g: *mut G, fn_ptr: unsafe extern "C" fn(*mut G)) -> ! {
+pub(crate) unsafe fn mcall(g: *mut G, fn_ptr: unsafe extern "C" fn(*mut G)) {
     unsafe {
         let g_sched  = addr_of_mut!((*g).sched);
         let g0_gobuf = G0_SCHED.with(|c| c.get());
@@ -165,7 +180,12 @@ pub(crate) unsafe fn mcall(g: *mut G, fn_ptr: unsafe extern "C" fn(*mut G)) -> !
             !g0_gobuf.is_null(),
             "mcall: G0_SCHED is null — M::new must be called before spawning goroutines (step 6)",
         );
-        mcall_asm(g, g_sched, g0_gobuf, fn_ptr)
+        mcall_asm(g, g_sched, g0_gobuf, fn_ptr);
+        // mcall_asm switches to g0 and calls fn_ptr (which calls schedule,
+        // an infinite loop).  Execution never reaches here during normal
+        // forward flow.  When gogo() later resumes this goroutine it jumps
+        // directly to the epilogue of this function (the instruction after
+        // `blr mcall_asm`), unwinding the frame chain back to the user code.
     }
 }
 
