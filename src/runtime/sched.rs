@@ -22,10 +22,11 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, Ordering::*
 use std::sync::{Mutex, OnceLock};
 
 use super::g::{current_g, set_current_g, G, GDEAD, GRUNNABLE, GRUNNING};
-use super::m::{current_m, set_current_m, M};
+use super::m::{current_m, M};
 use super::p::{GlobalRunQueue, P, PIDLE, PRUNNING};
 use super::stack::stack_alloc;
 use super::sysmon::start_sysmon;
+use super::time::start_timer_thread;
 
 #[cfg(target_arch = "x86_64")]
 use super::asm_amd64::{gogo, mcall};
@@ -97,7 +98,7 @@ pub(crate) fn sched() -> &'static Sched {
 ///
 /// Ported from `schedule` in `runtime/proc.go`.
 pub(crate) unsafe fn schedule() -> ! {
-    let m = unsafe { current_m() };
+    let m = current_m();
     debug_assert!(!m.is_null(), "schedule: CURRENT_M is null — call set_current_m first");
 
     loop {
@@ -108,7 +109,7 @@ pub(crate) unsafe fn schedule() -> ! {
         // 61 is a prime chosen by Go so the check is not aligned to any bursty
         // producer period.
         let tick = unsafe { (*p).schedtick.load(Relaxed) };
-        if tick % 61 == 0 && unsafe { sched().global_run_q.len() > 0 } {
+        if tick % 61 == 0 && sched().global_run_q.len() > 0 {
             let gp = unsafe { sched().global_run_q.pop() };
             if !gp.is_null() {
                 unsafe { execute(gp) }; // -> !
@@ -146,7 +147,7 @@ pub(crate) unsafe fn schedule() -> ! {
 ///
 /// Ported from `findrunnable` in `runtime/proc.go` (trimmed for v1).
 pub(crate) unsafe fn findrunnable() -> *mut G {
-    let m  = unsafe { current_m() };
+    let m  = current_m();
     let sc = sched();
 
     loop {
@@ -212,7 +213,7 @@ pub(crate) unsafe fn findrunnable() -> *mut G {
 ///
 /// Ported from `stopm` in `runtime/proc.go`.
 unsafe fn stopm() {
-    let m  = unsafe { current_m() };
+    let m  = current_m();
     let sc = sched();
 
     // Surrender P under the scheduler lock.
@@ -317,7 +318,7 @@ pub(crate) unsafe fn startm(p: *mut P) {
 ///
 /// Ported from `execute` in `runtime/proc.go`.
 pub(crate) unsafe fn execute(gp: *mut G) -> ! {
-    let m = unsafe { current_m() };
+    let m = current_m();
 
     unsafe {
         (*m).curg  = gp;
@@ -349,7 +350,7 @@ pub(crate) unsafe fn execute(gp: *mut G) -> ! {
 ///
 /// Ported from `goexit0` in `runtime/proc.go`.
 pub(crate) unsafe extern "C" fn goexit0(gp: *mut G) {
-    let m = unsafe { current_m() };
+    let m = current_m();
 
     unsafe {
         (*gp).atomicstatus.store(GDEAD, Release);
@@ -373,14 +374,14 @@ pub(crate) unsafe extern "C" fn goexit0(gp: *mut G) {
 ///
 /// Ported from `Gosched` / `gosched_m` in `runtime/proc.go`.
 pub(crate) unsafe fn gosched() {
-    let gp = unsafe { current_g() };
+    let gp = current_g();
     debug_assert!(!gp.is_null(), "gosched: called from g0 or uninitialised thread");
     unsafe { mcall(gp, gosched_m) };
 }
 
 /// Mcall target for `gosched`.  Runs on g0's stack.
 unsafe extern "C" fn gosched_m(gp: *mut G) {
-    let m = unsafe { current_m() };
+    let m = current_m();
 
     unsafe {
         (*gp).atomicstatus.store(GRUNNABLE, Release);
@@ -504,7 +505,7 @@ pub(crate) fn new_goroutine(f: impl FnOnce() + Send + 'static) -> Box<G> {
     // Heap-allocate the closure behind a thin pointer and store it in ctxt.
     let go_fn   = Box::new(GoFn(Box::new(f)));
     g.sched.ctxt = Box::into_raw(go_fn) as *mut u8;
-    g.sched.pc   = goroutine_entry as usize;
+    g.sched.pc   = goroutine_entry as *const () as usize;
 
     // Architecture-specific: wire the goexit_trampoline as the return target.
     #[cfg(target_arch = "x86_64")]
@@ -513,7 +514,7 @@ pub(crate) fn new_goroutine(f: impl FnOnce() + Send + 'static) -> Box<G> {
         // set sp to point at that word.  goroutine_entry's `ret` pops it and
         // jumps there.
         let ret_slot = (g.stack.hi - 8) as *mut usize;
-        unsafe { ret_slot.write(goexit_trampoline as usize) };
+        unsafe { ret_slot.write(goexit_trampoline as *const () as usize) };
         g.sched.sp = g.stack.hi - 8;
         g.sched.bp = 0; // null frame-pointer marks the root of the call chain
     }
@@ -586,6 +587,8 @@ pub(crate) fn schedinit(nprocs: i32) {
 
     // Start the background monitor thread (sysmon).
     start_sysmon();
+    // Start the background timer thread.
+    start_timer_thread();
 }
 
 /// Allocate a new M, wire it to `p`, and spawn an OS thread that runs the
@@ -713,12 +716,12 @@ mod tests {
                 // sp points one word below stack.hi; that word holds goexit_trampoline.
                 assert_eq!((*g_ptr).sched.sp, (*g_ptr).stack.hi - 8);
                 let ret_addr = ((*g_ptr).sched.sp as *const usize).read();
-                assert_eq!(ret_addr, goexit_trampoline as usize);
+                assert_eq!(ret_addr, goexit_trampoline as *const () as usize);
             }
             #[cfg(target_arch = "aarch64")]
             {
                 assert_eq!((*g_ptr).sched.sp, (*g_ptr).stack.hi);
-                assert_eq!((*g_ptr).sched.lr, goexit_trampoline as usize);
+                assert_eq!((*g_ptr).sched.lr, goexit_trampoline as *const () as usize);
             }
 
             // Drop the G — the closure and stack will be leaked here since G has
