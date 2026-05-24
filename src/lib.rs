@@ -26,3 +26,20 @@ pub mod select;
 pub mod sync;
 
 mod go_macro;
+
+/// Initialise the go-lib scheduler and run `f` as the first goroutine.
+///
+/// Blocks the calling thread until `f` returns.  The scheduler threads
+/// (one per logical CPU) continue running in the background after `run`
+/// returns; they park themselves when there is no more work.
+///
+/// # Example
+///
+/// ```no_run
+/// go_lib::run(|| {
+///     println!("hello from a goroutine");
+/// });
+/// ```
+pub fn run<F: FnOnce() + Send + 'static>(f: F) {
+    runtime::sched::run_impl(f);
+}
