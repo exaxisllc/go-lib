@@ -25,6 +25,7 @@ use super::g::{current_g, set_current_g, G, GDEAD, GRUNNABLE, GRUNNING};
 use super::m::{current_m, set_current_m, M};
 use super::p::{GlobalRunQueue, P, PIDLE, PRUNNING};
 use super::stack::stack_alloc;
+use super::sysmon::start_sysmon;
 
 #[cfg(target_arch = "x86_64")]
 use super::asm_amd64::{gogo, mcall};
@@ -574,6 +575,9 @@ pub(crate) fn schedinit(nprocs: i32) {
         let id = NEXT_MID.fetch_add(1, Relaxed);
         unsafe { spawn_m(id, p_ptr) };
     }
+
+    // Start the background monitor thread (sysmon).
+    start_sysmon();
 }
 
 /// Allocate a new M, wire it to `p`, and spawn an OS thread that runs the

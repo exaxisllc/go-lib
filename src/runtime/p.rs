@@ -179,6 +179,13 @@ pub(crate) struct P {
     /// Used by `schedule` to check the global run queue every 61 ticks.
     pub schedtick: AtomicU32,
 
+    /// Monotonically-increasing count of syscalls entered on this P.
+    /// Bumped by `entersyscall` (step 15.5) and by `retake` when it steals
+    /// the P, so `exitsyscall` can detect that its P was taken away.
+    ///
+    /// Ported from `p.syscalltick` in `runtime/runtime2.go`.
+    pub syscalltick: AtomicU32,
+
     // ── scheduler links ───────────────────────────────────────────────────
     /// Intrusive link for the idle-P list maintained by the scheduler (step 8).
     pub link: *mut P,
@@ -203,9 +210,10 @@ impl P {
             runqhead: AtomicU32::new(0),
             runqtail: AtomicU32::new(0),
             runq:     std::array::from_fn(|_| AtomicUsize::new(0)),
-            runnext:   AtomicUsize::new(0),
-            schedtick: AtomicU32::new(0),
-            link:      std::ptr::null_mut(),
+            runnext:     AtomicUsize::new(0),
+            schedtick:   AtomicU32::new(0),
+            syscalltick: AtomicU32::new(0),
+            link:        std::ptr::null_mut(),
         })
     }
 
