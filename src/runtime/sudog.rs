@@ -32,9 +32,10 @@
 //! Ported from `waitq` / `waitq.enqueue` / `waitq.dequeue` in
 //! `runtime/runtime2.go` and `runtime/chan.go`.
 
+use std::sync::atomic::Ordering;
 use std::sync::Mutex;
 
-use super::g::{G, GWAITING};
+use super::g::G;
 
 // ---------------------------------------------------------------------------
 // Sudog
@@ -92,6 +93,15 @@ pub(crate) struct Sudog {
     /// completed the complementary operation.  Mirrors Go's `sudog.success`.
     pub success: bool,
 
+    /// Whether `elem` points to a heap-allocated `Box<MaybeUninit<T>>` that
+    /// must be freed after the value is consumed.
+    ///
+    /// `true`  — allocated by `chansend` / `chanrecv` blocking paths; the
+    ///           receiving side must call `Box::from_raw(elem)` after reading.
+    /// `false` — `elem` is a direct pointer (goroutine stack or select slot);
+    ///           the receiving side must NOT call `Box::from_raw`.
+    pub boxed_elem: bool,
+
     /// The channel this sudog is queued on.
     ///
     /// Typed `*mut u8` until `chan::Hchan` is defined (step 13).
@@ -109,13 +119,14 @@ impl Sudog {
     /// sanitising a recycled instance before handing it to the caller.
     fn zeroed() -> Self {
         Sudog {
-            g:         std::ptr::null_mut(),
-            next:      std::ptr::null_mut(),
-            prev:      std::ptr::null_mut(),
-            elem:      std::ptr::null_mut(),
-            is_select: false,
-            success:   false,
-            c:         std::ptr::null_mut(),
+            g:          std::ptr::null_mut(),
+            next:       std::ptr::null_mut(),
+            prev:       std::ptr::null_mut(),
+            elem:       std::ptr::null_mut(),
+            is_select:  false,
+            success:    false,
+            boxed_elem: false,
+            c:          std::ptr::null_mut(),
         }
     }
 }
@@ -180,9 +191,14 @@ impl WaitQ {
 
     /// Remove and return the oldest waiter, or `null` if the queue is empty.
     ///
-    /// Skips any sudog whose goroutine is no longer in `GWAITING` — this can
-    /// occur in `select` when a competing case wins the race and the loser's
-    /// goroutine transitions to `GRUNNABLE` before we dequeue it.
+    /// For `is_select` sudogs (enrolled in a `select` statement) the function
+    /// races via `g.selectdone` (a CAS 0 → 1) to claim the win.  Only one
+    /// case across all channels may claim the same goroutine; losers are
+    /// **unlinked from this queue but not released** — `selectgo`'s cleanup
+    /// phase releases them after re-acquiring all locks.
+    ///
+    /// Non-select sudogs are always returned without further filtering; by
+    /// invariant they are in `GWAITING` when `dequeue` is called.
     ///
     /// The returned sudog has its `next` and `prev` fields cleared.
     ///
@@ -202,22 +218,22 @@ impl WaitQ {
             } else {
                 unsafe { (*next).prev = std::ptr::null_mut() };
                 self.first = next;
-                unsafe { (*sgp).next = std::ptr::null_mut() }; // mark removed
+                unsafe { (*sgp).next = std::ptr::null_mut() };
             }
             unsafe { (*sgp).prev = std::ptr::null_mut() };
 
-            // Skip sudogs whose goroutine is no longer GWAITING.  This can
-            // happen in a select race: the goroutine was woken by a different
-            // case and is already runnable.
-            let g = unsafe { (*sgp).g };
-            if !g.is_null() {
-                let status = unsafe {
-                    (*g).atomicstatus.load(std::sync::atomic::Ordering::Acquire)
-                };
-                if status != GWAITING {
-                    // Not waiting any more — discard this sudog and try the
-                    // next one.  (In v1 we leak the sudog here; a full impl
-                    // would release it back to the cache.)
+            // For select sudogs, race to claim the win.
+            if unsafe { (*sgp).is_select } {
+                let gp = unsafe { (*sgp).g };
+                let won = !gp.is_null()
+                    && unsafe {
+                        (*gp).selectdone
+                            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed)
+                    }
+                    .is_ok();
+                if !won {
+                    // Loser: already unlinked from the queue.  Do NOT release —
+                    // selectgo cleanup will release it.
                     continue;
                 }
             }
@@ -228,26 +244,33 @@ impl WaitQ {
 
     /// Remove a specific sudog from anywhere in the queue (O(1) via `prev`/`next`).
     ///
-    /// Used by `selectgo` to cancel waiting sudogs on non-winning channels.
-    /// Returns `true` if `sgp` was found and removed, `false` if it had
-    /// already been dequeued by a concurrent channel operation.
+    /// Used by `selectgo` cleanup to cancel losing sudogs on non-winning
+    /// channels.  If `sgp` was already unlinked (e.g. a racing `dequeue` on
+    /// that channel already removed it), the function returns immediately
+    /// without modifying the queue.
+    ///
+    /// Caller must hold the channel lock.
     ///
     /// Ported from `dequeueSudoG` in `runtime/chan.go`.
     pub(crate) unsafe fn dequeue_sudog(&mut self, sgp: *mut Sudog) {
         let prev = unsafe { (*sgp).prev };
         let next = unsafe { (*sgp).next };
 
+        // Guard: if sgp has no prev link and is not the head, it has already
+        // been unlinked by a racing `dequeue()` call.  Do nothing.
+        if prev.is_null() && self.first != sgp {
+            return;
+        }
+
         if !prev.is_null() {
             unsafe { (*prev).next = next };
         } else {
-            // sgp was the head.
             self.first = next;
         }
 
         if !next.is_null() {
             unsafe { (*next).prev = prev };
         } else {
-            // sgp was the tail.
             self.last = prev;
         }
 
@@ -360,6 +383,7 @@ pub(crate) unsafe fn release_sudog(s: *mut Sudog) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::g::GWAITING;
     use std::sync::atomic::Ordering::Release;
 
     // Helper: allocate a minimal G for tests (just needs a stable address).
@@ -490,36 +514,52 @@ mod tests {
         }
     }
 
-    /// `dequeue` skips a sudog whose goroutine is no longer GWAITING (select race).
+    /// `dequeue` skips an `is_select` sudog whose goroutine's `selectdone` CAS
+    /// already lost (another case claimed the win).
     #[test]
     fn waitq_dequeue_skips_non_waiting() {
-        use crate::runtime::g::GRUNNABLE;
+        use crate::runtime::g::GWAITING;
 
-        let g_skip = make_g(); // will be in GRUNNABLE
-        let g_take = make_g(); // will be in GWAITING
+        // g_skip: is_select sudog that already lost the selectdone race.
+        // g_take: is_select sudog whose selectdone is still 0 (uncontested).
+        let g_skip = make_g();
+        let g_take = make_g();
         let s_skip = acquire_sudog();
         let s_take = acquire_sudog();
 
         unsafe {
-            (*s_skip).g = g_skip;
-            (*s_take).g = g_take;
-            (*g_skip).atomicstatus.store(GRUNNABLE, Release); // already woken
-            (*g_take).atomicstatus.store(GWAITING,  Release);
+            (*s_skip).g         = g_skip;
+            (*s_skip).is_select = true;
+            (*s_take).g         = g_take;
+            (*s_take).is_select = true;
+
+            // Mark g_skip as already won by another case.
+            (*g_skip).atomicstatus.store(GWAITING, Release);
+            (*g_skip).selectdone.store(1, Release); // already claimed
+            (*g_take).atomicstatus.store(GWAITING, Release);
+            // g_take.selectdone stays 0 — dequeue should claim it.
         }
 
         let mut q = WaitQ::new();
         unsafe { q.enqueue(s_skip); q.enqueue(s_take); }
 
-        // dequeue should skip s_skip and return s_take.
+        // dequeue should skip s_skip (selectdone CAS fails) and return s_take.
         let got = unsafe { q.dequeue() };
-        assert_eq!(got, s_take, "dequeue must skip the non-waiting sudog");
+        assert_eq!(got, s_take, "dequeue must skip the select-lost sudog");
         assert!(q.is_empty());
+
+        // Verify dequeue set selectdone = 1 on g_take.
+        assert_eq!(
+            unsafe { (*g_take).selectdone.load(Ordering::Relaxed) },
+            1,
+            "dequeue must CAS selectdone to 1 for the winning sudog"
+        );
 
         // Clean up
         unsafe {
             (*s_take).g = std::ptr::null_mut(); (*s_take).c = std::ptr::null_mut();
             release_sudog(s_take);
-            // s_skip was skipped (leaked) by dequeue — free it manually here.
+            // s_skip was unlinked (not released) by dequeue — free it manually.
             let _ = Box::from_raw(s_skip);
             let _ = Box::from_raw(g_skip); let _ = Box::from_raw(g_take);
         }

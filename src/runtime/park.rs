@@ -22,8 +22,8 @@
 
 use std::ptr;
 
-use super::g::{current_g, set_current_g, G, GRUNNABLE, GWAITING, WaitReason};
-use super::m::{current_m, M};
+use super::g::{current_g, set_current_g, G, GRUNNABLE, GRUNNING, GWAITING, WaitReason};
+use super::m::current_m;
 use super::sched::{sched, schedule, startm};
 
 #[cfg(target_arch = "x86_64")]
@@ -45,7 +45,7 @@ use super::asm_arm64::mcall;
 ///
 /// Ported from `gopark` in `runtime/proc.go`.
 pub(crate) unsafe fn gopark(reason: WaitReason) {
-    let gp = unsafe { current_g() };
+    let gp = current_g();
     debug_assert!(!gp.is_null(), "gopark: called from g0");
 
     unsafe { (*gp).waitreason = reason };
@@ -57,7 +57,7 @@ pub(crate) unsafe fn gopark(reason: WaitReason) {
 ///
 /// Sets G status to `Gwaiting`, unlinks G from the M, and enters `schedule`.
 unsafe extern "C" fn park_fn(gp: *mut G) {
-    let m = unsafe { current_m() };
+    let m = current_m();
 
     unsafe {
         (*gp).atomicstatus.store(GWAITING, std::sync::atomic::Ordering::Release);
@@ -81,12 +81,39 @@ unsafe extern "C" fn park_fn(gp: *mut G) {
 ///
 /// May be called from any goroutine or from g0.
 ///
+/// ## GWAITING spin
+///
+/// Channel operations release their lock *before* calling `gopark`, so there
+/// is a brief window where the target G is still `GRUNNING` (park_fn hasn't
+/// run yet) even though we have already dequeued its sudog.  We spin with
+/// `spin_loop` hints until the G reaches `GWAITING` before marking it
+/// `GRUNNABLE`, preventing a second M from picking up a goroutine that is
+/// still executing on the first M.
+///
+/// The spin is always very short — just the cost of a single `mcall` switch
+/// (≈ tens of nanoseconds) — and terminates as soon as park_fn fires.
+///
 /// Ported from `goready` in `runtime/proc.go`.
 pub(crate) unsafe fn goready(gp: *mut G) {
+    use std::sync::atomic::Ordering::Acquire;
+
+    // Spin until the goroutine finishes its GRUNNING → GWAITING transition.
+    loop {
+        let s = unsafe { (*gp).atomicstatus.load(Acquire) };
+        if s == GWAITING {
+            break;
+        }
+        debug_assert!(
+            s == GRUNNING,
+            "goready: unexpected status {s} — G must be GRUNNING or GWAITING"
+        );
+        std::hint::spin_loop();
+    }
+
     unsafe { (*gp).atomicstatus.store(GRUNNABLE, std::sync::atomic::Ordering::Release) };
 
     let sc = sched();
-    let m  = unsafe { current_m() };
+    let m  = current_m();
 
     if !m.is_null() {
         let p = unsafe { (*m).p };

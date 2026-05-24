@@ -3,6 +3,13 @@
 //! Ported from `src/runtime/` in <https://github.com/golang/go>. The mapping
 //! is one-to-one where possible:
 //!
+//! Many constants, struct fields, and helper functions in this module are
+//! faithful ports of Go runtime symbols that are not yet wired up in v1
+//! (stack growth, async preemption, GC integration, …).  They are retained
+//! intentionally so that future work can land incrementally without having to
+//! re-discover or re-port them.  The `#[allow(dead_code)]` annotation below
+//! suppresses the resulting unused-item warnings.
+//!
 //! | This module   | Go source                                            |
 //! |---------------|------------------------------------------------------|
 //! | `g`           | `runtime/runtime2.go`                                |
@@ -18,8 +25,13 @@
 //! | `asm_amd64`   | `runtime/asm_amd64.s`                                |
 //! | `asm_arm64`   | `runtime/asm_arm64.s`                                |
 
+// Faithful Go-runtime ports contain symbols that will be used when deferred
+// features land.  Suppress dead-code warnings across the whole runtime module.
+#![allow(dead_code)]
+
 pub(crate) mod g;
 pub(crate) mod m;
+pub(crate) mod rawmutex;
 pub(crate) mod p;
 pub(crate) mod park;
 pub(crate) mod sched;
@@ -39,5 +51,3 @@ pub(crate) mod asm_arm64;
 // without caring about the target architecture.
 #[cfg(target_arch = "aarch64")]
 pub(crate) use asm_arm64::{gogo, mcall, systemstack};
-#[cfg(target_arch = "x86_64")]
-pub(crate) use asm_amd64::{gogo, mcall, systemstack};

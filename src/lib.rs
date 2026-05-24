@@ -18,7 +18,68 @@
 //!
 //! ## Internals
 //! See [`runtime`] for the scheduler (G/M/P, parking, work stealing, sysmon).
+//!
+//! ## Known limitations (v1 — deferred to v2+)
+//!
+//! These items are intentionally out of scope for v1.  Each is a real
+//! limitation; work-arounds are noted where applicable.
+//!
+//! ### Stack growth
+//! Every goroutine is allocated a **fixed 64 KiB stack** backed by an
+//! `mmap`'d region with a single guard page.  Go's `morestack` / `copystack`
+//! stack-growth mechanism is not ported.  Deep recursion or large stack frames
+//! will overflow into the guard page and segfault.
+//!
+//! *Work-around*: keep goroutine call stacks shallow; move large buffers to the
+//! heap (use `Box` / `Vec`).
+//!
+//! ### Async (signal-based) preemption
+//! v1 is **cooperative only**.  The sysmon thread sets a preemption hint after
+//! 10 ms of wall time, but because there are no stack-check traps a goroutine
+//! will not be preempted until it calls [`gosched`] (or blocks on a channel /
+//! sleep).
+//!
+//! *Work-around*: sprinkle `gosched()` inside CPU-bound loops.
+//!
+//! ### `defer` / `recover` / cross-goroutine `panic`
+//! Rust's `std::panic::catch_unwind` is available but goroutine-boundary panic
+//! propagation (Go's `recover`) is not implemented.  A panic inside a goroutine
+//! will abort the process.
+//!
+//! ### `context.Context` / cancellation
+//! Go's `context` package is not ported.  Use a done-channel pattern
+//! (`chan::<()>(0)`) together with `select!` as a work-around.
+//!
+//! ### Netpoll / I/O integration
+//! There is no integration with the OS event loop (`epoll`/`kqueue`).
+//! Goroutines that call blocking I/O should wrap the call with
+//! [`with_syscall`] so the scheduler can hand off the P during the wait.
+//!
+//! ### `GOMAXPROCS` at runtime
+//! The parallelism level is fixed at process start (`num_cpus` logical
+//! processors).  Changing `GOMAXPROCS` dynamically is not supported.
+//!
+//! ### `sync.Cond`
+//! `sync::Cond` is not yet implemented.  The `Condvar` from [`std::sync`] is
+//! available for low-level use.
+//!
+//! ### Race detector
+//! The Go race detector is a compiler/runtime feature with no Rust equivalent
+//! in this crate.  Use `cargo test --release` with `loom` (separate crate) for
+//! concurrency model checking.
+//!
+//! ## Unsafe conventions
+//! The runtime modules (`src/runtime/`) are a direct port of Go's C-adjacent
+//! runtime code.  Almost every function is `unsafe fn` because it operates on
+//! raw goroutine pointers and `mmap`'d memory.  Inner `unsafe {}` blocks are
+//! omitted for brevity (suppressed via `unsafe_op_in_unsafe_fn`) — the caller's
+//! obligation is documented in each function's `# Safety` section instead.
 #![deny(missing_docs)]
+// The runtime is a deliberate port of Go's low-level C-adjacent scheduler code.
+// Virtually every function is `unsafe fn`; requiring inner `unsafe {}` blocks
+// on every raw-pointer dereference would add noise without safety information.
+// Each `unsafe fn`'s contract is documented in its `# Safety` section instead.
+#![allow(unsafe_op_in_unsafe_fn)]
 
 pub mod chan;
 pub mod runtime;
@@ -75,4 +136,62 @@ pub fn gosched() {
     // SAFETY: we are on a goroutine stack (enforced by the debug_assert inside
     // the internal gosched that current_g() is non-null).
     unsafe { runtime::sched::gosched() }
+}
+
+/// Wrap a potentially-blocking operation so the go-lib scheduler can
+/// hand off this goroutine's P to another M while the OS thread is in the
+/// kernel.
+///
+/// Calls [`entersyscall`][runtime::syscall::entersyscall] before `f` and
+/// [`exitsyscall`][runtime::syscall::exitsyscall] after `f` returns.  This is
+/// a no-op when called outside the scheduler (before [`run`]).
+///
+/// # Example
+///
+/// ```no_run
+/// go_lib::run(|| {
+///     let data = go_lib::with_syscall(|| std::fs::read("file.txt"));
+/// });
+/// ```
+pub fn with_syscall<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    runtime::syscall::with_syscall(f)
+}
+
+/// Sleep the current goroutine for at least `d`.
+///
+/// Parks the goroutine and lets other goroutines run; the background timer
+/// thread calls [`goready`][runtime::park] when the duration elapses.
+///
+/// Passing `Duration::ZERO` yields to the scheduler without sleeping.
+///
+/// # Panics
+///
+/// Debug-panics if called from outside a goroutine.
+///
+/// # Example
+///
+/// ```no_run
+/// go_lib::run(|| {
+///     go_lib::sleep(std::time::Duration::from_millis(10));
+/// });
+/// ```
+pub fn sleep(d: std::time::Duration) {
+    // SAFETY: called from a goroutine context (checked by debug_assert in sleep).
+    unsafe { runtime::time::goroutine_sleep(d) }
+}
+
+/// Spawn a goroutine.  Called by the [`go!`] macro; not for direct use.
+///
+/// Must be called from within a running goroutine (i.e. inside [`run`]).
+///
+/// # Panics
+///
+/// Debug-panics if called from outside a goroutine context.
+#[doc(hidden)]
+pub fn __spawn<F: FnOnce() + Send + 'static>(f: F) {
+    // SAFETY: callers are expected to be inside a goroutine context.
+    unsafe { runtime::sched::spawn_goroutine(f) }
 }
