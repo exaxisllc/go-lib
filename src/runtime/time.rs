@@ -230,38 +230,28 @@ mod tests {
         assert!(b >= a, "mono_ns must be non-decreasing");
     }
 
-    /// fire_expired wakes goroutines whose timers have elapsed.
-    /// We simulate this by inserting an already-expired entry with a dummy G
-    /// in GWAITING state.
+    /// fire_expired (via the timer thread) wakes a sleeping goroutine.
+    ///
+    /// The original test injected a fake G (non-mmap'd stack) directly into
+    /// the timer heap and called fire_expired().  After goready() pushed the
+    /// fake G into the live global run queue, background M-threads would
+    /// execute it and SIGSEGV on the bogus stack address.
+    ///
+    /// This version tests the full path with a real goroutine: sleep() inserts
+    /// a real G into the heap, the timer thread fires it, and the goroutine
+    /// resumes after the expected delay.
     #[test]
     fn fire_expired_wakes_goroutine() {
-        use crate::runtime::g::{Stack, G, GRUNNABLE, GWAITING};
-        use std::sync::atomic::Ordering::*;
-
-        let lo = 0x300000usize;
-        let gp = Box::into_raw(G::new(Stack { lo, hi: lo + 65536 }, 200));
-        unsafe { (*gp).atomicstatus.store(GWAITING, Release) };
-
-        {
-            let mut heap = TIMER_HEAP.lock().unwrap();
-            // Insert a timer that expired 1 second ago.
-            heap.push(TimerEntry { when: mono_ns().saturating_sub(1_000_000_000), gp });
-        }
-
-        fire_expired();
-
-        assert_eq!(
-            unsafe { (*gp).atomicstatus.load(Relaxed) },
-            GRUNNABLE,
-            "fire_expired must transition the G to GRUNNABLE"
-        );
-
-        // Drain what goready pushed to the global queue so other tests aren't
-        // confused.
-        let sc = crate::runtime::sched::sched();
-        while !unsafe { sc.global_run_q.pop() }.is_null() {}
-
-        let _ = unsafe { Box::from_raw(gp) };
+        use std::time::Instant;
+        run_impl(|| {
+            let t0 = Instant::now();
+            unsafe { sleep(Duration::from_millis(10)) };
+            let elapsed = t0.elapsed();
+            assert!(
+                elapsed >= Duration::from_millis(8),
+                "timer did not fire: elapsed only {:?}", elapsed
+            );
+        });
     }
 
     /// sleep(0) yields without blocking.
