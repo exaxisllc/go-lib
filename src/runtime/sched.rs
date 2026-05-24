@@ -463,10 +463,16 @@ unsafe extern "C" fn goexit_trampoline() -> ! {
 /// Helper called by the AMD64 `goexit_trampoline`.  Runs as a normal function
 /// with correct stack alignment; switches to g0 via `mcall` and calls
 /// `goexit0`.
+///
+/// This function genuinely never returns: `goexit0` calls `schedule()` which
+/// loops forever.  The `unreachable_unchecked` is sound because dying
+/// goroutines are never resumed via `gogo` — they are dropped in `goexit0`.
 #[cfg(target_arch = "x86_64")]
 unsafe extern "C" fn goexit0_handler() -> ! {
     let gp = current_g();
-    unsafe { mcall(gp, goexit0) }
+    unsafe { mcall(gp, goexit0) };
+    // SAFETY: goexit0 → schedule() is an infinite loop; this is unreachable.
+    unsafe { std::hint::unreachable_unchecked() }
 }
 
 // AArch64: The trampoline is stored in gobuf.lr and loaded into x30 by
@@ -477,7 +483,9 @@ unsafe extern "C" fn goexit0_handler() -> ! {
 #[cfg(target_arch = "aarch64")]
 unsafe extern "C" fn goexit_trampoline() -> ! {
     let gp = current_g();
-    unsafe { mcall(gp, goexit0) }
+    unsafe { mcall(gp, goexit0) };
+    // SAFETY: goexit0 → schedule() is an infinite loop; this is unreachable.
+    unsafe { std::hint::unreachable_unchecked() }
 }
 
 /// Allocate and initialise a new goroutine G that will run `f`.
@@ -751,5 +759,49 @@ mod tests {
         run_impl(|| { COUNT.fetch_add(1, Ordering::AcqRel); });
 
         assert_eq!(COUNT.load(Ordering::Acquire), 2);
+    }
+
+    /// `gosched()` must complete without panicking and execution must continue
+    /// after the call site.
+    #[test]
+    fn gosched_returns_to_caller() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static AFTER_YIELD: AtomicBool = AtomicBool::new(false);
+
+        run_impl(|| {
+            // Yield mid-goroutine.
+            unsafe { gosched() };
+            // Execution must resume here after rescheduling.
+            AFTER_YIELD.store(true, Ordering::Release);
+        });
+
+        assert!(
+            AFTER_YIELD.load(Ordering::Acquire),
+            "execution must continue after gosched()"
+        );
+    }
+
+    /// Two goroutines: the first loops calling `gosched()` until it sees a flag
+    /// set by the second.  Without the yield the first goroutine would starve
+    /// the second on a single-P build; with the yield they interleave.
+    #[test]
+    fn gosched_allows_other_goroutines_to_run() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let flag = Arc::new(AtomicBool::new(false));
+        let flag_setter = Arc::clone(&flag);
+
+        run_impl(move || {
+            // Goroutine 1: spawn goroutine 2 then yield until it sets the flag.
+            unsafe {
+                spawn_goroutine(move || {
+                    flag_setter.store(true, Ordering::Release);
+                });
+            }
+            while !flag.load(Ordering::Acquire) {
+                unsafe { gosched() };
+            }
+        });
     }
 }
