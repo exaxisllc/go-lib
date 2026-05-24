@@ -174,6 +174,11 @@ pub(crate) struct P {
     /// `0` means empty.  Swapped atomically so stealers can grab it.
     runnext: AtomicUsize,
 
+    // ── scheduler tick ────────────────────────────────────────────────────
+    /// Monotonically-increasing count of goroutines scheduled on this P.
+    /// Used by `schedule` to check the global run queue every 61 ticks.
+    pub schedtick: AtomicU32,
+
     // ── scheduler links ───────────────────────────────────────────────────
     /// Intrusive link for the idle-P list maintained by the scheduler (step 8).
     pub link: *mut P,
@@ -198,8 +203,9 @@ impl P {
             runqhead: AtomicU32::new(0),
             runqtail: AtomicU32::new(0),
             runq:     std::array::from_fn(|_| AtomicUsize::new(0)),
-            runnext:  AtomicUsize::new(0),
-            link:     std::ptr::null_mut(),
+            runnext:   AtomicUsize::new(0),
+            schedtick: AtomicU32::new(0),
+            link:      std::ptr::null_mut(),
         })
     }
 
