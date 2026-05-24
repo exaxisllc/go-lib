@@ -23,8 +23,8 @@
 use std::ptr;
 
 use super::g::{current_g, set_current_g, G, GRUNNABLE, GWAITING, WaitReason};
-use super::m::M;
-use super::sched::{current_m, sched, schedule, startm};
+use super::m::{current_m, M};
+use super::sched::{sched, schedule, startm};
 
 #[cfg(target_arch = "x86_64")]
 use super::asm_amd64::mcall;

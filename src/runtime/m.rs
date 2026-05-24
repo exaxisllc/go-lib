@@ -19,12 +19,38 @@
 //! blocks until `wakeup` sets it; `wakeup` before `sleep` means `sleep`
 //! returns immediately.
 
+use std::cell::Cell;
 use std::ptr::addr_of_mut;
 use std::sync::{Condvar, Mutex};
 
 use super::g::{set_current_g, set_g0_sched, Stack, G};
 use super::p::P;
 use super::stack::{stack_alloc, stack_free};
+
+// ---------------------------------------------------------------------------
+// Thread-local: current M
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    /// The M currently running on this OS thread.
+    /// Set by [`M::start_thread_locals`] before the scheduler loop begins.
+    pub(crate) static CURRENT_M: Cell<*mut M> = const { Cell::new(std::ptr::null_mut()) };
+}
+
+/// Return the M for the current OS thread, or null before initialisation.
+#[inline]
+pub(crate) fn current_m() -> *mut M {
+    CURRENT_M.with(|c| c.get())
+}
+
+/// Record `m` as the M for the current OS thread.
+///
+/// # Safety
+/// Must be called once per OS thread before any scheduler function runs.
+#[inline]
+pub(crate) unsafe fn set_current_m(m: *mut M) {
+    CURRENT_M.with(|c| c.set(m));
+}
 
 // ---------------------------------------------------------------------------
 // Note — park/unpark primitive
@@ -207,27 +233,23 @@ impl M {
         m
     }
 
-    /// Initialise the thread-local state for the OS thread running this M.
+    /// Initialise **all** thread-local state for the OS thread that owns this M.
+    ///
+    /// Sets three thread-locals:
+    /// - `CURRENT_M`  ← `self` so `schedule` knows which M is running.
+    /// - `G0_SCHED`   ← `&g0.sched` so `mcall` can switch to the scheduler stack.
+    /// - `CURRENT_G`  ← `null` because the thread starts executing on g0.
     ///
     /// **Must be called from inside the OS thread** (`std::thread::spawn`
-    /// closure) because it writes to thread-local variables:
-    ///
-    /// - `G0_SCHED` ← `&g0.sched` so `mcall` can switch to the scheduler stack.
-    /// - `CURRENT_G` ← `null` because the thread starts on g0.
-    ///
-    /// After this call the M is fully initialised.  Step 8 (`schedule()`) is
-    /// then called to enter the scheduler loop.
+    /// closure) before any scheduler function is invoked.
     ///
     /// Ported from `mstart` / `mstart0` / `mstart1` in `runtime/proc.go`.
     pub(crate) unsafe fn start(&mut self) {
         unsafe {
-            // Tell mcall where g0's Gobuf lives for this thread.
+            set_current_m(self as *mut M);
             set_g0_sched(addr_of_mut!((*self.g0).sched));
-            // No user goroutine is running at thread start — we are on g0.
             set_current_g(std::ptr::null_mut());
         }
-
-        // TODO(step 8): schedule();
     }
 
     /// Park this M until another thread calls [`M::unpark`].
