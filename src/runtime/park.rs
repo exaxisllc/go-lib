@@ -140,9 +140,7 @@ pub(crate) unsafe fn goready(gp: *mut G) {
 
 #[cfg(all(test, not(loom)))]
 mod tests {
-    use super::*;
-    use crate::runtime::g::{Stack, G, GRUNNABLE, GWAITING};
-    use std::sync::atomic::Ordering::Relaxed;
+    use crate::runtime::g::{Stack, G};
 
     fn make_g(id: u64) -> Box<G> {
         let lo = (id as usize + 1) << 20;

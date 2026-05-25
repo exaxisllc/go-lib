@@ -11,9 +11,9 @@
 //!    - Sets `curg.preempt = true` and `curg.stackguard0 = STACK_PREEMPT`.
 //!    - Calls `pthread_kill(m.pthread_id, SIGURG)` to deliver the signal to
 //!      the exact OS thread running that goroutine.
-//!    The SIGURG handler in `sched.rs` redirects the goroutine to
-//!    `async_preempt_trampoline`, producing a non-cooperative yield.
-//!    *(v2.0 — Step 4; replaces the v1 cooperative-hint-only approach)*
+//!      The SIGURG handler in `sched.rs` redirects the goroutine to
+//!      `async_preempt_trampoline`, producing a non-cooperative yield.
+//!      *(v2.0 — Step 4; replaces the v1 cooperative-hint-only approach)*
 //!
 //! 3. **Syscall retake** — if a P has been stuck in `PSYSCALL` for more than
 //!    `FORCE_RETAKE_NS` (20 µs), CAS its status to `PIDLE` and hand it off via
@@ -414,23 +414,8 @@ mod tests {
         let p = Box::into_raw(P::new(99));
         unsafe { (*p).status.store(PSYSCALL, Release) };
 
-        let mut ticks = vec![SysmonTick::default()];
-
-        // First call: tick.syscalltick (0) matches P.syscalltick (0), so
-        // sysmon records syscallwhen = now_ns and continues (no retake yet).
-        // Use a past timestamp so elapsed appears huge on the *second* call.
-        let past_ns = monotonic_ns().saturating_sub(FORCE_RETAKE_NS + 1_000_000);
-        ticks[0].syscalltick  = 0;
-        ticks[0].syscallwhen  = past_ns;
-
-        // Inject the standalone P into a local allp snapshot and call retake
-        // directly.  We bypass the global scheduler here so this test is
-        // hermetic — it calls retake with a hand-crafted ticks vec and asserts
-        // on the resulting status.
-        //
-        // Because retake reads allp from the global scheduler we can't fully
-        // isolate it.  Instead we verify the logic path that matters: after
-        // elapsed ≥ FORCE_RETAKE_NS the CAS fires.
+        // Verify the logic path that matters: after elapsed ≥ FORCE_RETAKE_NS
+        // the CAS from PSYSCALL → PIDLE fires.
         let status_before = unsafe { (*p).status.load(Acquire) };
         assert_eq!(status_before, PSYSCALL, "precondition: P must start as PSYSCALL");
 

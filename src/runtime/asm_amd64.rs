@@ -5,7 +5,7 @@
 //! - [`gogo`]                     — restore a saved `Gobuf` and resume a goroutine.
 //! - [`mcall`]                    — save current G, switch to g0's stack, call a fn.
 //! - [`async_preempt_trampoline`] — save all GPRs + XMMs, call `async_preempt2`,
-//!                                  restore, ret to interrupted PC.  *(v2.0 — Step 4)*
+//!   restore, ret to interrupted PC.  *(v2.0 — Step 4)*
 //! - [`systemstack`]              — run a closure on g0's stack (TODO).
 //!
 //! ## Design vs Go's approach
@@ -95,7 +95,7 @@ unsafe extern "C" fn gogo_asm(buf: *mut Gobuf) -> ! {
 /// - `rdx` = g0_gobuf  (*mut Gobuf — &(*g0).sched, from G0_SCHED TLS)
 /// - `rcx` = fn_ptr    (unsafe extern "C" fn(*mut G))
 /// - `[rsp]`= return address pushed by `call mcall_asm` — saved as
-///            `g_sched.pc` so `gogo` can resume at `mcall`'s epilogue.
+///   `g_sched.pc` so `gogo` can resume at `mcall`'s epilogue.
 /// - `rsp` = stack pointer (pointing at the return address on entry)
 ///
 /// Caller SP before the call is `rsp + 8` (the `call` instruction pushed the

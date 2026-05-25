@@ -5,7 +5,7 @@
 //! - [`gogo`]                     — restore a saved `Gobuf` and resume a goroutine.
 //! - [`mcall`]                    — save current G, switch to g0's stack, call a fn.
 //! - [`async_preempt_trampoline`] — save all GPRs + d0–d31, call `async_preempt2`,
-//!                                  restore, ret to interrupted PC.  *(v2.0 — Step 4)*
+//!   restore, ret to interrupted PC.  *(v2.0 — Step 4)*
 //! - [`systemstack`]              — run a closure on g0's stack (TODO).
 //!
 //! ## Design vs Go's approach

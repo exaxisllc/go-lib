@@ -12,11 +12,8 @@
 //! 2. It calls `grow_goroutine_stack_from_signal` which:
 //!    a. Allocates a new stack double the current size (capped at 1 GiB).
 //!    b. Copies the live portion of the old stack to the new one.
-//!    c. Adjusts all pointer-sized words in the copied region that fall
-//!       within the old stack bounds (conservative scan + frame-chain walk).
-//!    d. Updates `G.stack`, `G.stackguard0`, and the interrupted `RSP/SP`
-//!       in the `ucontext_t` so the faulting instruction retries on the
-//!       new stack.
+//!    c. Adjusts all pointer-sized words in `[old_lo, old_hi)` (conservative scan).
+//!    d. Updates `G.stack`, `G.stackguard0`, and SP in `ucontext_t` (OS retries the instruction).
 //! 3. The SIGSEGV handler returns; the OS restores the updated register state;
 //!    the faulting instruction is re-executed and now succeeds.
 //!
@@ -55,7 +52,7 @@ use super::g::{current_g, Stack, STACK_GUARD, G};
 pub(crate) const STACK_MIN: usize = 8 * 1024;
 
 /// Maximum goroutine stack size (bytes). 1 GiB matches Go's `maxstacksize`.
-pub(crate) const STACK_MAX: usize = 1 * 1024 * 1024 * 1024;
+pub(crate) const STACK_MAX: usize = 1024 * 1024 * 1024;
 
 /// Initial stack size for every new goroutine.
 pub(crate) const GOROUTINE_STACK_BYTES: usize = STACK_MIN;
@@ -342,10 +339,10 @@ unsafe extern "C" fn sigsegv_handler(
     }
 
     // Not a stack fault — chain to the previous handler.
-    let prev = PREV_SIGSEGV.lock().unwrap().clone();
+    let prev = *PREV_SIGSEGV.lock().unwrap();
     match prev {
-        Some(old) if old.sa_sigaction != libc::SIG_DFL as usize
-                  && old.sa_sigaction != libc::SIG_IGN as usize => {
+        Some(old) if old.sa_sigaction != libc::SIG_DFL
+                  && old.sa_sigaction != libc::SIG_IGN => {
             // Call the previous handler.
             type SaFn = unsafe extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void);
             let f: SaFn = unsafe { std::mem::transmute(old.sa_sigaction) };

@@ -312,9 +312,9 @@ impl P {
         // Collect the n drained Gs plus the new gp into a fixed array.
         let n_usize = n as usize;
         let mut batch = [std::ptr::null_mut::<G>(); RUNQ_CAP / 2 + 1];
-        for i in 0..n_usize {
+        for (i, b) in batch.iter_mut().enumerate().take(n_usize) {
             let slot = self.runq[(h.wrapping_add(i as u32) as usize) % RUNQ_CAP].load(Relaxed);
-            batch[i] = slot as *mut G;
+            *b = slot as *mut G;
         }
         batch[n_usize] = gp;
 
