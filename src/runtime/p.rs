@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Processor (`P`) and its 256-slot lock-free local run queue.
 //!
 //! Ported from `runtime/runtime2.go` (P struct) and `runtime/proc.go`

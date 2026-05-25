@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Goroutine scheduler internals.
 //!
 //! Ported from `src/runtime/` in <https://github.com/golang/go>.  Each submodule

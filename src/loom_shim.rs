@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Conditional synchronisation primitives — `std` in production, `loom` under
 //! `cargo test --cfg loom`.
 //!

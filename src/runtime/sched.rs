@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Scheduler core — `schedule`, `findrunnable`, `execute`, `goexit0`, `gosched`.
 //!
 //! Ported from `runtime/proc.go` and `runtime/preempt.go`.

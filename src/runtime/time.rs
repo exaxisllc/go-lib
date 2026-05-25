@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Timer heap — ported from `runtime/time.go`.
 //!
 //! ## Design (v1 simplified)

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! select_fanin — fan-in multiplexing with `select!`.
 //!
 //! Two producers send values at different rates.  A single consumer uses

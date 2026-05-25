@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `Cond` — goroutine-aware condition variable.
 //!
 //! Mirrors Go's `sync.Cond`: goroutines waiting on a `Cond` are parked via

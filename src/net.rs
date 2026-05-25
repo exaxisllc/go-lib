@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Goroutine-aware TCP networking.
 //!
 //! `TcpListener` and `TcpStream` wrap non-blocking OS sockets and integrate

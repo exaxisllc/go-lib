@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 /// Demonstrates `sync::Cond` with a bounded producer / consumer queue.
 ///
 /// Three producers push items onto a shared queue; three consumers pop them.

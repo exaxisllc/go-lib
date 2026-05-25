@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Background monitor thread — ported from `runtime/proc.go` (`sysmon`).
 //!
 //! Runs a single detached OS thread that performs three duties every iteration:

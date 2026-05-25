@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 # Workspace-level Cargo configuration.
 #
 # force-frame-pointers: required by copystack (Step 3) so the frame chain can

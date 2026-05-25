@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Integration tests — exercise the full public API end-to-end.
 //!
 //! Each test runs the go-lib scheduler via `go_lib::run`, spawns goroutines
