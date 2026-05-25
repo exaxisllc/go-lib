@@ -292,10 +292,10 @@ unsafe fn preemptone(pp: *mut super::p::P) {
         (*gp).stackguard0 = STACK_PREEMPT;
     }
 
-    // Send SIGURG to the M's OS thread.  The signal is delivered asynchronously;
-    // if the goroutine is currently in a syscall the signal arrives when it
-    // returns to user space.
-    unsafe { libc::pthread_kill(pthread_id, libc::SIGURG) };
+    // Unix only: send SIGURG to the M's OS thread.  Windows has no pthread_kill;
+    // the preempt flag is set above and the goroutine will yield cooperatively.
+    #[cfg(not(windows))]
+    unsafe { libc::pthread_kill(pthread_id as libc::pthread_t, libc::SIGURG) };
 }
 
 // ---------------------------------------------------------------------------
@@ -355,6 +355,10 @@ mod tests {
 
     /// `preemptone` sets `preempt = true` and `stackguard0 = STACK_PREEMPT`
     /// on the goroutine running on a P, without touching the P's own status.
+    ///
+    /// Gated on Unix because the test sends SIGURG via `pthread_kill`, which
+    /// is not available on Windows.
+    #[cfg(not(windows))]
     #[test]
     fn preemptone_sets_flags() {
         use crate::runtime::g::{Stack, G, STACK_PREEMPT};
@@ -378,7 +382,7 @@ mod tests {
             (*gp).m = m;
             // Step 4: preemptone requires a non-zero pthread_id to send SIGURG.
             // Use the calling thread's ID so the test exercises the real path.
-            (*m).pthread_id = libc::pthread_self();
+            (*m).pthread_id = libc::pthread_self() as u64;
         }
 
         // Before the call, preempt is false and stackguard0 is whatever G::new set.

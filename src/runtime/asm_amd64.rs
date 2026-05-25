@@ -52,19 +52,37 @@ use super::g::{
 ///
 /// Ported from `runtime·gogo` in `runtime/asm_amd64.s`.
 ///
-/// Register usage:
-/// - `rdi` = buf (*mut Gobuf, argument — System V first arg)
-/// - `rax` = scratch (target pc, loaded before rsp changes)
-/// - `rbp`, `rsp` — restored from Gobuf
+/// Register usage (System V AMD64 — Linux / macOS):
+/// - `rdi` = buf (*mut Gobuf, first arg)
+///
+/// Register usage (Microsoft x64 — Windows):
+/// - `rcx` = buf (*mut Gobuf, first arg)
+///
+/// Common: `rax` = scratch (target pc), `rbp` / `rsp` restored from Gobuf.
+
+// System V AMD64 ABI (Linux, macOS): first argument in rdi.
+#[cfg(not(windows))]
 #[unsafe(naked)]
 unsafe extern "C" fn gogo_asm(buf: *mut Gobuf) -> ! {
-    // rdi = buf (*mut Gobuf)
-    // Load pc and bp before touching rsp — rdi remains valid throughout
-    // because it is a general-purpose register, not stack-relative.
     core::arch::naked_asm!(
         "mov rax, [rdi + {pc}]",   // rax = gobuf.pc  (load before stack switch)
         "mov rbp, [rdi + {bp}]",   // rbp = gobuf.bp  (frame pointer)
         "mov rsp, [rdi + {sp}]",   // rsp = gobuf.sp  (stack switch — do last)
+        "jmp rax",                  // jump to pc — never returns
+        pc = const GOBUF_PC_OFFSET,
+        bp = const GOBUF_BP_OFFSET,
+        sp = const GOBUF_SP_OFFSET,
+    )
+}
+
+// Microsoft x64 ABI (Windows): first argument in rcx.
+#[cfg(windows)]
+#[unsafe(naked)]
+unsafe extern "C" fn gogo_asm(buf: *mut Gobuf) -> ! {
+    core::arch::naked_asm!(
+        "mov rax, [rcx + {pc}]",   // rax = gobuf.pc  (load before stack switch)
+        "mov rbp, [rcx + {bp}]",   // rbp = gobuf.bp  (frame pointer)
+        "mov rsp, [rcx + {sp}]",   // rsp = gobuf.sp  (stack switch — do last)
         "jmp rax",                  // jump to pc — never returns
         pc = const GOBUF_PC_OFFSET,
         bp = const GOBUF_BP_OFFSET,
@@ -80,28 +98,27 @@ unsafe extern "C" fn gogo_asm(buf: *mut Gobuf) -> ! {
 /// stack, and call `fn_ptr(g)`.  Never returns via the normal path.
 ///
 /// The return type is `()` (not `!`) deliberately: the Rust compiler must
-/// generate a proper `leave; ret` epilogue for `mcall()` *after* the
-/// `callq mcall_asm` instruction.  When `gogo` later resumes a goroutine it
-/// jumps to `g_sched.pc`, which points at that epilogue.  Executing the
-/// epilogue unwinds the `mcall` and caller (`gosched`/`gopark`) frames
-/// normally, returning control to the goroutine's user code — exactly the
-/// same sequence Go uses.
+/// generate a proper epilogue for `mcall()` *after* the `call mcall_asm`
+/// instruction.  When `gogo` later resumes a goroutine it jumps to
+/// `g_sched.pc`, which points at that epilogue.  Executing the epilogue
+/// unwinds the `mcall` and caller (`gosched`/`gopark`) frames normally —
+/// exactly the same sequence Go uses.
 ///
 /// Ported from `runtime·mcall` in `runtime/asm_amd64.s`.
 ///
-/// System V AMD64 argument registers on entry:
-/// - `rdi` = g         (*mut G  — current goroutine)
-/// - `rsi` = g_sched   (*mut Gobuf — &(*g).sched, pre-computed by wrapper)
-/// - `rdx` = g0_gobuf  (*mut Gobuf — &(*g0).sched, from G0_SCHED TLS)
-/// - `rcx` = fn_ptr    (unsafe extern "C" fn(*mut G))
-/// - `[rsp]`= return address pushed by `call mcall_asm` — saved as
-///   `g_sched.pc` so `gogo` can resume at `mcall`'s epilogue.
-/// - `rsp` = stack pointer (pointing at the return address on entry)
+/// ## Calling conventions
 ///
-/// Caller SP before the call is `rsp + 8` (the `call` instruction pushed the
-/// 8-byte return address).  This is what we save as `g_sched.sp` so that
-/// `gogo` can restore it and have the stack look exactly as it did before
-/// `mcall_asm` was entered.
+/// **System V AMD64 (Linux, macOS)** — argument registers on entry:
+/// - `rdi` = g, `rsi` = g_sched, `rdx` = g0_gobuf, `rcx` = fn_ptr
+///
+/// **Microsoft x64 (Windows)** — argument registers on entry:
+/// - `rcx` = g, `rdx` = g_sched, `r8` = g0_gobuf, `r9` = fn_ptr
+///
+/// In both ABIs `[rsp]` on entry holds the return address pushed by the
+/// `call mcall_asm` instruction.  Caller SP = `rsp + 8`.
+
+// System V AMD64 ABI (Linux, macOS): args in rdi, rsi, rdx, rcx.
+#[cfg(not(windows))]
 #[unsafe(naked)]
 unsafe extern "C" fn mcall_asm(
     _g:        *mut G,
@@ -111,28 +128,57 @@ unsafe extern "C" fn mcall_asm(
 ) {
     core::arch::naked_asm!(
         // ── save current goroutine's context into g_sched (rsi) ──────────
-        // On x86-64 the `call` instruction pushes the return address at [rsp]
-        // before entering the callee, so on entry: [rsp] = caller's PC.
         "mov rax,          [rsp]",         // rax = return address (caller PC)
         "mov [rsi + {pc}], rax",           // g_sched.pc = return address
         "lea rax,          [rsp + 8]",     // rax = caller SP (before call pushed ret addr)
         "mov [rsi + {sp}], rax",           // g_sched.sp = caller SP
         "mov [rsi + {bp}], rbp",           // g_sched.bp = frame pointer
-        "mov [rsi + {g}],  rdi",           // g_sched.g  = g (keep field in sync)
+        "mov [rsi + {g}],  rdi",           // g_sched.g  = g
 
         // ── switch to g0's stack (rdx = g0_gobuf) ────────────────────────
-        // g0's sp must be 16-byte aligned before the `call` below (ABI).
-        // The invariant is established by M::new (step 6).
         "mov rsp, [rdx + {sp}]",           // rsp = g0.sp (stack switch)
         "mov rbp, [rdx + {bp}]",           // rbp = g0.bp
 
         // ── call fn_ptr(g) on g0's stack ─────────────────────────────────
-        // rdi = g (first argument, untouched since function entry)
+        // rdi = g (first argument, System V: first arg in rdi ✓)
         // rcx = fn_ptr
-        // `call` pushes a return address onto g0's stack then jumps.
         "call rcx",
+        "ud2",
 
-        // fn_ptr must never return.  Trap immediately to catch bugs.
+        pc = const GOBUF_PC_OFFSET,
+        sp = const GOBUF_SP_OFFSET,
+        bp = const GOBUF_BP_OFFSET,
+        g  = const GOBUF_G_OFFSET,
+    )
+}
+
+// Microsoft x64 ABI (Windows): args in rcx, rdx, r8, r9.
+#[cfg(windows)]
+#[unsafe(naked)]
+unsafe extern "C" fn mcall_asm(
+    _g:        *mut G,
+    _g_sched:  *mut Gobuf,
+    _g0_gobuf: *mut Gobuf,
+    _fn_ptr:   unsafe extern "C" fn(*mut G),
+) {
+    core::arch::naked_asm!(
+        // ── save current goroutine's context into g_sched (rdx) ──────────
+        // rcx = g, rdx = g_sched, r8 = g0_gobuf, r9 = fn_ptr
+        "mov rax,          [rsp]",         // rax = return address (caller PC)
+        "mov [rdx + {pc}], rax",           // g_sched.pc = return address
+        "lea rax,          [rsp + 8]",     // rax = caller SP
+        "mov [rdx + {sp}], rax",           // g_sched.sp = caller SP
+        "mov [rdx + {bp}], rbp",           // g_sched.bp = frame pointer
+        "mov [rdx + {g}],  rcx",           // g_sched.g  = g
+
+        // ── switch to g0's stack (r8 = g0_gobuf) ─────────────────────────
+        "mov rsp, [r8 + {sp}]",            // rsp = g0.sp (stack switch)
+        "mov rbp, [r8 + {bp}]",            // rbp = g0.bp
+
+        // ── call fn_ptr(g) on g0's stack ─────────────────────────────────
+        // rcx = g (still holds g — Microsoft x64 first arg in rcx ✓)
+        // r9  = fn_ptr
+        "call r9",
         "ud2",
 
         pc = const GOBUF_PC_OFFSET,
@@ -210,6 +256,11 @@ pub(crate) unsafe fn systemstack<F: FnOnce()>(_f: F) {
 
 /// Trampoline injected by the SIGURG handler to preempt a running goroutine.
 ///
+/// Windows has no POSIX signal mechanism so this trampoline is not compiled
+/// there.  Async preemption is a no-op on Windows; goroutines yield only
+/// cooperatively via `gosched` / channel operations.
+#[cfg(not(windows))]
+///
 /// The SIGURG handler redirects the goroutine's `RIP` to this function and
 /// pushes the original `RIP` onto the goroutine's stack (decrements `RSP` and
 /// writes the original PC to `[RSP]`).  When the goroutine resumes after the
@@ -240,6 +291,8 @@ pub(crate) unsafe fn systemstack<F: FnOnce()>(_f: F) {
 /// Ported from the auto-generated `asyncPreempt` in `runtime/preempt_amd64.s`.
 #[unsafe(naked)]
 pub(crate) unsafe extern "C" fn async_preempt_trampoline() {
+    // NOTE: this attribute / function body is only compiled on non-Windows
+    // (gated by the #[cfg(not(windows))] on the doc-comment block above).
     core::arch::naked_asm!(
         // ── save all general-purpose registers (15 pushes = 120 B) ──────────
         "push rbp",

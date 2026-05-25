@@ -199,10 +199,14 @@ pub(crate) struct M {
     pub schedlink: *mut M,
 
     // ── async preemption (Step 4) ─────────────────────────────────────────
-    /// POSIX thread ID of the OS thread running this M.
-    /// Captured by `M::start()` via `libc::pthread_self()`.
-    /// `sysmon` sends `SIGURG` here to trigger async goroutine preemption.
-    pub pthread_id: libc::pthread_t,
+    /// OS thread ID used to deliver async-preemption signals.
+    ///
+    /// On Unix this holds the `pthread_t` value returned by `pthread_self()`,
+    /// stored as `u64` so the field type is the same on every platform.
+    /// `sysmon` sends `SIGURG` to this thread on Unix to preempt the goroutine.
+    /// On Windows async preemption via signals is not available; the field
+    /// stays `0` and `preemptone` skips the signal delivery.
+    pub pthread_id: u64,
 }
 
 // SAFETY: The scheduler guarantees that only one thread operates on a given M
@@ -284,14 +288,15 @@ impl M {
             set_g0_sched(addr_of_mut!((*self.g0).sched));
             set_current_g(std::ptr::null_mut());
 
-            // Capture the OS thread ID so sysmon can send SIGURG to preempt
-            // any goroutine running on this M.
-            self.pthread_id = libc::pthread_self();
-
-            // Install a per-thread alternate signal stack.  SIGSEGV and SIGURG
-            // handlers are marked SA_ONSTACK; this guarantees they can run even
-            // when the goroutine's stack is completely exhausted.
-            setup_sigaltstack();
+            // Unix only: capture the pthread_t so sysmon can send SIGURG to
+            // preempt goroutines running on this M.  Install a per-thread
+            // alternate signal stack so SIGSEGV/SIGURG handlers can run even
+            // when the goroutine's own stack is exhausted.
+            #[cfg(not(windows))]
+            {
+                self.pthread_id = libc::pthread_self() as u64;
+                setup_sigaltstack();
+            }
         }
     }
 
@@ -319,7 +324,7 @@ impl M {
 }
 
 /// Allocate and install a per-thread alternate signal stack for the calling OS
-/// thread.
+/// thread (Unix only — no POSIX signals on Windows).
 ///
 /// The alternate stack is intentionally **leaked** — M threads run for the
 /// lifetime of the process so there is no meaningful teardown point.
@@ -327,6 +332,7 @@ impl M {
 /// # Safety
 /// Must be called once per OS thread from inside the thread that will receive
 /// signals (i.e. from `M::start`).
+#[cfg(not(windows))]
 unsafe fn setup_sigaltstack() {
     // Allocate the alternate stack memory.
     let mem = unsafe {
