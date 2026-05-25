@@ -464,7 +464,8 @@ static PREV_SIGURG: Mutex<Option<libc::sigaction>> = Mutex::new(None);
 pub(crate) unsafe fn install_sigurg_handler() {
     let mut sa: libc::sigaction = unsafe { std::mem::zeroed() };
     sa.sa_sigaction = sigurg_handler as *const () as usize;
-    sa.sa_flags     = libc::SA_SIGINFO | libc::SA_ONSTACK | (libc::SA_RESTART as libc::c_int);
+    // sa_flags is c_ulong on Linux and c_int on macOS; `as _` lets Rust infer the right type.
+    sa.sa_flags     = (libc::SA_SIGINFO | libc::SA_ONSTACK | libc::SA_RESTART) as _;
     unsafe { libc::sigemptyset(&mut sa.sa_mask) };
 
     let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
