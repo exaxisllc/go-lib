@@ -18,6 +18,27 @@
 //! The semantics are identical: a `Note` is either *clear* or *set*; `sleep`
 //! blocks until `wakeup` sets it; `wakeup` before `sleep` means `sleep`
 //! returns immediately.
+//!
+//! ## v2.0 additions
+//!
+//! ### `pthread_id` — async preemption target (Step 4)
+//! Each M now stores its OS thread ID (`pthread_id: libc::pthread_t`), set by
+//! `M::start()` via `pthread_self()`.  `sysmon` uses this to send `SIGURG` to
+//! the exact thread running a long-lived goroutine, triggering the
+//! `async_preempt_trampoline` code path.
+//!
+//! ### Alternate signal stack (Step 4)
+//! `M::start()` calls `setup_sigaltstack()` to allocate a 64 KiB alternate
+//! signal stack per OS thread (`sigaltstack(2)`).  Because both the SIGSEGV and
+//! SIGURG handlers are installed with `SA_ONSTACK`, they can safely execute
+//! even when the goroutine's own stack is completely exhausted — which is
+//! precisely when stack-growth signals arrive.
+//!
+//! ### g0 stack size (Step 3)
+//! The scheduler loop runs on the M's `g0` stack.  g0 now uses
+//! `g0_stack_alloc()` (64 KiB) rather than the goroutine default (8 KiB),
+//! because `schedule → findrunnable → stopm → locking` has a deeper call chain
+//! than a typical user goroutine.
 
 use std::cell::Cell;
 use std::ptr::addr_of_mut;
@@ -25,7 +46,12 @@ use std::sync::{Condvar, Mutex};
 
 use super::g::{set_current_g, set_g0_sched, Stack, G};
 use super::p::P;
-use super::stack::{stack_alloc, stack_free};
+use super::stack::{g0_stack_alloc, stack_free};
+
+/// Size of the alternate signal stack allocated per M thread.
+/// Signals (SIGSEGV, SIGURG) are delivered on this stack, which keeps the
+/// signal handler safe even when the goroutine's own stack is exhausted.
+const ALT_STACK_SIZE: usize = 64 * 1024; // 64 KiB
 
 // ---------------------------------------------------------------------------
 // Thread-local: current M
@@ -171,6 +197,12 @@ pub(crate) struct M {
 
     /// Link used by the scheduler for idle-M and other internal lists.
     pub schedlink: *mut M,
+
+    // ── async preemption (Step 4) ─────────────────────────────────────────
+    /// POSIX thread ID of the OS thread running this M.
+    /// Captured by `M::start()` via `libc::pthread_self()`.
+    /// `sysmon` sends `SIGURG` here to trigger async goroutine preemption.
+    pub pthread_id: libc::pthread_t,
 }
 
 // SAFETY: The scheduler guarantees that only one thread operates on a given M
@@ -192,9 +224,10 @@ impl M {
     /// # Panics
     /// Panics if `stack_alloc` fails (OOM or resource exhaustion).
     pub(crate) unsafe fn new(id: i64) -> Box<M> {
-        // Allocate g0's execution stack.
+        // Allocate g0's execution stack.  g0 uses a larger-than-goroutine
+        // allocation because the scheduler loop has a deeper call chain.
         let g0_stack = unsafe {
-            stack_alloc().expect("M::new: failed to allocate g0 stack")
+            g0_stack_alloc().expect("M::new: failed to allocate g0 stack")
         };
 
         // Create the g0 goroutine.  Its goid is 0 — g0s are not tracked in
@@ -218,6 +251,7 @@ impl M {
             park:      Note::new(),
             alllink:   std::ptr::null_mut(),
             schedlink: std::ptr::null_mut(),
+            pthread_id: 0, // set by M::start() once the OS thread is running
         });
 
         // Transfer g0 ownership to a raw pointer and wire both directions.
@@ -249,6 +283,15 @@ impl M {
             set_current_m(self as *mut M);
             set_g0_sched(addr_of_mut!((*self.g0).sched));
             set_current_g(std::ptr::null_mut());
+
+            // Capture the OS thread ID so sysmon can send SIGURG to preempt
+            // any goroutine running on this M.
+            self.pthread_id = libc::pthread_self();
+
+            // Install a per-thread alternate signal stack.  SIGSEGV and SIGURG
+            // handlers are marked SA_ONSTACK; this guarantees they can run even
+            // when the goroutine's stack is completely exhausted.
+            setup_sigaltstack();
         }
     }
 
@@ -273,6 +316,41 @@ impl M {
     pub(crate) fn unpark(&self) {
         self.park.wakeup();
     }
+}
+
+/// Allocate and install a per-thread alternate signal stack for the calling OS
+/// thread.
+///
+/// The alternate stack is intentionally **leaked** — M threads run for the
+/// lifetime of the process so there is no meaningful teardown point.
+///
+/// # Safety
+/// Must be called once per OS thread from inside the thread that will receive
+/// signals (i.e. from `M::start`).
+unsafe fn setup_sigaltstack() {
+    // Allocate the alternate stack memory.
+    let mem = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            ALT_STACK_SIZE,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_ANON | libc::MAP_PRIVATE,
+            -1,
+            0,
+        )
+    };
+    if mem == libc::MAP_FAILED {
+        // Non-fatal: without an altstack the signal handler may crash if the
+        // goroutine's stack is full, but guard-page faults are rare in practice.
+        return;
+    }
+
+    let ss = libc::stack_t {
+        ss_sp:    mem,
+        ss_flags: 0,
+        ss_size:  ALT_STACK_SIZE,
+    };
+    unsafe { libc::sigaltstack(&ss, std::ptr::null_mut()) };
 }
 
 impl Drop for M {

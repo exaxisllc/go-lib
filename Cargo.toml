@@ -5,3 +5,13 @@ edition = "2024"
 
 [dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+# Systematic concurrency model checker — explores all thread interleavings.
+# Used via `cargo test --cfg loom` (see .github/workflows/ci.yml).
+loom = "0.7"
+
+# Tell Cargo that `--cfg loom` is an expected cfg key, suppressing the
+# "unexpected_cfgs" warning that would otherwise fire on every #[cfg(loom)].
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }

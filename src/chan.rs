@@ -544,7 +544,7 @@ pub(crate) unsafe fn closechan<T: Send + 'static>(c: &Arc<Hchan<T>>) {
 // Tests
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
     use crate::runtime::sched::run_impl;

@@ -158,6 +158,7 @@ pub(crate) enum WaitReason {
     Semacquire  = 18,  // "semacquire"
     Sleep       = 19,  // "sleep"
     CondVar     = 20,  // "condvar wait"
+    IOWait      = 23,  // "IO wait" (netpoll — Step 5)
 }
 
 impl WaitReason {
@@ -171,6 +172,7 @@ impl WaitReason {
             Self::Semacquire  => "semacquire",
             Self::Sleep       => "sleep",
             Self::CondVar     => "condvar wait",
+            Self::IOWait      => "IO wait",
         }
     }
 }

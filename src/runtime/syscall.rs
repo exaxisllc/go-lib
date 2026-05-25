@@ -228,7 +228,7 @@ where
 // Tests
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
     use crate::runtime::p::{P, PIDLE, PRUNNING, PSYSCALL};

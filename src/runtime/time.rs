@@ -214,7 +214,7 @@ pub unsafe fn goroutine_sleep(d: Duration) {
 // Tests
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 #[allow(unused_unsafe)] // closures calling unsafe fn inside an outer unsafe{} block
 mod tests {
     use super::*;

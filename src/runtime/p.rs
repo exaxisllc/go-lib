@@ -21,7 +21,7 @@
 //! consults the global queue periodically for fairness.
 
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering::*};
-use std::sync::Mutex;
+use crate::loom_shim::Mutex;
 
 use super::g::G;
 use super::m::M;
@@ -487,7 +487,7 @@ impl P {
 // Tests
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
     use crate::runtime::g::{Stack, G};
@@ -697,5 +697,103 @@ mod tests {
         for g in goroutines {
             let _ = unsafe { Box::from_raw(Box::into_raw(g)) };
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Loom model tests
+// ---------------------------------------------------------------------------
+
+#[cfg(all(test, loom))]
+mod loom_tests {
+    use super::*;
+    use crate::runtime::g::{Stack, G};
+    use loom::sync::Arc;
+
+    // Wrapper so the raw G pointer can cross a loom::thread boundary.
+    // SAFETY: The test manages the lifetime of each G explicitly; the pointer
+    // is valid for the entire model invocation.
+    struct GPtr(*mut G);
+    unsafe impl Send for GPtr {}
+
+    fn make_g(id: u64) -> *mut G {
+        let lo = (id as usize + 1) << 20;
+        Box::into_raw(G::new(Stack { lo, hi: lo + 65536 }, id))
+    }
+
+    /// One thread pushes a single G; the main thread pops.  Loom explores
+    /// every ordering and verifies the Mutex is always correctly released and
+    /// exactly one G is recovered in total.
+    #[test]
+    fn concurrent_push_pop() {
+        loom::model(|| {
+            let gq  = Arc::new(GlobalRunQueue::new());
+            let gq2 = Arc::clone(&gq);
+
+            let g1 = GPtr(make_g(1));
+
+            let pusher = loom::thread::spawn(move || {
+                let gp = g1.0;
+                // push_batch terminates the chain internally before locking.
+                unsafe { gq2.push_batch(gp, gp, 1) };
+            });
+
+            // Main thread races with the pusher.
+            let got = unsafe { gq.pop() };
+
+            pusher.join().unwrap();
+
+            // Drain whatever the pusher left behind.
+            let got2 = unsafe { gq.pop() };
+
+            // Exactly one G was inserted; it must be dequeued exactly once.
+            let retrieved = [got, got2].iter().filter(|p| !p.is_null()).count();
+            assert_eq!(retrieved, 1, "expected exactly one G across both pops");
+
+            for p in [got, got2] {
+                if !p.is_null() {
+                    let _ = unsafe { Box::from_raw(p) };
+                }
+            }
+        });
+    }
+
+    /// Two threads pop concurrently after a batch has been pushed.  Each G
+    /// must be returned to at most one thread.
+    #[test]
+    fn concurrent_two_pops() {
+        loom::model(|| {
+            let gq  = Arc::new(GlobalRunQueue::new());
+            let gq2 = Arc::clone(&gq);
+            let gq3 = Arc::clone(&gq);
+
+            // Pre-populate two Gs (single-threaded setup before model races).
+            let g1 = make_g(1);
+            let g2 = make_g(2);
+            unsafe {
+                (*g1).schedlink = g2;
+                gq.push_batch(g1, g2, 2);
+            }
+
+            let t1 = loom::thread::spawn(move || unsafe { gq2.pop() });
+            let t2 = loom::thread::spawn(move || unsafe { gq3.pop() });
+
+            let p1 = t1.join().unwrap();
+            let p2 = t2.join().unwrap();
+
+            // Both threads together must have obtained exactly 2 distinct Gs.
+            let mut ptrs: Vec<*mut G> = [p1, p2, unsafe { gq.pop() }]
+                .into_iter()
+                .filter(|p| !p.is_null())
+                .collect();
+            assert_eq!(ptrs.len(), 2, "expected exactly 2 Gs from 2 pops");
+            ptrs.sort();
+            ptrs.dedup();
+            assert_eq!(ptrs.len(), 2, "each G must be returned to at most one thread");
+
+            for p in ptrs {
+                let _ = unsafe { Box::from_raw(p) };
+            }
+        });
     }
 }

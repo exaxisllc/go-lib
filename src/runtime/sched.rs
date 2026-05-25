@@ -1,18 +1,41 @@
 //! Scheduler core — `schedule`, `findrunnable`, `execute`, `goexit0`, `gosched`.
 //!
-//! Ported from `runtime/proc.go`.
+//! Ported from `runtime/proc.go` and `runtime/preempt.go`.
 //!
 //! ## Execution model
 //!
 //! Every M runs `schedule()` on its g0 stack.  `schedule` picks a runnable G
 //! via `findrunnable`, then calls `execute` which does a `gogo` context switch
 //! into that G — `execute` never returns.  When the G finishes, the `goexit`
-//! trampoline (wired during goroutine creation in step 9) calls `goexit0` back
-//! on g0, which cleans up the G and re-enters `schedule`.
+//! trampoline calls `goexit0` back on g0, which cleans up the G and re-enters
+//! `schedule`.
+//!
+//! ## v2.0 additions
+//!
+//! ### Stack-growth checkpoint (`execute`)
+//! Before every `gogo`, `execute` calls [`stack::grow_stack_if_needed`] to
+//! proactively double the stack when the saved SP is within `2 × STACK_GUARD`
+//! of the guard page.  This is a belt-and-suspenders complement to the reactive
+//! SIGSEGV handler in `stack.rs`.
+//!
+//! ### Async preemption (SIGURG)
+//! `schedinit` installs a `SIGURG` handler via [`install_sigurg_handler`].
+//! When `sysmon` detects that a goroutine has run for more than 10 ms it sets
+//! `gp.preempt = true` then calls `pthread_kill(m.pthread_id, SIGURG)`.  The
+//! signal handler ([`sigurg_handler`]) calls [`redirect_to_async_preempt`],
+//! which pushes the goroutine's original PC onto its own stack and sets PC to
+//! `async_preempt_trampoline`.  The trampoline (in `asm_amd64.rs` /
+//! `asm_arm64.rs`) saves all live registers, calls [`async_preempt2`], and
+//! restores them on resume — a transparent non-cooperative yield.
+//!
+//! ### Netpoll integration (`findrunnable`)
+//! After the three work-stealing steps, `findrunnable` calls
+//! `netpoll::netpoll_wait(0)` (non-blocking) and issues `goready` for every
+//! file descriptor that became ready since the last poll.
 //!
 //! ## Global state
 //!
-//! `SCHED` is a process-wide singleton initialised by `schedinit` (step 9).
+//! `SCHED` is a process-wide singleton initialised by `schedinit`.
 //! It holds the global run queue, idle P/M lists, and `allp` (all Ps).  The
 //! parts that need serialisation are guarded by `Mutex<SchedInner>`; the global
 //! run queue carries its own internal lock.
@@ -22,17 +45,17 @@ use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, Ordering::*};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use super::g::{current_g, set_current_g, G, GDEAD, GRUNNABLE, GRUNNING};
+use super::g::{current_g, set_current_g, G, GDEAD, GRUNNABLE, GRUNNING, STACK_GUARD};
 use super::m::{current_m, M};
 use super::p::{GlobalRunQueue, P, PIDLE, PRUNNING};
-use super::stack::stack_alloc;
+use super::stack::{grow_stack_if_needed, install_sigsegv_handler, stack_alloc};
 use super::sysmon::start_sysmon;
 use super::time::start_timer_thread;
 
 #[cfg(target_arch = "x86_64")]
-use super::asm_amd64::{gogo, mcall};
+use super::asm_amd64::{async_preempt_trampoline, gogo, mcall};
 #[cfg(target_arch = "aarch64")]
-use super::asm_arm64::{gogo, mcall};
+use super::asm_arm64::{async_preempt_trampoline, gogo, mcall};
 
 // ---------------------------------------------------------------------------
 // Global scheduler state
@@ -201,7 +224,17 @@ pub(crate) unsafe fn findrunnable() -> *mut G {
             }
         }
 
-        // ── 4. No work found — surrender P and park ───────────────────────
+        // ── 4. Non-blocking netpoll: check if any I/O goroutines are ready ──
+        {
+            let ready = unsafe { super::netpoll::netpoll_wait(0) };
+            for gp in ready {
+                // Wake each I/O goroutine.  They are moved from Gwaiting →
+                // Grunnable and placed into the local P's run queue.
+                unsafe { super::park::goready(gp) };
+            }
+        }
+
+        // ── 5. No work found — surrender P and park ───────────────────────
         unsafe { stopm() };
         // Woken up by startm/goready; P has been (re-)attached.  Try again.
     }
@@ -337,6 +370,11 @@ pub(crate) unsafe fn execute(gp: *mut G) -> ! {
         unsafe { (*p).schedtick.fetch_add(1, Relaxed) };
     }
 
+    // Checkpoint growth: proactively double the stack if the saved SP is
+    // within 2×STACK_GUARD of the guard page.  Prevents a SIGSEGV on the
+    // very first instruction of the next quantum.
+    unsafe { grow_stack_if_needed(gp) };
+
     // Switch into the goroutine's stack.  Never returns.
     unsafe {
         set_current_g(gp);
@@ -401,6 +439,157 @@ unsafe extern "C" fn gosched_m(gp: *mut G) {
         sched().global_run_q.push_batch(gp, gp, 1);
     }
 
+    unsafe { schedule() };
+}
+
+// ---------------------------------------------------------------------------
+// Async preemption (Step 4) — SIGURG handler + asyncPreempt2
+// ---------------------------------------------------------------------------
+
+/// Previous SIGURG handler (chained if the signal is not a preemption).
+static PREV_SIGURG: Mutex<Option<libc::sigaction>> = Mutex::new(None);
+
+/// Install the runtime's SIGURG handler for async goroutine preemption.
+///
+/// When sysmon wants to preempt a goroutine it sets `gp.preempt = true` then
+/// calls `pthread_kill(m.pthread_id, SIGURG)`.  The signal handler detects the
+/// goroutine preempt flag, pushes the goroutine's current PC onto its stack,
+/// and redirects `RIP`/`PC` to [`async_preempt_trampoline`].  The trampoline
+/// saves all live registers, calls `async_preempt2` (which `mcall`s into the
+/// scheduler), restores all registers on resume, and `ret`s to the original PC.
+///
+/// # Safety
+/// Call once during `schedinit`.
+pub(crate) unsafe fn install_sigurg_handler() {
+    let mut sa: libc::sigaction = unsafe { std::mem::zeroed() };
+    sa.sa_sigaction = sigurg_handler as *const () as usize;
+    sa.sa_flags     = libc::SA_SIGINFO | libc::SA_ONSTACK | (libc::SA_RESTART as libc::c_int);
+    unsafe { libc::sigemptyset(&mut sa.sa_mask) };
+
+    let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
+    let ret = unsafe { libc::sigaction(libc::SIGURG, &sa, &mut old) };
+    assert_eq!(ret, 0, "install_sigurg_handler: sigaction failed");
+
+    *PREV_SIGURG.lock().unwrap() = Some(old);
+}
+
+/// SIGURG handler: redirect a preemptable goroutine to `async_preempt_trampoline`.
+unsafe extern "C" fn sigurg_handler(
+    sig:  libc::c_int,
+    info: *mut libc::siginfo_t,
+    ctx:  *mut libc::c_void,
+) {
+    let gp = current_g();
+    if !gp.is_null() && unsafe { (*gp).preempt } {
+        // Redirect goroutine to the preempt trampoline.
+        unsafe { redirect_to_async_preempt(gp, ctx) };
+        return;
+    }
+
+    // Not our signal — chain to the previous handler.
+    let prev = PREV_SIGURG.lock().unwrap().clone();
+    match prev {
+        Some(old) if old.sa_sigaction != libc::SIG_DFL as usize
+                  && old.sa_sigaction != libc::SIG_IGN as usize => {
+            type SaFn = unsafe extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void);
+            let f: SaFn = unsafe { std::mem::transmute(old.sa_sigaction) };
+            unsafe { f(sig, info, ctx) };
+        }
+        _ => {} // default action for SIGURG is no-op; nothing to do
+    }
+}
+
+/// Redirect the goroutine's execution to `async_preempt_trampoline` by modifying
+/// the interrupted register state in `ucontext_t`.
+///
+/// On AMD64/x86_64: push the original `RIP` onto the goroutine's stack (decrement
+/// `RSP`, write to `[RSP]`), then set `RIP` = `async_preempt_trampoline`.
+///
+/// On AArch64: place the original `PC` into `LR` (x30), then set `PC` to the
+/// trampoline.  The trampoline saves x30 and restores it before `ret`.
+#[allow(unused_variables)]
+unsafe fn redirect_to_async_preempt(gp: *mut G, ctx: *mut libc::c_void) {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    unsafe {
+        let uc  = ctx as *mut libc::ucontext_t;
+        let rip = (*uc).uc_mcontext.gregs[libc::REG_RIP as usize] as usize;
+        let rsp = (*uc).uc_mcontext.gregs[libc::REG_RSP as usize] as usize;
+        let new_rsp = rsp - 8;
+        *(new_rsp as *mut usize) = rip;
+        (*uc).uc_mcontext.gregs[libc::REG_RSP as usize] = new_rsp as libc::greg_t;
+        (*uc).uc_mcontext.gregs[libc::REG_RIP as usize] =
+            async_preempt_trampoline as usize as libc::greg_t;
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    unsafe {
+        let uc  = ctx as *mut libc::ucontext_t;
+        // Save original PC into x30 (LR); the trampoline saves and restores x30.
+        (*uc).uc_mcontext.regs[30] = (*uc).uc_mcontext.pc;
+        (*uc).uc_mcontext.pc = async_preempt_trampoline as u64;
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    unsafe {
+        let uc  = ctx as *mut libc::ucontext_t;
+        let ss  = &mut (*(*uc).uc_mcontext).__ss;
+        let rip = ss.__rip as usize;
+        let rsp = ss.__rsp as usize;
+        let new_rsp = rsp - 8;
+        *(new_rsp as *mut usize) = rip;
+        ss.__rsp = new_rsp as u64;
+        ss.__rip = async_preempt_trampoline as *const () as u64;
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    unsafe {
+        let uc  = ctx as *mut libc::ucontext_t;
+        let ss  = &mut (*(*uc).uc_mcontext).__ss;
+        ss.__lr = ss.__pc;
+        ss.__pc = async_preempt_trampoline as u64;
+    }
+}
+
+/// Called by `async_preempt_trampoline` after all live registers have been
+/// saved to the goroutine's stack.
+///
+/// Performs a cooperative yield via `mcall → schedule()`.  When the goroutine
+/// is resumed by `gogo`, execution returns here; the trampoline then restores
+/// the saved registers and `ret`s to the original interrupted PC.
+///
+/// Ported from `asyncPreempt2` in `runtime/preempt.go`.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn async_preempt2() {
+    let gp = current_g();
+    if gp.is_null() {
+        return;
+    }
+
+    // Clear preempt flags (sysmon will re-set them next time).
+    unsafe {
+        (*gp).preempt     = false;
+        (*gp).stackguard0 = (*gp).stack.lo + STACK_GUARD;
+    }
+
+    // mcall saves this goroutine's state, switches to g0, and calls preemptm.
+    // When the goroutine is rescheduled via gogo, mcall returns here.
+    unsafe { mcall(gp, preemptm) };
+}
+
+/// `mcall` target for async preemption.  Runs on g0's stack.
+///
+/// Marks the goroutine as `GRUNNABLE`, detaches it from the M, and re-enters
+/// the scheduler — equivalent to `gosched_m` but called from a signal context.
+unsafe extern "C" fn preemptm(gp: *mut G) {
+    let m = current_m();
+    unsafe {
+        (*gp).atomicstatus.store(GRUNNABLE, Release);
+        (*gp).m   = ptr::null_mut();
+        (*m).curg = ptr::null_mut();
+        set_current_g(ptr::null_mut());
+        (*gp).schedlink = ptr::null_mut();
+        sched().global_run_q.push_batch(gp, gp, 1);
+    }
     unsafe { schedule() };
 }
 
@@ -713,6 +902,13 @@ pub(crate) fn schedinit(nprocs: i32) {
         unsafe { spawn_m(id, p_ptr) };
     }
 
+    // Install SIGSEGV handler for goroutine stack guard-page growth (Step 3).
+    unsafe { install_sigsegv_handler() };
+
+    // Install SIGURG handler for async goroutine preemption (Step 4).
+    // sysmon sends SIGURG to an M when its goroutine has been running >10 ms.
+    unsafe { install_sigurg_handler() };
+
     // Start the background monitor thread (sysmon).
     start_sysmon();
     // Start the background timer thread.
@@ -781,7 +977,7 @@ pub(crate) fn run_impl<F: FnOnce() + Send + 'static>(f: F) {
 // Tests
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
 

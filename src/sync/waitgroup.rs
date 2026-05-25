@@ -18,7 +18,7 @@
 //!
 //! Ported from `sync/waitgroup.go`.
 
-use std::sync::{Condvar, Mutex};
+use crate::loom_shim::{Condvar, Mutex};
 
 // ---------------------------------------------------------------------------
 // Internal state
@@ -128,7 +128,7 @@ impl Default for WaitGroup {
 // Tests
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
     use crate::runtime::sched::run_impl;
@@ -260,5 +260,75 @@ mod tests {
     fn negative_counter_panics() {
         let wg = WaitGroup::new();
         wg.add(-1); // counter is 0 → -1 → panic
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Loom model tests
+// ---------------------------------------------------------------------------
+
+#[cfg(all(test, loom))]
+mod loom_tests {
+    use super::*;
+    use loom::sync::Arc;
+
+    /// One worker calls done(); the waiter must unblock without deadlocking.
+    /// Loom explores all interleavings of done() vs wait().
+    #[test]
+    fn done_unblocks_wait() {
+        loom::model(|| {
+            let wg  = Arc::new(WaitGroup::new());
+            let wg2 = Arc::clone(&wg);
+
+            wg.add(1);
+
+            let worker = loom::thread::spawn(move || {
+                wg2.done();
+            });
+
+            wg.wait(); // must not deadlock in any interleaving
+
+            worker.join().unwrap();
+        });
+    }
+
+    /// Two concurrent done() calls both reach zero; a concurrent wait()
+    /// must see the final count of zero in every interleaving.
+    #[test]
+    fn two_workers_unblock_wait() {
+        loom::model(|| {
+            let wg  = Arc::new(WaitGroup::new());
+            let wg2 = Arc::clone(&wg);
+            let wg3 = Arc::clone(&wg);
+            let wg4 = Arc::clone(&wg);
+
+            wg.add(2);
+
+            let t1 = loom::thread::spawn(move || wg2.done());
+            let t2 = loom::thread::spawn(move || wg3.done());
+            let waiter = loom::thread::spawn(move || wg4.wait());
+
+            t1.join().unwrap();
+            t2.join().unwrap();
+            waiter.join().unwrap();
+        });
+    }
+
+    /// add() and done() may interleave; wait() must always see the true zero.
+    #[test]
+    fn add_and_done_interleave() {
+        loom::model(|| {
+            let wg  = Arc::new(WaitGroup::new());
+            let wg2 = Arc::clone(&wg);
+            let wg3 = Arc::clone(&wg);
+
+            // One add(1) followed concurrently by done() and wait().
+            wg.add(1);
+
+            let adder = loom::thread::spawn(move || wg2.done());
+            wg3.wait();
+
+            adder.join().unwrap();
+        });
     }
 }

@@ -499,7 +499,7 @@ pub fn send_case_of<T: Send + 'static>(tx: &Sender<T>, val: *mut ManuallyDrop<T>
 // Tests
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 #[allow(unused_unsafe)] // some closures call unsafe fn inside an outer unsafe{} block
 mod tests {
     use super::*;
