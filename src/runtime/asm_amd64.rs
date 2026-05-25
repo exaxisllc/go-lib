@@ -1,9 +1,12 @@
-//! x86-64 context switch primitives — ported from `runtime/asm_amd64.s`.
+//! x86-64 context switch primitives — ported from `runtime/asm_amd64.s` and
+//! `runtime/preempt_amd64.s`.
 //!
-//! Three public entry points:
-//! - [`gogo`]       — restore a saved `Gobuf` and resume a goroutine.
-//! - [`mcall`]      — save current G, switch to g0's stack, call a fn.
-//! - [`systemstack`] — run a closure on g0's stack (TODO: step 8).
+//! Public entry points:
+//! - [`gogo`]                     — restore a saved `Gobuf` and resume a goroutine.
+//! - [`mcall`]                    — save current G, switch to g0's stack, call a fn.
+//! - [`async_preempt_trampoline`] — save all GPRs + XMMs, call `async_preempt2`,
+//!                                  restore, ret to interrupted PC.  *(v2.0 — Step 4)*
+//! - [`systemstack`]              — run a closure on g0's stack (TODO).
 //!
 //! ## Design vs Go's approach
 //!
@@ -193,8 +196,137 @@ pub(crate) unsafe fn mcall(g: *mut G, fn_ptr: unsafe extern "C" fn(*mut G)) {
 
 /// Run `f` on the M's system stack (g0) then return to the current G's stack.
 ///
-/// TODO(step 8): implement once `M::g0` is wired up.
+/// Used by channel operations and the scheduler to ensure critical sections
+/// execute with sufficient stack headroom.  Currently unimplemented; goroutines
+/// that need extra headroom should heap-allocate large temporaries instead.
 #[allow(dead_code)]
 pub(crate) unsafe fn systemstack<F: FnOnce()>(_f: F) {
-    todo!("systemstack: requires M::g0 (step 6) and schedule() (step 8)")
+    todo!("systemstack not yet implemented")
+}
+
+// ---------------------------------------------------------------------------
+// async_preempt_trampoline — Step 4: async signal-based preemption
+// ---------------------------------------------------------------------------
+
+/// Trampoline injected by the SIGURG handler to preempt a running goroutine.
+///
+/// The SIGURG handler redirects the goroutine's `RIP` to this function and
+/// pushes the original `RIP` onto the goroutine's stack (decrements `RSP` and
+/// writes the original PC to `[RSP]`).  When the goroutine resumes after the
+/// signal returns, execution begins here — exactly as if the goroutine had been
+/// called with a normal `call` instruction.
+///
+/// ## Register layout on entry
+/// - `[RSP]`   = original `RIP` (the preemption point; serves as the return address)
+/// - `RSP+8..` = goroutine's live stack at the moment of preemption
+/// - All other registers: unchanged (intact from the interrupted state)
+///
+/// ## Frame layout (built by this function)
+/// ```text
+/// [RSP+0  .. RSP+239]: 15 × 8 B general-purpose registers
+///                       order: RBP, R15, R14, R13, R12, R11, R10, R9,
+///                              R8,  RDI, RSI, RDX, RCX, RBX, RAX
+/// [RSP-256 .. RSP-1]:  16 × 16 B XMM registers (XMM15 .. XMM0)
+/// ```
+///
+/// Total frame: 15×8 + 16×16 = 120 + 256 = 376 B (RSP stays 16-byte aligned
+/// before the `call async_preempt2` instruction).
+///
+/// ## Stack alignment
+/// On entry `RSP % 16 == 8` (the "call" pushed one 8-byte return address).
+/// After 15 pushes (120 B) `RSP % 16 == 8 - 120%16 == 8 - 8 == 0`.
+/// After `sub rsp, 256` (256 B) `RSP % 16 == 0`.  Correct for a call site.
+///
+/// Ported from the auto-generated `asyncPreempt` in `runtime/preempt_amd64.s`.
+#[unsafe(naked)]
+pub(crate) unsafe extern "C" fn async_preempt_trampoline() {
+    core::arch::naked_asm!(
+        // ── save all general-purpose registers (15 pushes = 120 B) ──────────
+        "push rbp",
+        "push r15",
+        "push r14",
+        "push r13",
+        "push r12",
+        "push r11",
+        "push r10",
+        "push r9",
+        "push r8",
+        "push rdi",
+        "push rsi",
+        "push rdx",
+        "push rcx",
+        "push rbx",
+        "push rax",
+        // RSP % 16 == 0 here (15 pushes × 8 B from an 8-mod-16 base)
+
+        // ── allocate XMM save area (256 B for 16 × 16 B XMM regs) ──────────
+        "sub rsp, 256",
+        // RSP % 16 == 0 — correct call-site alignment
+
+        // ── save XMM registers ───────────────────────────────────────────────
+        "movdqu [rsp + 0],   xmm0",
+        "movdqu [rsp + 16],  xmm1",
+        "movdqu [rsp + 32],  xmm2",
+        "movdqu [rsp + 48],  xmm3",
+        "movdqu [rsp + 64],  xmm4",
+        "movdqu [rsp + 80],  xmm5",
+        "movdqu [rsp + 96],  xmm6",
+        "movdqu [rsp + 112], xmm7",
+        "movdqu [rsp + 128], xmm8",
+        "movdqu [rsp + 144], xmm9",
+        "movdqu [rsp + 160], xmm10",
+        "movdqu [rsp + 176], xmm11",
+        "movdqu [rsp + 192], xmm12",
+        "movdqu [rsp + 208], xmm13",
+        "movdqu [rsp + 224], xmm14",
+        "movdqu [rsp + 240], xmm15",
+
+        // ── call async_preempt2 (yields via mcall → schedule) ───────────────
+        // RSP is 16-byte aligned here; `call` pushes 8 → RSP%16==8 in callee.
+        "call {ap2}",
+
+        // ── restore XMM registers ────────────────────────────────────────────
+        "movdqu xmm0,  [rsp + 0]",
+        "movdqu xmm1,  [rsp + 16]",
+        "movdqu xmm2,  [rsp + 32]",
+        "movdqu xmm3,  [rsp + 48]",
+        "movdqu xmm4,  [rsp + 64]",
+        "movdqu xmm5,  [rsp + 80]",
+        "movdqu xmm6,  [rsp + 96]",
+        "movdqu xmm7,  [rsp + 112]",
+        "movdqu xmm8,  [rsp + 128]",
+        "movdqu xmm9,  [rsp + 144]",
+        "movdqu xmm10, [rsp + 160]",
+        "movdqu xmm11, [rsp + 176]",
+        "movdqu xmm12, [rsp + 192]",
+        "movdqu xmm13, [rsp + 208]",
+        "movdqu xmm14, [rsp + 224]",
+        "movdqu xmm15, [rsp + 240]",
+
+        // ── release XMM save area ────────────────────────────────────────────
+        "add rsp, 256",
+
+        // ── restore general-purpose registers ────────────────────────────────
+        "pop rax",
+        "pop rbx",
+        "pop rcx",
+        "pop rdx",
+        "pop rsi",
+        "pop rdi",
+        "pop r8",
+        "pop r9",
+        "pop r10",
+        "pop r11",
+        "pop r12",
+        "pop r13",
+        "pop r14",
+        "pop r15",
+        "pop rbp",
+
+        // ── return to the original interrupted PC ─────────────────────────────
+        // [RSP] holds the original RIP (placed there by the SIGURG handler).
+        "ret",
+
+        ap2 = sym crate::runtime::sched::async_preempt2,
+    )
 }

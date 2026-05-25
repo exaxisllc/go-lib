@@ -1,9 +1,12 @@
-//! AArch64 context switch primitives — ported from `runtime/asm_arm64.s`.
+//! AArch64 context switch primitives — ported from `runtime/asm_arm64.s` and
+//! `runtime/preempt_arm64.s`.
 //!
-//! Three public entry points:
-//! - [`gogo`]       — restore a saved `Gobuf` and resume a goroutine.
-//! - [`mcall`]      — save current G, switch to g0's stack, call a fn.
-//! - [`systemstack`] — run a closure on g0's stack (TODO: step 8).
+//! Public entry points:
+//! - [`gogo`]                     — restore a saved `Gobuf` and resume a goroutine.
+//! - [`mcall`]                    — save current G, switch to g0's stack, call a fn.
+//! - [`async_preempt_trampoline`] — save all GPRs + d0–d31, call `async_preempt2`,
+//!                                  restore, ret to interrupted PC.  *(v2.0 — Step 4)*
+//! - [`systemstack`]              — run a closure on g0's stack (TODO).
 //!
 //! ## Design vs Go's approach
 //!
@@ -192,13 +195,126 @@ pub(crate) unsafe fn mcall(g: *mut G, fn_ptr: unsafe extern "C" fn(*mut G)) {
 /// Run `f` on the M's system stack (g0) then return to the current G's stack.
 ///
 /// Used by channel operations and the scheduler to ensure critical sections
-/// always execute with sufficient stack headroom, regardless of how much of
-/// the goroutine's own stack is already in use.
-///
-/// TODO(step 8): implement once `M::g0` is wired up.  The implementation will
-/// save the current G's `Gobuf`, switch to g0's stack, call `f()`, then
-/// switch back and restore the G's stack before returning.
+/// execute with sufficient stack headroom, regardless of how much of the
+/// goroutine's own stack is already in use.  Currently unimplemented; goroutines
+/// that need extra headroom should heap-allocate large temporaries instead.
 #[allow(dead_code)]
 pub(crate) unsafe fn systemstack<F: FnOnce()>(_f: F) {
-    todo!("systemstack: requires M::g0 (step 6) and schedule() (step 8)")
+    todo!("systemstack not yet implemented")
+}
+
+// ---------------------------------------------------------------------------
+// async_preempt_trampoline — Step 4: async signal-based preemption
+// ---------------------------------------------------------------------------
+
+/// AArch64 async-preemption trampoline.
+///
+/// The SIGURG handler sets `x30` (LR) = original `PC` then redirects `PC` to
+/// this function.  Execution resumes here with all registers intact except x30.
+///
+/// ## Frame layout (512 B, 16-byte aligned)
+/// ```text
+/// sp+0   .. sp+231  : x0–x28 (29 GPRs × 8 B)
+/// sp+232 .. sp+239  : x29 (frame pointer)
+/// sp+240 .. sp+247  : x30 (LR = original PC)
+/// sp+248 .. sp+375  : d0–d15  (16 × 8 B double FP regs, caller-saved)
+/// sp+376 .. sp+503  : d16–d31 (16 × 8 B double FP regs, callee-saved in AAPCS64)
+///   ↑ 504 B used, padded to 512 B for 16-byte alignment
+/// ```
+///
+/// After `bl async_preempt2` (which calls `mcall → schedule` and returns when
+/// the goroutine is rescheduled), all registers are restored and `ret` returns
+/// to the original PC (via restored x30).
+///
+/// Ported from the auto-generated `asyncPreempt` in `runtime/preempt_arm64.s`.
+#[unsafe(naked)]
+pub(crate) unsafe extern "C" fn async_preempt_trampoline() {
+    core::arch::naked_asm!(
+        // ── allocate frame (512 B) ────────────────────────────────────────────
+        "sub sp, sp, #512",
+
+        // ── save GPRs x0–x28, x29, x30 ───────────────────────────────────────
+        "stp x0,  x1,  [sp, #0]",
+        "stp x2,  x3,  [sp, #16]",
+        "stp x4,  x5,  [sp, #32]",
+        "stp x6,  x7,  [sp, #48]",
+        "stp x8,  x9,  [sp, #64]",
+        "stp x10, x11, [sp, #80]",
+        "stp x12, x13, [sp, #96]",
+        "stp x14, x15, [sp, #112]",
+        "stp x16, x17, [sp, #128]",
+        "stp x18, x19, [sp, #144]",
+        "stp x20, x21, [sp, #160]",
+        "stp x22, x23, [sp, #176]",
+        "stp x24, x25, [sp, #192]",
+        "stp x26, x27, [sp, #208]",
+        "stp x28, x29, [sp, #224]",
+        "str x30,      [sp, #240]",   // x30 = original PC (set by SIGURG handler)
+
+        // ── save FP regs d0–d31 ───────────────────────────────────────────────
+        "stp d0,  d1,  [sp, #248]",
+        "stp d2,  d3,  [sp, #264]",
+        "stp d4,  d5,  [sp, #280]",
+        "stp d6,  d7,  [sp, #296]",
+        "stp d8,  d9,  [sp, #312]",
+        "stp d10, d11, [sp, #328]",
+        "stp d12, d13, [sp, #344]",
+        "stp d14, d15, [sp, #360]",
+        "stp d16, d17, [sp, #376]",
+        "stp d18, d19, [sp, #392]",
+        "stp d20, d21, [sp, #408]",
+        "stp d22, d23, [sp, #424]",
+        "stp d24, d25, [sp, #440]",
+        "stp d26, d27, [sp, #456]",
+        "stp d28, d29, [sp, #472]",
+        "stp d30, d31, [sp, #488]",
+
+        // ── call async_preempt2 ────────────────────────────────────────────────
+        // bl sets x30 = return address (inside this trampoline).  On return from
+        // async_preempt2 (after the goroutine is rescheduled), sp is restored to
+        // this frame by mcall/gogo.
+        "bl {ap2}",
+
+        // ── restore FP regs ────────────────────────────────────────────────────
+        "ldp d0,  d1,  [sp, #248]",
+        "ldp d2,  d3,  [sp, #264]",
+        "ldp d4,  d5,  [sp, #280]",
+        "ldp d6,  d7,  [sp, #296]",
+        "ldp d8,  d9,  [sp, #312]",
+        "ldp d10, d11, [sp, #328]",
+        "ldp d12, d13, [sp, #344]",
+        "ldp d14, d15, [sp, #360]",
+        "ldp d16, d17, [sp, #376]",
+        "ldp d18, d19, [sp, #392]",
+        "ldp d20, d21, [sp, #408]",
+        "ldp d22, d23, [sp, #424]",
+        "ldp d24, d25, [sp, #440]",
+        "ldp d26, d27, [sp, #456]",
+        "ldp d28, d29, [sp, #472]",
+        "ldp d30, d31, [sp, #488]",
+
+        // ── restore GPRs ──────────────────────────────────────────────────────
+        "ldr x30,      [sp, #240]",   // restore original PC into x30 (LR)
+        "ldp x28, x29, [sp, #224]",
+        "ldp x26, x27, [sp, #208]",
+        "ldp x24, x25, [sp, #192]",
+        "ldp x22, x23, [sp, #176]",
+        "ldp x20, x21, [sp, #160]",
+        "ldp x18, x19, [sp, #144]",
+        "ldp x16, x17, [sp, #128]",
+        "ldp x14, x15, [sp, #112]",
+        "ldp x12, x13, [sp, #96]",
+        "ldp x10, x11, [sp, #80]",
+        "ldp x8,  x9,  [sp, #64]",
+        "ldp x6,  x7,  [sp, #48]",
+        "ldp x4,  x5,  [sp, #32]",
+        "ldp x2,  x3,  [sp, #16]",
+        "ldp x0,  x1,  [sp, #0]",
+
+        // ── release frame and return to original PC ────────────────────────────
+        "add sp, sp, #512",
+        "ret",                          // branches to x30 = original PC
+
+        ap2 = sym crate::runtime::sched::async_preempt2,
+    )
 }

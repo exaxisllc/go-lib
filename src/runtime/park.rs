@@ -138,7 +138,7 @@ pub(crate) unsafe fn goready(gp: *mut G) {
 // Tests
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
     use crate::runtime::g::{Stack, G, GRUNNABLE, GWAITING};

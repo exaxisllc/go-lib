@@ -1,29 +1,34 @@
 //! Goroutine scheduler internals.
 //!
-//! Ported from `src/runtime/` in <https://github.com/golang/go>. The mapping
-//! is one-to-one where possible:
+//! Ported from `src/runtime/` in <https://github.com/golang/go>.  Each submodule
+//! maps to the Go source file(s) shown below.
 //!
-//! Many constants, struct fields, and helper functions in this module are
-//! faithful ports of Go runtime symbols that are not yet wired up in v1
-//! (stack growth, async preemption, GC integration, …).  They are retained
-//! intentionally so that future work can land incrementally without having to
-//! re-discover or re-port them.  The `#[allow(dead_code)]` annotation below
-//! suppresses the resulting unused-item warnings.
+//! ## v2.0 additions
 //!
-//! | This module   | Go source                                            |
-//! |---------------|------------------------------------------------------|
-//! | `g`           | `runtime/runtime2.go`                                |
-//! | `m`           | `runtime/runtime2.go`                                |
-//! | `p`           | `runtime/runtime2.go`, `runtime/proc.go`             |
-//! | `sched`       | `runtime/proc.go`                                    |
-//! | `stack`       | `runtime/stack.go`                                   |
-//! | `park`        | `runtime/proc.go` (gopark / goready)                 |
-//! | `sudog`       | `runtime/runtime2.go`, `runtime/proc.go`             |
-//! | `syscall`     | `runtime/proc.go` (entersyscall / exitsyscall)       |
-//! | `sysmon`      | `runtime/proc.go` (sysmon)                           |
-//! | `time`        | `runtime/time.go`                                    |
-//! | `asm_amd64`   | `runtime/asm_amd64.s`                                |
-//! | `asm_arm64`   | `runtime/asm_arm64.s`                                |
+//! | New module / symbol | Purpose |
+//! |----|-----|
+//! | `stack` — `newstack`, `copystack`, `sigsegv_handler` | Dynamic goroutine stack growth (Step 3) |
+//! | `m` — `pthread_id`, `setup_sigaltstack` | Per-M thread ID + 64 KiB alternate signal stack (Step 4) |
+//! | `sched` — `async_preempt2`, `sigurg_handler` | Non-cooperative goroutine preemption via SIGURG (Step 4) |
+//! | `asm_amd64`/`asm_arm64` — `async_preempt_trampoline` | Save/restore all registers around the preemption yield (Step 4) |
+//! | `sysmon` — `pthread_kill(SIGURG)` in `preemptone` | Signal delivery for async preemption (Step 4) |
+//! | `netpoll` | epoll (Linux) / kqueue (macOS) fd-readiness backend (Step 5) |
+//!
+//! | This module   | Go source                                                   |
+//! |---------------|-------------------------------------------------------------|
+//! | `g`           | `runtime/runtime2.go`                                       |
+//! | `m`           | `runtime/runtime2.go`, `runtime/proc.go`                    |
+//! | `p`           | `runtime/runtime2.go`, `runtime/proc.go`                    |
+//! | `sched`       | `runtime/proc.go`, `runtime/preempt.go`                     |
+//! | `stack`       | `runtime/stack.go`, `runtime/signal_unix.go`                |
+//! | `netpoll`     | `runtime/netpoll_epoll.go`, `runtime/netpoll_kqueue.go`     |
+//! | `park`        | `runtime/proc.go` (gopark / goready)                        |
+//! | `sudog`       | `runtime/runtime2.go`, `runtime/proc.go`                    |
+//! | `syscall`     | `runtime/proc.go` (entersyscall / exitsyscall)              |
+//! | `sysmon`      | `runtime/proc.go` (sysmon / retake)                         |
+//! | `time`        | `runtime/time.go`                                           |
+//! | `asm_amd64`   | `runtime/asm_amd64.s`, `runtime/preempt_amd64.s`           |
+//! | `asm_arm64`   | `runtime/asm_arm64.s`, `runtime/preempt_arm64.s`           |
 
 // Faithful Go-runtime ports contain symbols that will be used when deferred
 // features land.  Suppress dead-code warnings across the whole runtime module.
@@ -32,6 +37,7 @@
 pub(crate) mod g;
 pub(crate) mod m;
 pub(crate) mod rawmutex;
+pub(crate) mod netpoll;
 pub(crate) mod p;
 pub(crate) mod park;
 pub(crate) mod sched;

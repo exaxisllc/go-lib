@@ -380,7 +380,7 @@ pub(crate) unsafe fn release_sudog(s: *mut Sudog) {
 // Tests
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
     use crate::runtime::g::GWAITING;

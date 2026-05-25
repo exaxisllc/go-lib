@@ -1,20 +1,26 @@
 //! Background monitor thread — ported from `runtime/proc.go` (`sysmon`).
 //!
-//! Runs a single background OS thread that:
-//! - Retakes Ps stuck in syscalls (`retake`).
-//! - Uses the same sleep-backoff schedule as Go: 20 µs → doubles every 50 idle
-//!   iterations → capped at 10 ms.
+//! Runs a single detached OS thread that performs three duties every iteration:
 //!
-//! Step 11 adds cooperative preemption hints: for every P found in `PRUNNING`
-//! whose `schedtick` has not advanced for longer than `FORCE_PREEMPT_NS`
-//! (10 ms), sysmon sets `curg.preempt = true` and `curg.stackguard0 =
-//! STACK_PREEMPT`.  The goroutine must call `gosched()` at its next safe
-//! point to honour the hint — there are no stack-check traps in v1.
+//! 1. **Netpoll** — calls [`netpoll::netpoll_wait(0)`][super::netpoll::netpoll_wait]
+//!    (non-blocking) and issues [`goready`][super::park::goready] for every
+//!    goroutine whose I/O fd became ready.  *(v2.0 — Step 5)*
 //!
-//! What is **not** implemented in v1 (deferred):
-//! - Async signal-based preemption (no `SIGURG` / `asyncPreempt`).
-//! - Timer firing (step 17).
-//! - `netpoll` integration.
+//! 2. **Async preemption** — for every P in `PRUNNING` whose `schedtick` has
+//!    not advanced for more than `FORCE_PREEMPT_NS` (10 ms), `preemptone`:
+//!    - Sets `curg.preempt = true` and `curg.stackguard0 = STACK_PREEMPT`.
+//!    - Calls `pthread_kill(m.pthread_id, SIGURG)` to deliver the signal to
+//!      the exact OS thread running that goroutine.
+//!    The SIGURG handler in `sched.rs` redirects the goroutine to
+//!    `async_preempt_trampoline`, producing a non-cooperative yield.
+//!    *(v2.0 — Step 4; replaces the v1 cooperative-hint-only approach)*
+//!
+//! 3. **Syscall retake** — if a P has been stuck in `PSYSCALL` for more than
+//!    `FORCE_RETAKE_NS` (20 µs), CAS its status to `PIDLE` and hand it off via
+//!    `startm` so other goroutines can run.
+//!
+//! Sleep schedule (unchanged from Go): 20 µs initial; doubles every 50 idle
+//! iterations; capped at 10 ms.
 //!
 //! Ported from `sysmon` and `retake` in `runtime/proc.go`.
 
@@ -25,6 +31,7 @@ use std::time::{Duration, Instant};
 use super::g::STACK_PREEMPT;
 use super::p::{PIDLE, PSYSCALL, PRUNNING};
 use super::sched::{sched, startm};
+// libc is used for pthread_kill in preemptone (Step 4).
 
 // ---------------------------------------------------------------------------
 // Sleep constants — from Go's sysmon loop
@@ -93,6 +100,9 @@ pub(crate) fn start_sysmon() {
 ///
 /// Ported from `sysmon` in `runtime/proc.go`.
 fn sysmon_loop() {
+    // Initialise the netpoll backend (idempotent).
+    super::netpoll::netpoll_init();
+
     let mut delay_us: u64 = MIN_SLEEP_US;
     let mut idle: u64 = 0;
     // Per-P tick records, grown lazily to match `allp.len()`.
@@ -107,6 +117,19 @@ fn sysmon_loop() {
             delay_us = (delay_us * 2).min(MAX_SLEEP_US);
         }
         std::thread::sleep(Duration::from_micros(delay_us));
+
+        // ── Netpoll: wake goroutines whose I/O is ready ───────────────────
+        // Use a non-blocking poll here (0 ms timeout); sysmon must not block
+        // indefinitely or it will miss retake/preempt duties.
+        {
+            let ready = unsafe { super::netpoll::netpoll_wait(0) };
+            if !ready.is_empty() {
+                idle = 0;
+                for gp in ready {
+                    unsafe { super::park::goready(gp) };
+                }
+            }
+        }
 
         // ── Retake Ps stuck in syscalls ───────────────────────────────────
         let now_ns = monotonic_ns();
@@ -238,14 +261,14 @@ fn retake(now_ns: u64, ticks: &mut Vec<SysmonTick>) -> u32 {
 // preemptone — set the preempt flag on the goroutine running on pp
 // ---------------------------------------------------------------------------
 
-/// Request a cooperative yield from the goroutine currently running on `pp`.
+/// Request async preemption of the goroutine running on `pp`.
 ///
-/// Sets `gp.preempt = true` and `gp.stackguard0 = STACK_PREEMPT` so the G's
-/// next call to `gosched()` (or runtime safe-point check) notices the hint.
-/// Does nothing if the P is not currently running a goroutine.
+/// Sets `gp.preempt = true` and `gp.stackguard0 = STACK_PREEMPT`, then
+/// delivers `SIGURG` to the M's OS thread via `pthread_kill`.  The signal
+/// handler (`sigurg_handler` in `sched.rs`) detects the preempt flag and
+/// redirects the goroutine to `async_preempt_trampoline`.
 ///
-/// This is a *hint only* — in v1 there are no stack-check traps, so the G
-/// must voluntarily call `gosched()`.
+/// Falls back gracefully if the P is not currently running a goroutine.
 ///
 /// Ported from `preemptone` in `runtime/proc.go`.
 unsafe fn preemptone(pp: *mut super::p::P) {
@@ -257,11 +280,22 @@ unsafe fn preemptone(pp: *mut super::p::P) {
     if gp.is_null() {
         return;
     }
-    // Use Release so the goroutine thread sees the write promptly.
+    let pthread_id = unsafe { (*mp).pthread_id };
+    if pthread_id == 0 {
+        // M::start() has not run yet — no OS thread to signal.
+        return;
+    }
+
+    // Mark the goroutine for preemption.  The SIGURG handler reads this flag.
     unsafe {
         (*gp).preempt     = true;
         (*gp).stackguard0 = STACK_PREEMPT;
     }
+
+    // Send SIGURG to the M's OS thread.  The signal is delivered asynchronously;
+    // if the goroutine is currently in a syscall the signal arrives when it
+    // returns to user space.
+    unsafe { libc::pthread_kill(pthread_id, libc::SIGURG) };
 }
 
 // ---------------------------------------------------------------------------
@@ -282,7 +316,7 @@ fn monotonic_ns() -> u64 {
 // Tests
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
 
@@ -342,6 +376,9 @@ mod tests {
             (*m).p  = p;
             (*m).curg = gp;
             (*gp).m = m;
+            // Step 4: preemptone requires a non-zero pthread_id to send SIGURG.
+            // Use the calling thread's ID so the test exercises the real path.
+            (*m).pthread_id = libc::pthread_self();
         }
 
         // Before the call, preempt is false and stackguard0 is whatever G::new set.
@@ -353,6 +390,8 @@ mod tests {
 
         unsafe { preemptone(p) };
 
+        // preemptone set the flags and sent SIGURG.  The flags are set
+        // synchronously before pthread_kill, so we can check immediately.
         assert!(unsafe { (*gp).preempt },       "preempt must be true after preemptone");
         assert_eq!(
             unsafe { (*gp).stackguard0 }, STACK_PREEMPT,

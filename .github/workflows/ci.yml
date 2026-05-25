@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ── Standard build + test ──────────────────────────────────────────────────
+  test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: cargo build
+        run: cargo build --all-targets
+
+      - name: cargo test
+        run: cargo test
+
+      - name: cargo doc (no deps, no-run)
+        run: cargo doc --no-deps
+
+  # ── Loom concurrency model checker ────────────────────────────────────────
+  loom:
+    name: Loom model check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-loom-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: cargo test (loom)
+        # --cfg loom: activate loom::sync shims in crate::loom_shim.
+        # -- --test-threads 1: loom's model explorer must run serially.
+        # LOOM_MAX_PERMUTATIONS: cap the search so CI stays bounded;
+        #   increase locally with LOOM_MAX_PERMUTATIONS=0 (unlimited) for
+        #   deeper exploration.
+        env:
+          RUSTFLAGS: "--cfg loom"
+          LOOM_MAX_PERMUTATIONS: "10000"
+        run: cargo test -- --test-threads 1

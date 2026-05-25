@@ -13,6 +13,7 @@
 //! ## Public surface
 //! - `go!` / `select!` macros — spawn goroutines, multiplex channel ops
 //! - [`chan`] — buffered and unbuffered channels
+//! - [`net`] — goroutine-aware `TcpListener` / `TcpStream` *(v2.0)*
 //! - [`sync::WaitGroup`] — wait for a collection of goroutines
 //! - [`sync::Cond`] — goroutine-aware condition variable
 //! - [`sync::Mutex`] / [`sync::RwLock`] — re-exports of `std::sync`
@@ -21,29 +22,23 @@
 //! - [`set_gomaxprocs`] / [`gomaxprocs`] — runtime parallelism control
 //!
 //! ## Internals
-//! See [`runtime`] for the scheduler (G/M/P, parking, work stealing, sysmon).
+//! See [`runtime`] for the scheduler (G/M/P, parking, work stealing, sysmon,
+//! stack growth, async preemption, netpoll).
 //!
-//! ## Known limitations (v1 — deferred to v2+)
+//! ## v2.0 — new in this release
 //!
-//! These items are intentionally out of scope for v1.  Each is a real
-//! limitation; work-arounds are noted where applicable.
+//! - **Dynamic stack growth** (Step 3): goroutines start with an 8 KiB stack
+//!   and grow automatically up to 1 GiB via SIGSEGV guard-page detection and
+//!   `copystack` (conservative pointer adjustment).
+//! - **Async preemption** (Step 4): sysmon sends `SIGURG` to the M thread whose
+//!   goroutine has run > 10 ms.  The signal handler redirects execution to an
+//!   assembly trampoline that saves all registers, calls `async_preempt2`, and
+//!   restores state on resume — a transparent, non-cooperative yield.
+//! - **Netpoll / async I/O** (Step 5): `epoll` on Linux, `kqueue` on macOS.
+//!   Goroutines park on `EAGAIN` and are re-enqueued when the fd is ready.
+//!   See the [`net`] module for `TcpListener` / `TcpStream`.
 //!
-//! ### Stack growth
-//! Every goroutine is allocated a **fixed 64 KiB stack** backed by an
-//! `mmap`'d region with a single guard page.  Go's `morestack` / `copystack`
-//! stack-growth mechanism is not ported.  Deep recursion or large stack frames
-//! will overflow into the guard page and segfault.
-//!
-//! *Work-around*: keep goroutine call stacks shallow; move large buffers to the
-//! heap (use `Box` / `Vec`).
-//!
-//! ### Async (signal-based) preemption
-//! v1 is **cooperative only**.  The sysmon thread sets a preemption hint after
-//! 10 ms of wall time, but because there are no stack-check traps a goroutine
-//! will not be preempted until it calls [`gosched`] (or blocks on a channel /
-//! sleep).
-//!
-//! *Work-around*: sprinkle `gosched()` inside CPU-bound loops.
+//! ## Known limitations
 //!
 //! ### `defer` / `recover` / cross-goroutine `panic`
 //! Goroutine panics are caught and routed to [`set_panic_handler`]; the
@@ -51,15 +46,10 @@
 //! call-stack boundary) has no direct Rust equivalent — use `catch_unwind`
 //! inside the goroutine body when fine-grained recovery is needed.
 //!
-//! ### Netpoll / I/O integration
-//! There is no integration with the OS event loop (`epoll`/`kqueue`).
-//! Goroutines that call blocking I/O should wrap the call with
-//! [`with_syscall`] so the scheduler can hand off the P during the wait.
-//!
 //! ### Race detector
 //! The Go race detector is a compiler/runtime feature with no Rust equivalent
-//! in this crate.  Use `cargo test --release` with `loom` (separate crate) for
-//! concurrency model checking.
+//! in this crate.  Use `cargo test --cfg loom` with the [loom model checker]
+//! for systematic concurrency testing.
 //!
 //! ## Unsafe conventions
 //! The runtime modules (`src/runtime/`) are a direct port of Go's C-adjacent
@@ -76,11 +66,16 @@
 
 pub mod chan;
 pub mod context;
+/// Goroutine-aware TCP networking (Step 5: netpoll integration).
+///
+/// See [`net::TcpListener`] and [`net::TcpStream`].
+pub mod net;
 pub mod runtime;
 pub mod select;
 pub mod sync;
 
 mod go_macro;
+pub(crate) mod loom_shim;
 
 /// Initialise the go-lib scheduler and run `f` as the first goroutine.
 ///

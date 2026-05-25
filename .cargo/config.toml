@@ -1,0 +1,8 @@
+# Workspace-level Cargo configuration.
+#
+# force-frame-pointers: required by copystack (Step 3) so the frame chain can
+# be walked during goroutine stack relocation.  Without frame pointers the
+# base-pointer (rbp / x29) chain is absent and pointer adjustment is limited
+# to the conservative full-stack scan.
+[build]
+rustflags = ["-C", "force-frame-pointers=yes"]
