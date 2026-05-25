@@ -303,20 +303,24 @@ fn sleep_completes() {
     let elapsed_ms3 = Arc::clone(&elapsed_ms); // kept for the assert after run()
 
     go_lib::run(move || {
+        // Use WaitGroup so the main goroutine parks (gopark) rather than
+        // blocking the OS thread.  std::thread::sleep inside a goroutine
+        // holds the M+P without releasing them; under high scheduling
+        // pressure (many integration tests running concurrently) the timer
+        // that fires for the sleeper may find no idle M and starve past the
+        // timeout, causing an unrecoverable hang via the panic path.
+        let wg  = Arc::new(WaitGroup::new());
+        let wg2 = Arc::clone(&wg);
+        wg.add(1);
+
         go!(move || {
             let t0 = Instant::now();
             go_lib::sleep(Duration::from_millis(10));
             e2.store(t0.elapsed().as_millis() as i64, Ordering::Relaxed);
+            wg2.done();
         });
 
-        // Wait up to 500 ms for the sleeper.
-        let deadline = Instant::now() + Duration::from_millis(500);
-        loop {
-            if elapsed_ms.load(Ordering::Acquire) >= 0 { break; }
-            if Instant::now() > deadline { panic!("sleep never completed"); }
-            go_lib::gosched();
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        wg.wait(); // parks this goroutine; the M is free to run the sleeper
     });
 
     let ms = elapsed_ms3.load(Ordering::Acquire);
