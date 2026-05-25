@@ -54,7 +54,7 @@
 //! `selectgo` returns `CASE_DEFAULT` (`usize::MAX`) when the default case is
 //! taken.  Channel cases use their 0-based index within the slice.
 
-use std::mem::{ManuallyDrop, MaybeUninit};
+use std::mem::ManuallyDrop;
 use std::ptr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -120,8 +120,9 @@ pub struct SCase {
 
     /// Type-erased value pointer.
     ///
-    /// **Send**: `*mut T` — the value to send (read by the fn pointers).
-    /// **Recv**: `*mut MaybeUninit<T>` — output slot written on success.
+    /// **Send**: `*mut ManuallyDrop<T>` — the value to send (read by the fn pointers).
+    /// **Recv**: `*mut Option<T>` — output slot; written as `Some(val)` on a
+    ///           successful receive, left as `None` when the channel is closed.
     /// **Default**: `null`.
     pub(crate) elem: *mut u8,
 
@@ -165,10 +166,9 @@ struct Lehmer(u64);
 
 impl Lehmer {
     fn from_goid() -> Self {
-        let goid = unsafe {
-            let gp = current_g();
-            if gp.is_null() { 1 } else { (*gp).goid | 1 }
-        };
+        let gp = current_g();
+        // SAFETY: gp is only dereferenced after the null check.
+        let goid = if gp.is_null() { 1 } else { (unsafe { (*gp).goid }) | 1 };
         Lehmer(goid | 1) // must be odd and non-zero
     }
 
@@ -193,14 +193,18 @@ impl Lehmer {
 /// - `chosen_index` is the 0-based index into `cases`, or [`CASE_DEFAULT`] if
 ///   the default arm was taken.
 /// - `received_ok` is `true` for a normal channel recv, `false` if the
-///   channel was closed (and the receive yielded the zero value).  Always
+///   channel was closed (and the receive wrote `None` into the slot).  Always
 ///   `false` for send/default arms.
 ///
-/// # Safety
-/// - All `SCase` fields must be correctly initialised by the caller.
+/// # Preconditions
+///
+/// - All `SCase` values must be created by [`recv_case_of`] or [`send_case_of`].
 /// - Must be called from a goroutine stack (not g0 or a bare OS thread).
+///   A `debug_assert` fires in debug builds if this is violated.
+///
+/// This function is intended only for use by the `select!` macro.
 #[doc(hidden)]
-pub unsafe fn selectgo(cases: &mut [SCase], has_default: bool) -> (usize, bool) {
+pub fn selectgo(cases: &mut [SCase], has_default: bool) -> (usize, bool) {
     let n = cases.len();
 
     // ── 1. Build pollorder (random permutation) ───────────────────────────────
@@ -363,10 +367,10 @@ pub(crate) unsafe fn try_send_chan<T: Send + 'static>(
     let recv_sg = state.recvq.dequeue();
     if !recv_sg.is_null() {
         let gp = (*recv_sg).g;
-        let ep = (*recv_sg).elem as *mut MaybeUninit<T>;
+        // elem is *mut ManuallyDrop<T> (send slot); recv_sg.elem is *mut Option<T>.
+        let ep = (*recv_sg).elem as *mut Option<T>;
         if !ep.is_null() {
-            // ManuallyDrop<T> / T have identical layout → ptr::read is safe.
-            (*ep).write(ptr::read(elem as *const T));
+            *ep = Some(ptr::read(elem as *const T));
         }
         (*recv_sg).success = true;
         (*gp).param        = recv_sg as *mut u8;
@@ -384,7 +388,7 @@ pub(crate) unsafe fn try_send_chan<T: Send + 'static>(
 
 pub(crate) unsafe fn try_recv_chan<T: Send + 'static>(
     p: *const (),
-    elem: *mut u8,
+    elem: *mut u8, // *mut Option<T>
 ) -> TryResult {
     let hchan = &*(p as *const Hchan<T>);
     let state = &mut *hchan.state.get();
@@ -393,22 +397,24 @@ pub(crate) unsafe fn try_recv_chan<T: Send + 'static>(
     let send_sg = state.sendq.dequeue();
     if !send_sg.is_null() {
         let gp    = (*send_sg).g;
-        let ep    = (*send_sg).elem as *mut MaybeUninit<T>; // may be ManuallyDrop<T>
+        // send_sg.elem is *mut ManuallyDrop<T>; use ManuallyDrop explicitly so
+        // Box::from_raw for the boxed path does not run T's destructor.
+        let ep    = (*send_sg).elem as *mut ManuallyDrop<T>;
         let boxed = (*send_sg).boxed_elem;
         let val = if state.cap == 0 {
-            let v = (*ep).assume_init_read();
+            let v = ManuallyDrop::into_inner(ptr::read(ep));
             if boxed { let _ = Box::from_raw(ep); }
             (*send_sg).elem = ptr::null_mut();
             v
         } else {
             let head = state.buf.pop_front().unwrap();
-            let sv   = (*ep).assume_init_read();
+            let sv   = ManuallyDrop::into_inner(ptr::read(ep));
             if boxed { let _ = Box::from_raw(ep); }
             (*send_sg).elem = ptr::null_mut();
             state.buf.push_back(sv);
             head
         };
-        (*(elem as *mut MaybeUninit<T>)).write(val);
+        *(elem as *mut Option<T>) = Some(val);
         (*send_sg).success = true;
         (*gp).param        = send_sg as *mut u8;
         return TryResult::Handoff { gp, ok: true };
@@ -417,11 +423,11 @@ pub(crate) unsafe fn try_recv_chan<T: Send + 'static>(
     // Buffer data?
     if !state.buf.is_empty() {
         let val = state.buf.pop_front().unwrap();
-        (*(elem as *mut MaybeUninit<T>)).write(val);
+        *(elem as *mut Option<T>) = Some(val);
         return TryResult::Done { ok: true };
     }
 
-    // Closed and empty → leave elem uninitialised; caller checks ok=false.
+    // Closed and empty → elem stays None; caller checks ok=false.
     if state.closed {
         return TryResult::Done { ok: false };
     }
@@ -455,13 +461,13 @@ pub(crate) unsafe fn dequeue_recv_chan<T: Send + 'static>(p: *const (), sg: *mut
 
 /// Build a receive [`SCase`] for use in [`selectgo`].
 ///
-/// `slot` must point to a valid (possibly uninitialised) `MaybeUninit<T>` that
-/// outlives the `selectgo` call.  On success (`ok = true`) the slot holds the
-/// received value; on `ok = false` (channel closed) the slot is uninitialised.
+/// `slot` must point to an `Option<T>` initialised to `None` that outlives the
+/// `selectgo` call.  On a successful receive (`ok = true`) the slot is
+/// `Some(value)`; on `ok = false` (channel closed) the slot remains `None`.
 ///
 /// Called by the `select!` macro; not intended for direct use.
 #[doc(hidden)]
-pub fn recv_case_of<T: Send + 'static>(rx: &Receiver<T>, slot: *mut MaybeUninit<T>) -> SCase {
+pub fn recv_case_of<T: Send + 'static>(rx: &Receiver<T>, slot: *mut Option<T>) -> SCase {
     SCase {
         chan_ptr:    Arc::as_ptr(rx.hchan()) as *const (),
         sg:          ptr::null_mut(),
@@ -507,7 +513,6 @@ mod tests {
     use crate::chan::{chan, Hchan};
     use crate::runtime::sudog::Sudog;
     use crate::runtime::sched::run_impl;
-    use std::mem::MaybeUninit;
     use std::ptr;
     use std::sync::atomic::{AtomicI32, Ordering};
     use std::sync::Arc;
@@ -537,9 +542,9 @@ mod tests {
         let recv_sg = state.recvq.dequeue();
         if !recv_sg.is_null() {
             let gp  = (*recv_sg).g;
-            let ep  = (*recv_sg).elem as *mut MaybeUninit<i32>;
+            let ep  = (*recv_sg).elem as *mut Option<i32>;
             if !ep.is_null() {
-                (*ep).write(ptr::read(elem as *const i32));
+                *ep = Some(ptr::read(elem as *const i32));
             }
             (*recv_sg).success = true;
             (*gp).param        = recv_sg as *mut u8;
@@ -557,7 +562,7 @@ mod tests {
 
     /// try_fn for a **recv** case on `Hchan<i32>`.
     ///
-    /// `elem` points to a `MaybeUninit<i32>` output slot.
+    /// `elem` points to an `Option<i32>` output slot (initialised to `None`).
     unsafe fn try_recv_i32(p: *const (), elem: *mut u8) -> TryResult {
         let hchan = &*(p as *const Hchan<i32>);
         let state = &mut *hchan.state.get();
@@ -566,22 +571,22 @@ mod tests {
         let send_sg = state.sendq.dequeue();
         if !send_sg.is_null() {
             let gp    = (*send_sg).g;
-            let ep    = (*send_sg).elem as *mut MaybeUninit<i32>;
+            let ep    = (*send_sg).elem as *mut ManuallyDrop<i32>;
             let boxed = (*send_sg).boxed_elem;
             let val = if state.cap == 0 {
-                let v = (*ep).assume_init_read();
+                let v = ManuallyDrop::into_inner(ptr::read(ep));
                 if boxed { let _ = Box::from_raw(ep); }
                 (*send_sg).elem = ptr::null_mut();
                 v
             } else {
                 let head = state.buf.pop_front().unwrap();
-                let sv   = (*ep).assume_init_read();
+                let sv   = ManuallyDrop::into_inner(ptr::read(ep));
                 if boxed { let _ = Box::from_raw(ep); }
                 (*send_sg).elem = ptr::null_mut();
                 state.buf.push_back(sv);
                 head
             };
-            (*(elem as *mut MaybeUninit<i32>)).write(val);
+            *(elem as *mut Option<i32>) = Some(val);
             (*send_sg).success = true;
             (*gp).param        = send_sg as *mut u8;
             return TryResult::Handoff { gp, ok: true };
@@ -590,13 +595,12 @@ mod tests {
         // Buffer has data?
         if !state.buf.is_empty() {
             let val = state.buf.pop_front().unwrap();
-            (*(elem as *mut MaybeUninit<i32>)).write(val);
+            *(elem as *mut Option<i32>) = Some(val);
             return TryResult::Done { ok: true };
         }
 
-        // Closed and empty?
+        // Closed and empty → elem stays None.
         if state.closed {
-            (*(elem as *mut MaybeUninit<i32>)) = MaybeUninit::uninit();
             return TryResult::Done { ok: false };
         }
 
@@ -635,11 +639,11 @@ mod tests {
     }
 
     /// Build an `SCase` for a recv on channel `h`, output into `slot`.
-    fn recv_case(h: &Arc<Hchan<i32>>, slot: &mut MaybeUninit<i32>) -> SCase {
+    fn recv_case(h: &Arc<Hchan<i32>>, slot: &mut Option<i32>) -> SCase {
         SCase {
             chan_ptr:   Arc::as_ptr(h) as *const (),
             sg:        ptr::null_mut(),
-            elem:      slot as *mut MaybeUninit<i32> as *mut u8,
+            elem:      slot as *mut Option<i32> as *mut u8,
             lock_fn:   lock_i32,
             unlock_fn: unlock_i32,
             try_fn:    try_recv_i32,
@@ -657,13 +661,13 @@ mod tests {
             let (tx, rx) = chan::<i32>(4);
             tx.send(42);
 
-            let mut slot = MaybeUninit::<i32>::uninit();
+            let mut slot: Option<i32> = None;
             let mut cases = [recv_case(rx.hchan(), &mut slot)];
-            let (idx, ok) = unsafe { selectgo(&mut cases, true) };
+            let (idx, ok) = selectgo(&mut cases, true);
 
             assert_eq!(idx, 0, "should pick recv case");
             assert!(ok,        "should be ok (not closed)");
-            assert_eq!(unsafe { slot.assume_init() }, 42);
+            assert_eq!(slot.unwrap(), 42);
         });
     }
 
@@ -675,7 +679,7 @@ mod tests {
 
             let mut val = 99_i32;
             let mut cases = [send_case(tx.hchan(), &mut val)];
-            let (idx, ok) = unsafe { selectgo(&mut cases, true) };
+            let (idx, ok) = selectgo(&mut cases, true);
 
             assert_eq!(idx, 0);
             assert!(ok, "buffered send completes with ok=true");
@@ -689,9 +693,9 @@ mod tests {
         run_impl(|| {
             let (_tx, rx) = chan::<i32>(0);
 
-            let mut slot = MaybeUninit::<i32>::uninit();
+            let mut slot: Option<i32> = None;
             let mut cases = [recv_case(rx.hchan(), &mut slot)];
-            let (idx, ok) = unsafe { selectgo(&mut cases, true) };
+            let (idx, ok) = selectgo(&mut cases, true);
 
             assert_eq!(idx, CASE_DEFAULT);
             assert!(!ok);
@@ -705,12 +709,13 @@ mod tests {
             let (tx, rx) = chan::<i32>(0);
             tx.close();
 
-            let mut slot = MaybeUninit::<i32>::uninit();
+            let mut slot: Option<i32> = None;
             let mut cases = [recv_case(rx.hchan(), &mut slot)];
-            let (idx, ok) = unsafe { selectgo(&mut cases, false) };
+            let (idx, ok) = selectgo(&mut cases, false);
 
             assert_eq!(idx, 0);
             assert!(!ok, "recv from closed returns ok=false");
+            assert!(slot.is_none(), "closed recv slot must stay None");
         });
     }
 
@@ -725,17 +730,17 @@ mod tests {
 
             tx1.send(7);
 
-            let mut s1 = MaybeUninit::<i32>::uninit();
-            let mut s2 = MaybeUninit::<i32>::uninit();
+            let mut s1: Option<i32> = None;
+            let mut s2: Option<i32> = None;
             let mut cases = [
                 recv_case(rx1.hchan(), &mut s1),
                 recv_case(rx2.hchan(), &mut s2),
             ];
-            let (idx, ok) = unsafe { selectgo(&mut cases, false) };
+            let (idx, ok) = selectgo(&mut cases, false);
 
             assert_eq!(idx, 0);
             assert!(ok);
-            assert_eq!(unsafe { s1.assume_init() }, 7);
+            assert_eq!(s1.unwrap(), 7);
         });
     }
 
@@ -758,14 +763,14 @@ mod tests {
                 tx.send(55);
             });
 
-            let mut slot = MaybeUninit::<i32>::uninit();
+            let mut slot: Option<i32> = None;
             let mut cases = [recv_case(rx.hchan(), &mut slot)];
             // No default → will block.
-            let (idx, ok) = unsafe { selectgo(&mut cases, false) };
+            let (idx, ok) = selectgo(&mut cases, false);
 
             assert_eq!(idx, 0);
             assert!(ok);
-            result2.store(unsafe { slot.assume_init() }, Ordering::Relaxed);
+            result2.store(slot.unwrap(), Ordering::Relaxed);
         });
 
         assert_eq!(result.load(Ordering::Acquire), 55);
@@ -787,7 +792,7 @@ mod tests {
 
             let mut val = 77_i32;
             let mut cases = [send_case(tx.hchan(), &mut val)];
-            let (idx, _ok) = unsafe { selectgo(&mut cases, false) };
+            let (idx, _ok) = selectgo(&mut cases, false);
 
             assert_eq!(idx, 0);
         });
@@ -810,9 +815,9 @@ mod tests {
                 let wins = Arc::clone(&wins2);
                 let rx = rx.clone();
                 move || {
-                    let mut slot = MaybeUninit::<i32>::uninit();
+                    let mut slot: Option<i32> = None;
                     let mut cases = [recv_case(rx.hchan(), &mut slot)];
-                    let (idx, ok) = unsafe { selectgo(&mut cases, true) };
+                    let (idx, ok) = selectgo(&mut cases, true);
                     if idx == 0 && ok { wins.fetch_add(1, Ordering::Relaxed); }
                 }
             });
@@ -821,9 +826,9 @@ mod tests {
                 let wins = Arc::clone(&wins3);
                 let rx = rx.clone();
                 move || {
-                    let mut slot = MaybeUninit::<i32>::uninit();
+                    let mut slot: Option<i32> = None;
                     let mut cases = [recv_case(rx.hchan(), &mut slot)];
-                    let (idx, ok) = unsafe { selectgo(&mut cases, true) };
+                    let (idx, ok) = selectgo(&mut cases, true);
                     if idx == 0 && ok { wins.fetch_add(1, Ordering::Relaxed); }
                 }
             });
