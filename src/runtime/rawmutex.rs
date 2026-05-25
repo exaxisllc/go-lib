@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Adaptive spinlock used inside `Hchan<T>`.
 //!
 //! Unlike `std::sync::Mutex`, `RawMutex` has no guard — you call `lock()` and

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Goroutine (`G`) and register save area (`Gobuf`) — ported from
 //! `runtime/runtime2.go`.
 //!

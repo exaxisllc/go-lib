@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! hello — goroutines and channels in ten lines.
 //!
 //! Demonstrates the basic pattern: spawn goroutines with `go!`, communicate

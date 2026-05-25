@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Machine (`M`) — the OS thread that executes goroutines.
 //!
 //! Ported from `runtime/runtime2.go` and the `mstart`/`stopm` family in

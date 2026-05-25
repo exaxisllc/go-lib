@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Network poller — integrates non-blocking I/O with the goroutine scheduler.
 //!
 //! Ported from `runtime/netpoll_epoll.go` (Linux) and

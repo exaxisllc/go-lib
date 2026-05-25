@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `selectgo` — the runtime heart of `select { }`.
 //!
 //! Ported from `runtime/select.go`.

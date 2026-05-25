@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Syscall handoff shim — ported from `runtime/proc.go`
 //! (`entersyscall` / `exitsyscall`).
 //!

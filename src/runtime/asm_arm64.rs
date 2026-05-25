@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! AArch64 context switch primitives — ported from `runtime/asm_arm64.s` and
 //! `runtime/preempt_arm64.s`.
 //!

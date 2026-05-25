@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `go!` and `select!` macros — public spawn/multiplex syntax.
 //!
 //! ## `go!`

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Cancellation and deadline propagation — equivalent to Go's `context` package.
 //!
 //! ## Quick start

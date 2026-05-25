@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! # go-lib
 //!
 //! Go-style concurrency for Rust: goroutines, channels, `select`, `WaitGroup` —

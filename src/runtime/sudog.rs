@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Waiter records (`sudog`) and wait queues (`waitq`).
 //!
 //! Ported from `runtime/runtime2.go` (`sudog`, `waitq`) and the

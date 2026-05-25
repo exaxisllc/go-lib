@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `gopark` / `goready` — the parking and wakeup primitives.
 //!
 //! Every blocking operation (channel send/receive, WaitGroup, select) uses

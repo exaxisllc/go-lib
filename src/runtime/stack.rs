@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Goroutine stack allocator and growth machinery — ported from
 //! `runtime/stack.go`, `runtime/signal_unix.go`.
 //!

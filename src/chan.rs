@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Channels — ported from `src/runtime/chan.go`.
 //!
 //! Buffered and unbuffered channels backed by the same G/M/P scheduler used by

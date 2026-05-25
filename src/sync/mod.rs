@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! Synchronization primitives.
 //!
 //! [`Mutex`] and [`RwLock`] are re-exports of `std::sync`'s implementations:
