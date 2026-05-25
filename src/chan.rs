@@ -652,9 +652,7 @@ mod tests {
 
         run_impl(|| {
             let (tx, rx) = chan::<i32>(0);
-            unsafe {
-                spawn_goroutine(move || { tx.send(99); });
-            }
+            spawn_goroutine(move || { tx.send(99); });
             assert_eq!(rx.recv(), Some(99));
         });
     }
@@ -668,14 +666,12 @@ mod tests {
             let (ping_tx, ping_rx) = chan::<i32>(0);
             let (pong_tx, pong_rx) = chan::<i32>(0);
 
-            unsafe {
-                spawn_goroutine(move || {
-                    for _ in 0..10 {
-                        let v = ping_rx.recv().unwrap();
-                        pong_tx.send(v + 1);
-                    }
-                });
-            }
+            spawn_goroutine(move || {
+                for _ in 0..10 {
+                    let v = ping_rx.recv().unwrap();
+                    pong_tx.send(v + 1);
+                }
+            });
 
             let mut n = 0_i32;
             for _ in 0..10 {
@@ -699,20 +695,16 @@ mod tests {
             let (tx, rx) = chan::<i32>(4);
             let sum3 = Arc::clone(&sum2);
 
-            unsafe {
-                spawn_goroutine(move || {
-                    for i in 0..N { tx.send(i); }
-                    tx.close();
-                });
-            }
+            spawn_goroutine(move || {
+                for i in 0..N { tx.send(i); }
+                tx.close();
+            });
 
-            unsafe {
-                spawn_goroutine(move || {
-                    while let Some(v) = rx.recv() {
-                        sum3.fetch_add(v, Ordering::Relaxed);
-                    }
-                });
-            }
+            spawn_goroutine(move || {
+                while let Some(v) = rx.recv() {
+                    sum3.fetch_add(v, Ordering::Relaxed);
+                }
+            });
 
             for _ in 0..500 { crate::gosched(); }
         });
@@ -731,14 +723,12 @@ mod tests {
         run_impl(move || {
             let (tx, rx) = chan::<i32>(0);
 
-            unsafe {
-                spawn_goroutine(move || {
-                    // Block on recv until the channel is closed.
-                    if rx.recv().is_none() {
-                        got2.fetch_add(1, Ordering::Relaxed);
-                    }
-                });
-            }
+            spawn_goroutine(move || {
+                // Block on recv until the channel is closed.
+                if rx.recv().is_none() {
+                    got2.fetch_add(1, Ordering::Relaxed);
+                }
+            });
 
             for _ in 0..20 { crate::gosched(); }
             tx.close();

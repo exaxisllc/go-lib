@@ -169,11 +169,9 @@ mod tests {
         run_impl(move || {
             // spawn_goroutine calls goready internally (via push_batch + startm).
             // Verify that the goroutine runs, which proves the ready path works.
-            unsafe {
-                crate::runtime::sched::spawn_goroutine(move || {
-                    ran2.store(true, Ordering::Release);
-                });
-            }
+            crate::runtime::sched::spawn_goroutine(move || {
+                ran2.store(true, Ordering::Release);
+            });
             // Yield until the spawned goroutine runs.
             for _ in 0..200 { crate::gosched(); }
         });

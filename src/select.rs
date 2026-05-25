@@ -752,13 +752,11 @@ mod tests {
         run_impl(move || {
             let (tx, rx) = chan::<i32>(0);
 
-            unsafe {
-                spawn_goroutine(move || {
-                    // Sender: wait a bit, then send.
-                    crate::gosched();
-                    tx.send(55);
-                });
-            }
+            spawn_goroutine(move || {
+                // Sender: wait a bit, then send.
+                crate::gosched();
+                tx.send(55);
+            });
 
             let mut slot = MaybeUninit::<i32>::uninit();
             let mut cases = [recv_case(rx.hchan(), &mut slot)];
@@ -781,13 +779,11 @@ mod tests {
         run_impl(|| {
             let (tx, rx) = chan::<i32>(0);
 
-            unsafe {
-                spawn_goroutine(move || {
-                    crate::gosched();
-                    // Consume the value the select sends.
-                    let _ = rx.recv();
-                });
-            }
+            spawn_goroutine(move || {
+                crate::gosched();
+                // Consume the value the select sends.
+                let _ = rx.recv();
+            });
 
             let mut val = 77_i32;
             let mut cases = [send_case(tx.hchan(), &mut val)];
@@ -810,31 +806,27 @@ mod tests {
             let (tx, rx) = chan::<i32>(1);
             tx.send(1); // one value in the buffer
 
-            unsafe {
-                spawn_goroutine({
-                    let wins = Arc::clone(&wins2);
-                    let rx = rx.clone();
-                    move || {
-                        let mut slot = MaybeUninit::<i32>::uninit();
-                        let mut cases = [recv_case(rx.hchan(), &mut slot)];
-                        let (idx, ok) = unsafe { selectgo(&mut cases, true) };
-                        if idx == 0 && ok { wins.fetch_add(1, Ordering::Relaxed); }
-                    }
-                });
-            }
+            spawn_goroutine({
+                let wins = Arc::clone(&wins2);
+                let rx = rx.clone();
+                move || {
+                    let mut slot = MaybeUninit::<i32>::uninit();
+                    let mut cases = [recv_case(rx.hchan(), &mut slot)];
+                    let (idx, ok) = unsafe { selectgo(&mut cases, true) };
+                    if idx == 0 && ok { wins.fetch_add(1, Ordering::Relaxed); }
+                }
+            });
 
-            unsafe {
-                spawn_goroutine({
-                    let wins = Arc::clone(&wins3);
-                    let rx = rx.clone();
-                    move || {
-                        let mut slot = MaybeUninit::<i32>::uninit();
-                        let mut cases = [recv_case(rx.hchan(), &mut slot)];
-                        let (idx, ok) = unsafe { selectgo(&mut cases, true) };
-                        if idx == 0 && ok { wins.fetch_add(1, Ordering::Relaxed); }
-                    }
-                });
-            }
+            spawn_goroutine({
+                let wins = Arc::clone(&wins3);
+                let rx = rx.clone();
+                move || {
+                    let mut slot = MaybeUninit::<i32>::uninit();
+                    let mut cases = [recv_case(rx.hchan(), &mut slot)];
+                    let (idx, ok) = unsafe { selectgo(&mut cases, true) };
+                    if idx == 0 && ok { wins.fetch_add(1, Ordering::Relaxed); }
+                }
+            });
 
             // Give goroutines time to race.
             for _ in 0..200 { crate::gosched(); }

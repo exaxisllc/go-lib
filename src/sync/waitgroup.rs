@@ -210,12 +210,10 @@ mod tests {
             wg.add(1);
             let wg2   = Arc::clone(&wg);
             let done2 = Arc::clone(&done);
-            unsafe {
-                crate::runtime::sched::spawn_goroutine(move || {
-                    done2.fetch_add(1, Ordering::Relaxed);
-                    wg2.done();
-                });
-            }
+            crate::runtime::sched::spawn_goroutine(move || {
+                done2.fetch_add(1, Ordering::Relaxed);
+                wg2.done();
+            });
 
             wg.wait();
             assert_eq!(done.load(Ordering::Acquire), 1);
@@ -236,12 +234,10 @@ mod tests {
                 wg.add(1);
                 let wg2    = Arc::clone(&wg);
                 let count3 = Arc::clone(&count2);
-                unsafe {
-                    crate::runtime::sched::spawn_goroutine(move || {
-                        count3.fetch_add(1, Ordering::Relaxed);
-                        wg2.done();
-                    });
-                }
+                crate::runtime::sched::spawn_goroutine(move || {
+                    count3.fetch_add(1, Ordering::Relaxed);
+                    wg2.done();
+                });
             }
 
             wg.wait();
@@ -265,12 +261,10 @@ mod tests {
             for _ in 0..2 {
                 let wg3   = Arc::clone(&wg);
                 let woke3 = Arc::clone(&woke2);
-                unsafe {
-                    crate::runtime::sched::spawn_goroutine(move || {
-                        wg3.wait();
-                        woke3.fetch_add(1, Ordering::Relaxed);
-                    });
-                }
+                crate::runtime::sched::spawn_goroutine(move || {
+                    wg3.wait();
+                    woke3.fetch_add(1, Ordering::Relaxed);
+                });
             }
 
             // Yield so the waiters have a chance to call wg.wait() and park.
@@ -305,9 +299,7 @@ mod tests {
             // Round 1.
             wg.add(1);
             let wg2 = Arc::clone(&wg);
-            unsafe {
-                crate::runtime::sched::spawn_goroutine(move || { wg2.done(); });
-            }
+            crate::runtime::sched::spawn_goroutine(move || { wg2.done(); });
             wg.wait();
 
             // Round 2.
@@ -315,12 +307,10 @@ mod tests {
             wg.add(1);
             let wg3   = Arc::clone(&wg);
             let done2 = Arc::clone(&done);
-            unsafe {
-                crate::runtime::sched::spawn_goroutine(move || {
-                    done2.store(1, Ordering::Relaxed);
-                    wg3.done();
-                });
-            }
+            crate::runtime::sched::spawn_goroutine(move || {
+                done2.store(1, Ordering::Relaxed);
+                wg3.done();
+            });
             wg.wait();
             assert_eq!(done.load(Ordering::Acquire), 1);
         });

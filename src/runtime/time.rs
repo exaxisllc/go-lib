@@ -269,12 +269,10 @@ mod tests {
         let done2 = Arc::clone(&done);
 
         run_impl(move || {
-            unsafe {
-                spawn_goroutine(move || {
-                    unsafe { sleep(Duration::from_millis(5)) };
-                    done2.store(1, Ordering::Relaxed);
-                });
-            }
+            spawn_goroutine(move || {
+                unsafe { sleep(Duration::from_millis(5)) };
+                done2.store(1, Ordering::Relaxed);
+            });
 
             // Spin-yield for up to 200 ms waiting for the sleeper to finish.
             let deadline = Instant::now() + Duration::from_millis(200);
@@ -300,12 +298,10 @@ mod tests {
         run_impl(move || {
             for _ in 0..N {
                 let awoke3 = Arc::clone(&awoke2);
-                unsafe {
-                    spawn_goroutine(move || {
-                        unsafe { sleep(Duration::from_millis(10)) };
-                        awoke3.fetch_add(1, Ordering::Relaxed);
-                    });
-                }
+                spawn_goroutine(move || {
+                    unsafe { sleep(Duration::from_millis(10)) };
+                    awoke3.fetch_add(1, Ordering::Relaxed);
+                });
             }
 
             let deadline = Instant::now() + Duration::from_millis(500);
