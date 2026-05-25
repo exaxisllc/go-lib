@@ -1,5 +1,7 @@
 # go-lib
 
+[![CI](https://github.com/exaxisllc/go-lib/actions/workflows/ci.yml/badge.svg)](https://github.com/exaxisllc/go-lib/actions/workflows/ci.yml)
+
 Go-style concurrency for Rust — goroutines, channels, `select!`, `WaitGroup`, `Cond`, and a `context` package — built on a direct port of the Go M:N scheduler.
 
 ```rust
