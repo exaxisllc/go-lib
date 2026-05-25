@@ -216,10 +216,24 @@ mod tests {
                 }
             }
 
-            // Yield so the waiters block, then release.
+            // Yield so the waiters have a chance to call wg.wait() and block.
             for _ in 0..20 { crate::gosched(); }
             wg.done();
-            for _ in 0..50 { crate::gosched(); }
+
+            // Poll until both waiter goroutines have run past wg.wait() and
+            // incremented woke.  A fixed gosched-loop is not deterministic
+            // under parallel test load; polling on the atomic is race-free.
+            let deadline = std::time::Instant::now()
+                + std::time::Duration::from_millis(500);
+            loop {
+                if woke2.load(Ordering::Acquire) >= 2 { break; }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "timed out: only {} of 2 waiters woke",
+                    woke2.load(Ordering::Relaxed),
+                );
+                crate::gosched();
+            }
         });
 
         assert_eq!(woke.load(Ordering::Acquire), 2, "both waiters must wake");
