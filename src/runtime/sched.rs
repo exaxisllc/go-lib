@@ -125,6 +125,7 @@ pub(crate) fn sched() -> &'static Sched {
 /// `goexit0` and `gosched_m`.
 ///
 /// Ported from `schedule` in `runtime/proc.go`.
+#[allow(clippy::never_loop)] // loop is the intended infinite-scheduler idiom; execute() diverges
 pub(crate) unsafe fn schedule() -> ! {
     let m = current_m();
     debug_assert!(!m.is_null(), "schedule: CURRENT_M is null — call set_current_m first");
@@ -487,10 +488,10 @@ unsafe extern "C" fn sigurg_handler(
     }
 
     // Not our signal — chain to the previous handler.
-    let prev = PREV_SIGURG.lock().unwrap().clone();
+    let prev = *PREV_SIGURG.lock().unwrap();
     match prev {
-        Some(old) if old.sa_sigaction != libc::SIG_DFL as usize
-                  && old.sa_sigaction != libc::SIG_IGN as usize => {
+        Some(old) if old.sa_sigaction != libc::SIG_DFL
+                  && old.sa_sigaction != libc::SIG_IGN => {
             type SaFn = unsafe extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void);
             let f: SaFn = unsafe { std::mem::transmute(old.sa_sigaction) };
             unsafe { f(sig, info, ctx) };
@@ -609,8 +610,8 @@ struct GoFn(Box<dyn FnOnce() + Send + 'static>);
 ///
 /// Stored as `Arc<dyn Fn>` so we can clone it out of the lock before calling,
 /// preventing a deadlock if the handler itself calls `set_panic_handler`.
-static PANIC_HANDLER: Mutex<Option<Arc<dyn Fn(Box<dyn Any + Send + 'static>) + Send + Sync + 'static>>>
-    = Mutex::new(None);
+type PanicFn = Arc<dyn Fn(Box<dyn Any + Send + 'static>) + Send + Sync + 'static>;
+static PANIC_HANDLER: Mutex<Option<PanicFn>> = Mutex::new(None);
 
 /// Register `f` as the global goroutine-panic handler.
 ///
@@ -667,7 +668,7 @@ pub fn gomaxprocs() -> usize {
 ///
 /// Has no effect before the scheduler is initialised (before `run()`).
 pub fn set_gomaxprocs(n: usize) -> usize {
-    let n = (n.max(1).min(256)) as i32;
+    let n = n.clamp(1, 256) as i32;
     let sc = sched();
 
     let old = {
@@ -808,7 +809,7 @@ unsafe extern "C" fn goexit_trampoline() -> ! {
 /// Ported from `newproc1` in `runtime/proc.go`.
 pub(crate) fn new_goroutine(f: impl FnOnce() + Send + 'static) -> Box<G> {
     let stack = unsafe { stack_alloc().expect("new_goroutine: stack_alloc failed") };
-    let goid  = NEXT_GOID.fetch_add(1, Relaxed) as u64;
+    let goid  = NEXT_GOID.fetch_add(1, Relaxed);
     let mut g  = G::new(stack, goid);
 
     // Heap-allocate the closure behind a thin pointer and store it in ctxt.
@@ -879,7 +880,7 @@ pub(crate) fn schedinit(nprocs: i32) {
     let nprocs = std::env::var("GOMAXPROCS")
         .ok()
         .and_then(|s| s.parse::<i32>().ok())
-        .filter(|&n| n >= 1 && n <= 256)
+        .filter(|&n| (1..=256).contains(&n))
         .unwrap_or(nprocs);
 
     let sc = sched();

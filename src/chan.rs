@@ -126,6 +126,7 @@ impl<T> Hchan<T> {
     /// # Safety
     /// The returned `&mut HchanState<T>` must not be used after the guard is
     /// dropped (the lock no longer protects access).
+    #[allow(clippy::mut_from_ref)] // intentional: state is behind UnsafeCell
     pub(crate) unsafe fn lock_state(&self) -> (LockGuard<'_>, &mut HchanState<T>) {
         let g = LockGuard::new(&self.mutex);
         // SAFETY: We just acquired the lock; no other thread holds a reference.
@@ -290,13 +291,11 @@ pub(crate) unsafe fn chansend<T: Send + 'static>(
         (*gp).param = ptr::null_mut();
         let ok = (*s2).success;
 
-        if !ok {
-            if !(*s2).elem.is_null() {
-                let ep = (*s2).elem as *mut MaybeUninit<T>;
-                (*s2).elem = ptr::null_mut();
-                (*ep).assume_init_drop();
-                if (*s2).boxed_elem { let _ = Box::from_raw(ep); }
-            }
+        if !ok && !(*s2).elem.is_null() {
+            let ep = (*s2).elem as *mut MaybeUninit<T>;
+            (*s2).elem = ptr::null_mut();
+            (*ep).assume_init_drop();
+            if (*s2).boxed_elem { let _ = Box::from_raw(ep); }
         }
         (*s2).g = ptr::null_mut();
         (*s2).c = ptr::null_mut();

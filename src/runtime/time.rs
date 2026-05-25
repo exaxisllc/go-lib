@@ -186,10 +186,8 @@ pub(crate) unsafe fn sleep(d: Duration) {
         was_earliest
     };
 
-    if need_unpark {
-        if let Some(t) = TIMER_THREAD.get() {
-            t.unpark();
-        }
+    if need_unpark && let Some(t) = TIMER_THREAD.get() {
+        t.unpark();
     }
 
     unsafe { gopark(WaitReason::Sleep) };

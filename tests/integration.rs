@@ -92,11 +92,8 @@ fn pipeline_three_stage() {
 
         // Stage 3: accumulate
         let mut sum = 0_i64;
-        loop {
-            match sq_rx.recv() {
-                Some(v) => sum += v,
-                None    => break,
-            }
+        while let Some(v) = sq_rx.recv() {
+            sum += v;
         }
         // 1+4+9+16+25 = 55
         result2.store(sum, Ordering::Relaxed);
