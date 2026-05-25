@@ -1,6 +1,6 @@
 # go-lib
 
-Go-style concurrency for Rust — goroutines, channels, `select!`, and `WaitGroup` — built on a direct port of the Go M:N scheduler.
+Go-style concurrency for Rust — goroutines, channels, `select!`, `WaitGroup`, `Cond`, and a `context` package — built on a direct port of the Go M:N scheduler.
 
 ```rust
 go_lib::run(|| {
@@ -34,8 +34,12 @@ No `async`, no Tokio, no executor. Every goroutine gets its own OS-stack and is 
   - [Channels](#channels)
   - [select!](#select)
   - [WaitGroup](#waitgroup)
+  - [Cond](#cond)
+  - [context](#context)
   - [sleep and gosched](#sleep-and-gosched)
   - [with_syscall](#with_syscall)
+  - [GOMAXPROCS](#gomaxprocs)
+  - [Panic handler](#panic-handler)
 - [Examples](#examples)
 - [Architecture](#architecture)
 - [Go → Rust mapping](#go--rust-mapping)
@@ -53,10 +57,14 @@ No `async`, no Tokio, no executor. Every goroutine gets its own OS-stack and is 
 | Channel close + drain | ✅ |
 | `select!` with recv, send, default | ✅ |
 | `WaitGroup` | ✅ |
+| `Cond` — goroutine-aware condition variable | ✅ |
+| `context` — cancellation and deadline propagation | ✅ |
 | `sleep(Duration)` | ✅ |
 | `gosched()` cooperative yield | ✅ |
 | `with_syscall` — P hand-off during blocking calls | ✅ |
 | Work-stealing across Ps | ✅ |
+| `GOMAXPROCS` env var + runtime adjustment | ✅ |
+| Goroutine panic handler (process does not abort) | ✅ |
 | Fixed 64 KiB goroutine stacks | ✅ (see [limitations](#known-limitations)) |
 | Stack growth (`morestack`) | ❌ deferred |
 | Async preemption | ❌ deferred (cooperative only) |
@@ -98,6 +106,7 @@ Run the bundled examples:
 cargo run --example hello
 cargo run --example pipeline
 cargo run --example select_fanin
+cargo run --example cond
 ```
 
 ---
@@ -110,7 +119,7 @@ cargo run --example select_fanin
 pub fn run<F: FnOnce() + Send + 'static>(f: F)
 ```
 
-Initialises the scheduler (one M-thread per logical CPU), runs `f` as the first goroutine, and blocks until `f` returns. May be called only once per process.
+Initialises the scheduler (one M-thread per logical CPU, or the value of the `GOMAXPROCS` environment variable), runs `f` as the first goroutine, and blocks until `f` returns. The scheduler threads remain alive in the background; subsequent calls to `run` reuse them.
 
 ---
 
@@ -212,26 +221,6 @@ select! {
 }
 ```
 
-**Done-channel cancellation** (the Go idiom):
-
-```rust
-go_lib::run(|| {
-    let (done_tx, done_rx) = chan::<()>(0);
-
-    go!(move || {
-        loop {
-            select! {
-                recv(done_rx) -> _ => { break; }
-                default            => { /* do work */ go_lib::gosched(); }
-            }
-        }
-    });
-
-    // … eventually:
-    done_tx.send(());
-});
-```
-
 ---
 
 ### WaitGroup
@@ -260,6 +249,95 @@ go_lib::run(|| {
 
 ---
 
+### Cond
+
+A goroutine-aware condition variable. `wait` parks the calling goroutine via the scheduler (instead of blocking an OS thread), so other goroutines sharing the same M continue to run while waiting.
+
+```rust
+use go_lib::sync::Cond;
+use std::sync::{Arc, Mutex};
+
+go_lib::run(|| {
+    let mu  = Arc::new(Mutex::new(false));
+    let cnd = Arc::new(Cond::new());
+
+    let mu2  = Arc::clone(&mu);
+    let cnd2 = Arc::clone(&cnd);
+
+    go!(move || {
+        // Producer: set the flag and signal.
+        *mu2.lock().unwrap() = true;
+        cnd2.notify_one();
+    });
+
+    // Consumer: wait until the flag is set.
+    let mut guard = mu.lock().unwrap();
+    while !*guard {
+        guard = cnd.wait(&mu, guard);
+    }
+    println!("flag is set");
+});
+```
+
+| Method | Description |
+|---|---|
+| `Cond::new()` | Create a new condition variable |
+| `cnd.wait(mu, guard)` | Release `guard`, park goroutine, re-acquire on wakeup; returns new guard |
+| `cnd.notify_one()` | Wake one waiting goroutine |
+| `cnd.notify_all()` | Wake all waiting goroutines |
+
+Always re-check the predicate in a loop — spurious wakeups are possible.
+
+---
+
+### context
+
+A port of Go's `context` package. A `Context` carries a cancellation signal and optional deadline. Cancellation propagates from parent to all descendants.
+
+```rust
+use go_lib::context;
+use std::time::Duration;
+
+go_lib::run(|| {
+    let bg = context::background(); // root — never cancels
+
+    // Derived context with explicit cancel
+    let (ctx, cancel) = context::with_cancel(&bg);
+
+    go!(move || {
+        loop {
+            select! {
+                recv(ctx.done()) -> _v => { break }   // cancelled
+                default => { /* do work */ go_lib::gosched(); }
+            }
+        }
+        println!("worker stopped");
+    });
+
+    go_lib::sleep(Duration::from_millis(10));
+    cancel.cancel(); // signal all workers
+});
+```
+
+| Constructor | Description |
+|---|---|
+| `context::background()` | Root context; never cancelled |
+| `context::with_cancel(parent)` | Returns `(Context, CancelFn)`; `cancel.cancel()` cancels |
+| `context::with_deadline(parent, instant)` | Auto-cancels at `instant`; also returns `CancelFn` |
+| `context::with_timeout(parent, duration)` | Sugar over `with_deadline` |
+
+| Method | Description |
+|---|---|
+| `ctx.done()` | `&Receiver<()>` — fires (`None`) when cancelled; use in `select!` |
+| `ctx.err()` | `Option<ContextError>` — `None`, `Cancelled`, or `DeadlineExceeded` |
+| `ctx.deadline()` | `Option<Instant>` |
+| `ctx.is_done()` | `bool` — shorthand for `ctx.err().is_some()` |
+| `cancel.cancel()` | Cancel the context; idempotent, safe to call multiple times |
+
+`Context` and `CancelFn` are both `Clone`. `with_deadline` / `with_timeout` spawn a timer goroutine and must be called from within `run`.
+
+---
+
 ### sleep and gosched
 
 ```rust
@@ -282,6 +360,49 @@ go_lib::run(|| {
 ```
 
 Wraps a potentially-blocking operation so the scheduler can hand the current M's P to another M while the OS thread is blocked. Use this around any call that may park an OS thread (file I/O, blocking network, `std::thread::sleep`, etc.).
+
+---
+
+### GOMAXPROCS
+
+The number of logical processors defaults to `available_parallelism()` but can be overridden:
+
+**Environment variable** — set before starting the process:
+
+```sh
+GOMAXPROCS=4 cargo run
+```
+
+**Runtime adjustment** — from inside `run`:
+
+```rust
+let old = go_lib::set_gomaxprocs(4);
+println!("was {old}, now {}", go_lib::gomaxprocs());
+```
+
+Increasing GOMAXPROCS immediately spawns new Ps and M-threads. Decreasing updates the counter; surplus Ms park on their next idle cycle.
+
+---
+
+### Panic handler
+
+By default, a goroutine panic prints the payload to stderr and the scheduler continues — the process does **not** abort. Install a custom handler to log, record metrics, or recover state:
+
+```rust
+go_lib::set_panic_handler(|payload| {
+    if let Some(msg) = payload.downcast_ref::<String>() {
+        eprintln!("[goroutine panic] {msg}");
+    } else if let Some(msg) = payload.downcast_ref::<&str>() {
+        eprintln!("[goroutine panic] {msg}");
+    }
+});
+
+go_lib::run(|| {
+    go!(|| panic!("oops")); // caught; other goroutines keep running
+    go_lib::sleep(std::time::Duration::from_millis(10));
+    println!("still running");
+});
+```
 
 ---
 
@@ -367,7 +488,7 @@ fn main() {
         let (fast_tx, fast_rx) = chan::<i32>(8);
         let (slow_tx, slow_rx) = chan::<i32>(4);
 
-        go!(move || { for i in 0..6  { go_lib::sleep(Duration::from_millis(5));  fast_tx.send(i); } });
+        go!(move || { for i in 0..6   { go_lib::sleep(Duration::from_millis(5));  fast_tx.send(i); } });
         go!(move || { for i in 10..13 { go_lib::sleep(Duration::from_millis(15)); slow_tx.send(i); } });
 
         let mut received = Vec::new();
@@ -379,6 +500,45 @@ fn main() {
         }
         println!("{received:?}");
     });
+}
+```
+
+### cond — bounded producer/consumer queue
+
+```rust
+// examples/cond.rs  (abridged)
+use go_lib::sync::{Cond, WaitGroup};
+use std::sync::{Arc, Mutex};
+use std::collections::VecDeque;
+
+struct BoundedQueue<T> {
+    buf:       Mutex<VecDeque<T>>,
+    cap:       usize,
+    not_full:  Cond,
+    not_empty: Cond,
+}
+
+impl<T: Send + 'static> BoundedQueue<T> {
+    fn push(&self, val: T) {
+        let mut buf = self.buf.lock().unwrap();
+        while buf.len() >= self.cap {
+            buf = self.not_full.wait(&self.buf, buf);
+        }
+        buf.push_back(val);
+        drop(buf);
+        self.not_empty.notify_one();
+    }
+
+    fn pop(&self) -> T {
+        let mut buf = self.buf.lock().unwrap();
+        while buf.is_empty() {
+            buf = self.not_empty.wait(&self.buf, buf);
+        }
+        let val = buf.pop_front().unwrap();
+        drop(buf);
+        self.not_full.notify_one();
+        val
+    }
 }
 ```
 
@@ -409,7 +569,7 @@ Each M-thread loop (schedule → findrunnable → execute → goexit0 → schedu
       gogo(gp)              → context switch onto goroutine's stack
                               (naked asm: AMD64 / AArch64)
 
-    goexit0(gp)             runs on g0 after goroutine returns
+    goexit0(gp)             runs on g0 after goroutine returns (or panic caught)
       → schedule()          re-enter scheduler loop
 ```
 
@@ -420,7 +580,7 @@ Each M-thread loop (schedule → findrunnable → execute → goexit0 → schedu
 | `runtime::g` | `runtime/runtime2.go` | G struct, goroutine status constants |
 | `runtime::m` | `runtime/runtime2.go` | M struct, Note park/unpark primitive |
 | `runtime::p` | `runtime/runtime2.go`, `proc.go` | P struct, 256-slot run queue |
-| `runtime::sched` | `runtime/proc.go` | schedule, findrunnable, execute, goexit0 |
+| `runtime::sched` | `runtime/proc.go` | schedule, findrunnable, execute, goexit0, GOMAXPROCS, panic handler |
 | `runtime::park` | `runtime/proc.go` | gopark, goready |
 | `runtime::stack` | `runtime/stack.go` | 64 KiB mmap stack allocator |
 | `runtime::sudog` | `runtime/runtime2.go` | Sudog waiter records + per-P pool |
@@ -432,6 +592,8 @@ Each M-thread loop (schedule → findrunnable → execute → goexit0 → schedu
 | `chan` | `runtime/chan.go` | hchan, chansend, chanrecv, closechan |
 | `select` | `runtime/select.go` | selectgo, type-erased vtable |
 | `sync::waitgroup` | `sync/waitgroup.go` | WaitGroup |
+| `sync::cond` | `sync/cond.go` | Cond — goroutine-aware condition variable |
+| `context` | `context/context.go` | background, with_cancel, with_deadline, with_timeout |
 
 ---
 
@@ -445,28 +607,29 @@ Each M-thread loop (schedule → findrunnable → execute → goexit0 → schedu
 | `close(ch)` | `tx.close()` (or drop last `Sender`) |
 | `select { case … }` | `select! { … }` |
 | `sync.WaitGroup` | `sync::WaitGroup` |
+| `sync.Cond` | `sync::Cond` |
+| `context.Background()` | `context::background()` |
+| `context.WithCancel(ctx)` | `context::with_cancel(&ctx)` |
+| `context.WithDeadline(ctx, t)` | `context::with_deadline(&ctx, t)` |
+| `context.WithTimeout(ctx, d)` | `context::with_timeout(&ctx, d)` |
 | `runtime.Gosched()` | `go_lib::gosched()` |
 | `time.Sleep(d)` | `go_lib::sleep(d)` |
-| `runtime.GOMAXPROCS(n)` | fixed at startup (`available_parallelism`) |
+| `runtime.GOMAXPROCS(n)` | `go_lib::set_gomaxprocs(n)` |
 
 ---
 
 ## Known limitations
 
-These are intentionally deferred to v2; they are documented rather than silently broken.
+These are deferred to v2; they are documented rather than silently broken.
 
 **Fixed goroutine stack size** — Every goroutine is allocated a fixed 64 KiB stack backed by `mmap` with a guard page. Go's `morestack`/`copystack` stack-growth mechanism is not ported. Deep recursion or large stack frames will hit the guard page and segfault. *Work-around*: keep goroutine call stacks shallow; heap-allocate large buffers.
 
 **Cooperative preemption only** — The sysmon thread sets a preemption hint after 10 ms, but without stack-check traps a goroutine is not preempted until it calls `gosched()` or blocks. *Work-around*: call `gosched()` inside long CPU-bound loops.
 
-**No `defer`/`recover` across goroutine boundaries** — A panic inside a goroutine propagates as a normal Rust panic and aborts the process. Go's `recover` is not implemented.
-
-**No `context.Context`** — Use a done-channel (`chan::<()>(0)`) with `select!` as a work-around.
+**No `defer`/`recover` across goroutine boundaries** — Goroutine panics are caught and routed to the panic handler; the process does not abort. However, Go's `recover()` (intercepting a panic mid-stack and returning a value to the caller) has no direct equivalent. Use `std::panic::catch_unwind` inside the goroutine body for fine-grained recovery.
 
 **No netpoll / async I/O** — There is no integration with `epoll`/`kqueue`. Wrap blocking I/O in `with_syscall` so the scheduler can lend the P to another M during the wait.
 
-**Fixed `GOMAXPROCS`** — Parallelism is set once at startup from `available_parallelism`. Runtime adjustment is not supported.
-
-**No `sync.Cond`** — `std::sync::Condvar` is available for low-level use.
+**GOMAXPROCS decrease is best-effort** — Increasing GOMAXPROCS immediately adds capacity. Decreasing updates the counter but does not forcibly retire excess Ms; they park on their next idle cycle and are re-recruited if GOMAXPROCS rises again.
 
 **No race detector** — Use `loom` for concurrency model checking under test.
