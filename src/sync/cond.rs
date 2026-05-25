@@ -113,8 +113,7 @@ impl Cond {
         drop(guard);
 
         // Park until goready transitions us back to GRUNNABLE.
-        // SAFETY: we are on a goroutine stack (asserted above).
-        unsafe { gopark(WaitReason::CondVar) };
+        gopark(WaitReason::CondVar);
 
         // Woken — re-acquire the user's mutex.
         mu.lock().unwrap()

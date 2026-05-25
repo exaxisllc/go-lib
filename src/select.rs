@@ -293,7 +293,7 @@ pub fn selectgo(cases: &mut [SCase], has_default: bool) -> (usize, bool) {
         unsafe { (cases[i].unlock_fn)(cases[i].chan_ptr) };
     }
 
-    unsafe { gopark(WaitReason::Select) };
+    gopark(WaitReason::Select);
 
     // ── 7. Woken: find winner, clean up losers ────────────────────────────────
     //

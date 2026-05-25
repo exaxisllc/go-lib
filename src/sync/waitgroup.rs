@@ -162,7 +162,7 @@ impl WaitGroup {
             drop(state);
             // Suspend this goroutine.  Execution resumes here after add()
             // calls goready(gp) once the counter reaches zero.
-            unsafe { gopark(WaitReason::Semacquire) };
+            gopark(WaitReason::Semacquire);
             return;
         }
 

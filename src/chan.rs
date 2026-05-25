@@ -287,7 +287,7 @@ pub(crate) unsafe fn chansend<T: Send + 'static>(
     }
 
     drop(_g); // release lock BEFORE parking
-    unsafe { gopark(WaitReason::ChanSend) };
+    gopark(WaitReason::ChanSend);
 
     // ── Resumed: inspect outcome ─────────────────────────────────────────────
     let ok = unsafe {
@@ -379,7 +379,7 @@ pub(crate) unsafe fn chanrecv<T: Send + 'static>(
     }
 
     drop(_g);
-    unsafe { gopark(WaitReason::ChanReceive) };
+    gopark(WaitReason::ChanReceive);
 
     // ── Resumed: read outcome ─────────────────────────────────────────────────
     unsafe {

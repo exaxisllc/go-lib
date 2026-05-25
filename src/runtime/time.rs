@@ -191,7 +191,7 @@ pub(crate) unsafe fn sleep(d: Duration) {
         t.unpark();
     }
 
-    unsafe { gopark(WaitReason::Sleep) };
+    gopark(WaitReason::Sleep);
     // Returns here after the timer fires and goready transitions us to GRUNNABLE.
 }
 
