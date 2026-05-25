@@ -48,12 +48,17 @@ use std::sync::{Arc, Mutex, OnceLock};
 use super::g::{current_g, set_current_g, G, GDEAD, GRUNNABLE, GRUNNING, STACK_GUARD};
 use super::m::{current_m, M};
 use super::p::{GlobalRunQueue, P, PIDLE, PRUNNING};
-use super::stack::{grow_stack_if_needed, install_sigsegv_handler, stack_alloc};
+use super::stack::{grow_stack_if_needed, stack_alloc};
+#[cfg(not(windows))]
+use super::stack::install_sigsegv_handler;
 use super::sysmon::start_sysmon;
 use super::time::start_timer_thread;
 
-#[cfg(target_arch = "x86_64")]
+// On Windows: no signal-based async preemption → don't import the trampoline.
+#[cfg(all(target_arch = "x86_64", not(windows)))]
 use super::asm_amd64::{async_preempt_trampoline, gogo, mcall};
+#[cfg(all(target_arch = "x86_64", windows))]
+use super::asm_amd64::{gogo, mcall};
 #[cfg(target_arch = "aarch64")]
 use super::asm_arm64::{async_preempt_trampoline, gogo, mcall};
 
@@ -448,6 +453,7 @@ unsafe extern "C" fn gosched_m(gp: *mut G) {
 // ---------------------------------------------------------------------------
 
 /// Previous SIGURG handler (chained if the signal is not a preemption).
+#[cfg(not(windows))]
 static PREV_SIGURG: Mutex<Option<libc::sigaction>> = Mutex::new(None);
 
 /// Install the runtime's SIGURG handler for async goroutine preemption.
@@ -459,8 +465,11 @@ static PREV_SIGURG: Mutex<Option<libc::sigaction>> = Mutex::new(None);
 /// saves all live registers, calls `async_preempt2` (which `mcall`s into the
 /// scheduler), restores all registers on resume, and `ret`s to the original PC.
 ///
+/// **Not available on Windows** — POSIX signals do not exist there.
+///
 /// # Safety
 /// Call once during `schedinit`.
+#[cfg(not(windows))]
 pub(crate) unsafe fn install_sigurg_handler() {
     let mut sa: libc::sigaction = unsafe { std::mem::zeroed() };
     sa.sa_sigaction = sigurg_handler as *const () as usize;
@@ -476,6 +485,7 @@ pub(crate) unsafe fn install_sigurg_handler() {
 }
 
 /// SIGURG handler: redirect a preemptable goroutine to `async_preempt_trampoline`.
+#[cfg(not(windows))]
 unsafe extern "C" fn sigurg_handler(
     sig:  libc::c_int,
     info: *mut libc::siginfo_t,
@@ -509,6 +519,7 @@ unsafe extern "C" fn sigurg_handler(
 ///
 /// On AArch64: place the original `PC` into `LR` (x30), then set `PC` to the
 /// trampoline.  The trampoline saves x30 and restores it before `ret`.
+#[cfg(not(windows))]
 #[allow(unused_variables)]
 unsafe fn redirect_to_async_preempt(gp: *mut G, ctx: *mut libc::c_void) {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -904,11 +915,11 @@ pub(crate) fn schedinit(nprocs: i32) {
         unsafe { spawn_m(id, p_ptr) };
     }
 
-    // Install SIGSEGV handler for goroutine stack guard-page growth (Step 3).
+    // Install SIGSEGV / SIGURG handlers (Unix only — Windows has no POSIX
+    // signals; proactive growth and cooperative preemption are used there).
+    #[cfg(not(windows))]
     unsafe { install_sigsegv_handler() };
-
-    // Install SIGURG handler for async goroutine preemption (Step 4).
-    // sysmon sends SIGURG to an M when its goroutine has been running >10 ms.
+    #[cfg(not(windows))]
     unsafe { install_sigurg_handler() };
 
     // Start the background monitor thread (sysmon).

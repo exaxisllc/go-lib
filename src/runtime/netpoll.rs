@@ -28,11 +28,15 @@
 //! triggering `Send` trait violations.  All access is serialised by the Mutex.
 
 use std::collections::HashMap;
-use std::os::unix::io::RawFd;
 use std::sync::atomic::{AtomicI32, Ordering::*};
 use std::sync::Mutex;
 
-use libc;
+// `RawFd` is a Unix concept (file descriptor = signed integer).  On Windows we
+// use the same `i32` representation but don't pull in the unix-specific module.
+#[cfg(not(windows))]
+use std::os::unix::io::RawFd;
+#[cfg(windows)]
+type RawFd = i32;
 
 use super::g::G;
 
@@ -76,18 +80,25 @@ pub(crate) const POLL_WRITE: u32 = 2;
 static POLL_FD: AtomicI32 = AtomicI32::new(-1);
 
 /// Initialise the global netpoll fd.  Idempotent — subsequent calls are no-ops.
+///
+/// On Windows, netpoll is not implemented (epoll/kqueue are Unix-specific).
+/// `POLL_FD` remains `-1` and all `netpoll_wait` calls return an empty vec.
 pub(crate) fn netpoll_init() {
-    if POLL_FD.load(Relaxed) >= 0 {
-        return;
-    }
-    let fd = create_poll_fd();
-    assert!(fd >= 0, "netpoll_init: could not create poll fd");
-    // Only one caller wins the CAS; the rest discard their fd.
-    if POLL_FD
-        .compare_exchange(-1, fd, AcqRel, Relaxed)
-        .is_err()
+    // Windows: no epoll/kqueue backend — leave POLL_FD at -1.
+    #[cfg(not(windows))]
     {
-        unsafe { libc::close(fd) };
+        if POLL_FD.load(Relaxed) >= 0 {
+            return;
+        }
+        let fd = create_poll_fd();
+        assert!(fd >= 0, "netpoll_init: could not create poll fd");
+        // Only one caller wins the CAS; the rest discard their fd.
+        if POLL_FD
+            .compare_exchange(-1, fd, AcqRel, Relaxed)
+            .is_err()
+        {
+            unsafe { libc::close(fd) };
+        }
     }
 }
 
@@ -335,3 +346,21 @@ unsafe fn poll_wait(kq: RawFd, timeout_ms: i32) -> Vec<RawFd> {
         .map(|i| events[i].ident as RawFd)
         .collect()
 }
+
+// ---------------------------------------------------------------------------
+// Windows stubs — no epoll/kqueue; netpoll is a no-op
+// ---------------------------------------------------------------------------
+// POLL_FD stays -1; netpoll_wait always returns empty; goroutines that need
+// I/O readiness must use platform threads or async runtimes on Windows.
+
+#[cfg(windows)]
+fn create_poll_fd() -> RawFd { -1 }
+
+#[cfg(windows)]
+unsafe fn poll_add(_pfd: RawFd, _fd: RawFd, _mode: u32) {}
+
+#[cfg(windows)]
+unsafe fn poll_del(_pfd: RawFd, _fd: RawFd) {}
+
+#[cfg(windows)]
+unsafe fn poll_wait(_pfd: RawFd, _timeout_ms: i32) -> Vec<RawFd> { Vec::new() }

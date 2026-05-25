@@ -38,11 +38,53 @@
 //! equal a stack address are a theoretical false positive but vanishingly
 //! rare for the narrow 8–1024 KiB windows used here.
 
-use std::sync::{Mutex, OnceLock};
+// Mutex is only needed for the SIGSEGV handler's static on Unix.
+#[cfg(not(windows))]
+use std::sync::Mutex;
+use std::sync::OnceLock;
 
+// Unix-only: mmap constants and signal types.
+#[cfg(not(windows))]
 use libc::{MAP_ANON, MAP_FAILED, MAP_PRIVATE, PROT_NONE, PROT_READ, PROT_WRITE};
 
-use super::g::{current_g, Stack, STACK_GUARD, G};
+// current_g is only needed by the SIGSEGV handler (Unix-only).
+#[cfg(not(windows))]
+use super::g::current_g;
+use super::g::{Stack, STACK_GUARD, G};
+
+// ---------------------------------------------------------------------------
+// Windows: Win32 virtual-memory API (no libc wrappers available)
+// ---------------------------------------------------------------------------
+
+#[cfg(windows)]
+mod win32 {
+    pub const MEM_COMMIT:   u32 = 0x0000_1000;
+    pub const MEM_RESERVE:  u32 = 0x0000_2000;
+    pub const MEM_RELEASE:  u32 = 0x0000_8000;
+    pub const PAGE_READWRITE: u32 = 0x04;
+    pub const PAGE_NOACCESS:  u32 = 0x01;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        pub fn VirtualAlloc(
+            lpAddress:         *mut u8,
+            dwSize:            usize,
+            flAllocationType:  u32,
+            flProtect:         u32,
+        ) -> *mut u8;
+        pub fn VirtualFree(
+            lpAddress:   *mut u8,
+            dwSize:      usize,
+            dwFreeType:  u32,
+        ) -> i32;
+        pub fn VirtualProtect(
+            lpAddress:      *mut u8,
+            dwSize:         usize,
+            flNewProtect:   u32,
+            lpflOldProtect: *mut u32,
+        ) -> i32;
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -70,16 +112,22 @@ pub(crate) const G0_STACK_BYTES: usize = 64 * 1024;
 // Page size
 // ---------------------------------------------------------------------------
 
-/// Returns the OS page size, queried once from `sysconf` and then cached.
+/// Returns the OS page size, queried once and then cached.
 ///
-/// On macOS/AArch64 (Apple Silicon) this is **16 KiB**; on Linux x86-64 it
-/// is typically **4 KiB**.
+/// On macOS/AArch64 (Apple Silicon) this is **16 KiB**; on Linux x86-64 and
+/// Windows x86-64 it is typically **4 KiB**.
 pub(crate) fn page_size() -> usize {
     static PAGE_SIZE: OnceLock<usize> = OnceLock::new();
     *PAGE_SIZE.get_or_init(|| {
-        let n = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-        assert!(n > 0, "sysconf(_SC_PAGESIZE) returned {n}");
-        n as usize
+        #[cfg(not(windows))]
+        {
+            let n = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+            assert!(n > 0, "sysconf(_SC_PAGESIZE) returned {n}");
+            n as usize
+        }
+        // Windows x86-64 always uses 4 KiB pages.
+        #[cfg(windows)]
+        { 4096usize }
     })
 }
 
@@ -92,37 +140,58 @@ pub(crate) fn page_size() -> usize {
 /// Returns a [`Stack`] describing the usable region `[lo, hi)`.
 ///
 /// # Errors
-/// Returns a static error string on `mmap` / `mprotect` failure.
+/// Returns a static error string on allocation failure.
 pub(crate) unsafe fn stack_alloc_size(size: usize) -> Result<Stack, &'static str> {
     debug_assert!(size.is_power_of_two() || size == STACK_MAX,
         "stack_alloc_size: size must be a power of two");
     let ps    = page_size();
     let total = size + ps; // guard page + usable stack
 
-    let base = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            total,
-            PROT_READ | PROT_WRITE,
-            MAP_ANON | MAP_PRIVATE,
-            -1,
-            0,
-        )
-    };
-    if base == MAP_FAILED {
-        return Err("stack_alloc_size: mmap failed");
+    #[cfg(not(windows))]
+    {
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                total,
+                PROT_READ | PROT_WRITE,
+                MAP_ANON | MAP_PRIVATE,
+                -1,
+                0,
+            )
+        };
+        if base == MAP_FAILED {
+            return Err("stack_alloc_size: mmap failed");
+        }
+        if unsafe { libc::mprotect(base, ps, PROT_NONE) } != 0 {
+            unsafe { libc::munmap(base, total) };
+            return Err("stack_alloc_size: mprotect guard page failed");
+        }
+        let base_addr = base as usize;
+        return Ok(Stack { lo: base_addr + ps, hi: base_addr + total });
     }
 
-    if unsafe { libc::mprotect(base, ps, PROT_NONE) } != 0 {
-        unsafe { libc::munmap(base, total) };
-        return Err("stack_alloc_size: mprotect guard page failed");
+    #[cfg(windows)]
+    {
+        use win32::*;
+        let base = unsafe {
+            VirtualAlloc(
+                std::ptr::null_mut(),
+                total,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_READWRITE,
+            )
+        };
+        if base.is_null() {
+            return Err("stack_alloc_size: VirtualAlloc failed");
+        }
+        let mut old_protect: u32 = 0;
+        if unsafe { VirtualProtect(base, ps, PAGE_NOACCESS, &mut old_protect) } == 0 {
+            unsafe { VirtualFree(base, 0, MEM_RELEASE) };
+            return Err("stack_alloc_size: VirtualProtect guard page failed");
+        }
+        let base_addr = base as usize;
+        return Ok(Stack { lo: base_addr + ps, hi: base_addr + total });
     }
-
-    let base_addr = base as usize;
-    Ok(Stack {
-        lo: base_addr + ps,
-        hi: base_addr + total,
-    })
 }
 
 /// Allocate a new goroutine stack of the default initial size.
@@ -150,10 +219,21 @@ pub(crate) unsafe fn g0_stack_alloc() -> Result<Stack, &'static str> {
 /// `stack` must have been returned by `stack_alloc_size` and must not have
 /// been freed before.
 pub(crate) unsafe fn stack_free(stack: &Stack) {
-    let ps    = page_size();
-    let base  = (stack.lo - ps) as *mut libc::c_void;
-    let total = (stack.hi - stack.lo) + ps;
-    unsafe { libc::munmap(base, total) };
+    let ps   = page_size();
+    let base = (stack.lo - ps) as *mut u8;
+
+    #[cfg(not(windows))]
+    {
+        let total = (stack.hi - stack.lo) + ps;
+        unsafe { libc::munmap(base as *mut libc::c_void, total) };
+    }
+
+    #[cfg(windows)]
+    {
+        use win32::{MEM_RELEASE, VirtualFree};
+        // VirtualFree with MEM_RELEASE requires dwSize = 0.
+        unsafe { VirtualFree(base, 0, MEM_RELEASE) };
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -166,12 +246,15 @@ pub(crate) unsafe fn stack_free(stack: &Stack) {
 /// On return the goroutine's stack fields are updated; the caller must also
 /// update the interrupted `RSP/SP` in the platform `ucontext_t`.
 ///
-/// Returns the delta applied to all adjusted pointers
-/// (`new_stack.lo as isize - old_stack.lo as isize`).
+/// Returns the delta applied to all adjusted pointers.
 ///
 /// # Safety
 /// Must be called from a signal handler context; `gp` must be the goroutine
 /// whose guard page was touched.
+///
+/// **Not compiled on Windows** — Windows has no POSIX SIGSEGV mechanism.
+/// Proactive growth via `grow_stack_if_needed` handles Windows instead.
+#[cfg(not(windows))]
 pub(crate) unsafe fn newstack(gp: *mut G) -> isize {
     let old_stack = Stack {
         lo: unsafe { (*gp).stack.lo },
@@ -295,10 +378,13 @@ unsafe fn copystack(gp: *mut G, old_stack: &Stack, new_stack: &Stack) -> isize {
 }
 
 // ---------------------------------------------------------------------------
-// SIGSEGV handler — guard page detection and stack growth
+// SIGSEGV handler — guard page detection and stack growth (Unix only)
 // ---------------------------------------------------------------------------
+// Windows does not have POSIX signals; guard-page faults are handled instead
+// by the proactive `grow_stack_if_needed` checkpoint in the scheduler.
 
 /// Previous SIGSEGV handler (chained if fault is not a stack overflow).
+#[cfg(not(windows))]
 static PREV_SIGSEGV: Mutex<Option<libc::sigaction>> = Mutex::new(None);
 
 /// Install the runtime's SIGSEGV handler for goroutine stack guard pages.
@@ -309,6 +395,7 @@ static PREV_SIGSEGV: Mutex<Option<libc::sigaction>> = Mutex::new(None);
 ///
 /// # Safety
 /// Call once from the main initialisation path (inside `schedinit`).
+#[cfg(not(windows))]
 pub(crate) unsafe fn install_sigsegv_handler() {
     let mut sa: libc::sigaction = unsafe { std::mem::zeroed() };
     sa.sa_sigaction = sigsegv_handler as *const () as usize;
@@ -324,6 +411,7 @@ pub(crate) unsafe fn install_sigsegv_handler() {
 }
 
 /// SIGSEGV handler: detect goroutine guard page faults and grow the stack.
+#[cfg(not(windows))]
 unsafe extern "C" fn sigsegv_handler(
     sig:  libc::c_int,
     info: *mut libc::siginfo_t,
@@ -365,6 +453,7 @@ unsafe extern "C" fn sigsegv_handler(
 
 /// Update the stack pointer saved in the signal `ucontext_t` by `delta`.
 /// Platform-specific: Linux x86-64, Linux AArch64, macOS x86-64, macOS AArch64.
+#[cfg(not(windows))]
 #[allow(unused_variables)]
 unsafe fn update_sp_in_context(ctx: *mut libc::c_void, delta: isize) {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]

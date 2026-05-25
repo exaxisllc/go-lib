@@ -69,6 +69,10 @@ pub mod context;
 /// Goroutine-aware TCP networking (Step 5: netpoll integration).
 ///
 /// See [`net::TcpListener`] and [`net::TcpStream`].
+///
+/// **Note**: The networking module currently requires a Unix platform
+/// (epoll/kqueue).  On Windows it is not compiled.
+#[cfg(not(windows))]
 pub mod net;
 pub mod runtime;
 pub mod select;
