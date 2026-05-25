@@ -113,32 +113,32 @@ jobs:
           LOOM_MAX_PERMUTATIONS: "10000"
         run: cargo test -- --test-threads 1
 
-    coverage:
-      name: Coverage
-      runs-on: ${{ matrix.os }}
-      strategy:
-        matrix:
-          os: [ ubuntu-latest ]
-          toolchain: [ nightly ]
-      steps:
-        - uses: actions/checkout@v4
-        - name: Update tool chain
-          run: |
-            rustup update ${{ matrix.toolchain }}
-            rustup default ${{ matrix.toolchain }}
-            rustup component add llvm-tools-preview --toolchain ${{ matrix.toolchain }}
-        - name: Install clippy
-          run: rustup component add clippy
-        - name: Install coverage tool
-          run: cargo +stable install cargo-llvm-cov --locked
-        - name: Test project and generate coverage report
-          run: cargo llvm-cov --remap-path-prefix --show-missing-lines --branch --doctests --lcov --output-path lcov.info
-        - name: Publish coverage summary to job summary
-          uses: livewing/lcov-job-summary@v1.1.0
-          with:
-            lcov: lcov.info
-        - name: Fail build if coverage below 80%
-          uses: bigmeech/gha-simple-coverage@master
-          with:
-            lcov-file-path: lcov.info
-            fail-if-below: 80
+  coverage:
+    name: Coverage
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ ubuntu-latest ]
+        toolchain: [ nightly ]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Update tool chain
+        run: |
+          rustup update ${{ matrix.toolchain }}
+          rustup default ${{ matrix.toolchain }}
+          rustup component add llvm-tools-preview --toolchain ${{ matrix.toolchain }}
+      - name: Install clippy
+        run: rustup component add clippy
+      - name: Install coverage tool
+        run: cargo +stable install cargo-llvm-cov --locked
+      - name: Test project and generate coverage report
+        run: cargo llvm-cov --remap-path-prefix --show-missing-lines --branch --doctests --lcov --output-path lcov.info
+      - name: Publish coverage summary to job summary
+        uses: livewing/lcov-job-summary@v1.1.0
+        with:
+          lcov: lcov.info
+      - name: Fail build if coverage below 80%
+        uses: bigmeech/gha-simple-coverage@master
+        with:
+          lcov-file-path: lcov.info
+          fail-if-below: 80
