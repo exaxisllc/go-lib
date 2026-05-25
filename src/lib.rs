@@ -14,7 +14,11 @@
 //! - `go!` / `select!` macros — spawn goroutines, multiplex channel ops
 //! - [`chan`] — buffered and unbuffered channels
 //! - [`sync::WaitGroup`] — wait for a collection of goroutines
+//! - [`sync::Cond`] — goroutine-aware condition variable
 //! - [`sync::Mutex`] / [`sync::RwLock`] — re-exports of `std::sync`
+//! - [`context`] — cancellation and deadline propagation
+//! - [`set_panic_handler`] — customise goroutine-panic behaviour
+//! - [`set_gomaxprocs`] / [`gomaxprocs`] — runtime parallelism control
 //!
 //! ## Internals
 //! See [`runtime`] for the scheduler (G/M/P, parking, work stealing, sysmon).
@@ -42,26 +46,15 @@
 //! *Work-around*: sprinkle `gosched()` inside CPU-bound loops.
 //!
 //! ### `defer` / `recover` / cross-goroutine `panic`
-//! Rust's `std::panic::catch_unwind` is available but goroutine-boundary panic
-//! propagation (Go's `recover`) is not implemented.  A panic inside a goroutine
-//! will abort the process.
-//!
-//! ### `context.Context` / cancellation
-//! Go's `context` package is not ported.  Use a done-channel pattern
-//! (`chan::<()>(0)`) together with `select!` as a work-around.
+//! Goroutine panics are caught and routed to [`set_panic_handler`]; the
+//! process does not abort.  Go's `recover()` (stopping panic propagation at a
+//! call-stack boundary) has no direct Rust equivalent — use `catch_unwind`
+//! inside the goroutine body when fine-grained recovery is needed.
 //!
 //! ### Netpoll / I/O integration
 //! There is no integration with the OS event loop (`epoll`/`kqueue`).
 //! Goroutines that call blocking I/O should wrap the call with
 //! [`with_syscall`] so the scheduler can hand off the P during the wait.
-//!
-//! ### `GOMAXPROCS` at runtime
-//! The parallelism level is fixed at process start (`num_cpus` logical
-//! processors).  Changing `GOMAXPROCS` dynamically is not supported.
-//!
-//! ### `sync.Cond`
-//! `sync::Cond` is not yet implemented.  The `Condvar` from [`std::sync`] is
-//! available for low-level use.
 //!
 //! ### Race detector
 //! The Go race detector is a compiler/runtime feature with no Rust equivalent
@@ -82,6 +75,7 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 pub mod chan;
+pub mod context;
 pub mod runtime;
 pub mod select;
 pub mod sync;
@@ -194,4 +188,60 @@ pub fn sleep(d: std::time::Duration) {
 pub fn __spawn<F: FnOnce() + Send + 'static>(f: F) {
     // SAFETY: callers are expected to be inside a goroutine context.
     unsafe { runtime::sched::spawn_goroutine(f) }
+}
+
+// ---------------------------------------------------------------------------
+// GOMAXPROCS
+// ---------------------------------------------------------------------------
+
+/// Return the current number of logical processors (GOMAXPROCS).
+///
+/// This equals the value set by the `GOMAXPROCS` environment variable at
+/// startup, or [`set_gomaxprocs`], or `available_parallelism` if neither was
+/// provided.
+pub fn gomaxprocs() -> usize {
+    runtime::sched::gomaxprocs()
+}
+
+/// Set the number of logical processors and return the previous value.
+///
+/// See [`runtime::sched::set_gomaxprocs`] for full semantics.
+///
+/// # Example
+///
+/// ```no_run
+/// let old = go_lib::set_gomaxprocs(2);
+/// println!("was {old}, now {}", go_lib::gomaxprocs());
+/// ```
+pub fn set_gomaxprocs(n: usize) -> usize {
+    runtime::sched::set_gomaxprocs(n)
+}
+
+// ---------------------------------------------------------------------------
+// Goroutine panic handler
+// ---------------------------------------------------------------------------
+
+/// Register a custom handler for goroutine panics.
+///
+/// By default, a panicking goroutine prints its payload to stderr and the
+/// scheduler continues running other goroutines — the process does **not**
+/// abort.
+///
+/// Calling `set_panic_handler` replaces the previous handler.  The handler
+/// receives the `Box<dyn Any + Send>` payload from `std::panic::catch_unwind`.
+///
+/// # Example
+///
+/// ```no_run
+/// go_lib::set_panic_handler(|payload| {
+///     if let Some(s) = payload.downcast_ref::<String>() {
+///         eprintln!("goroutine panicked: {s}");
+///     }
+/// });
+/// ```
+pub fn set_panic_handler<F>(f: F)
+where
+    F: Fn(Box<dyn std::any::Any + Send + 'static>) + Send + Sync + 'static,
+{
+    runtime::sched::set_panic_handler(f);
 }
