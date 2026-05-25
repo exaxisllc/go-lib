@@ -12,8 +12,58 @@ env:
 
 jobs:
   # ── Standard build + test ──────────────────────────────────────────────────
+  
   test:
     name: Build & Test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+        - target: x86_64-unknown-linux-gnu
+          os: ubuntu-latest
+        - target: aarch64-unknown-linux-gnu
+          os: ubuntu-24.04-arm
+        - target: x86_64-apple-darwin
+          os: macos-latest
+        - target: aarch64-apple-darwin
+          os: macos-14
+        - target: x86_64-pc-windows-msvc
+          os: windows-latest
+        - target: aarch64-pc-windows-msvc
+          os: windows-11-arm
+    continue-on-error: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Update tool chain
+        run: |
+          rustup update ${{ matrix.target }}
+          rustup default ${{ matrix.target }}
+          rustup component add clippy
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Clippy check
+        run: cargo clippy
+        
+      - name: cargo build
+        run: cargo build --all-targets
+
+      - name: cargo test
+        run: cargo test
+
+      - name: cargo doc (no deps, no-run)
+        run: cargo doc --no-deps
+        
+  build:
+    name: Build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -32,12 +82,6 @@ jobs:
 
       - name: cargo build
         run: cargo build --all-targets
-
-      - name: cargo test
-        run: cargo test
-
-      - name: cargo doc (no deps, no-run)
-        run: cargo doc --no-deps
 
   # ── Loom concurrency model checker ────────────────────────────────────────
   loom:
@@ -68,3 +112,33 @@ jobs:
           RUSTFLAGS: "--cfg loom"
           LOOM_MAX_PERMUTATIONS: "10000"
         run: cargo test -- --test-threads 1
+
+    coverage:
+      name: Coverage
+      runs-on: ${{ matrix.os }}
+      strategy:
+        matrix:
+          os: [ ubuntu-latest ]
+          toolchain: [ nightly ]
+      steps:
+        - uses: actions/checkout@v4
+        - name: Update tool chain
+          run: |
+            rustup update ${{ matrix.toolchain }}
+            rustup default ${{ matrix.toolchain }}
+            rustup component add llvm-tools-preview --toolchain ${{ matrix.toolchain }}
+        - name: Install clippy
+          run: rustup component add clippy
+        - name: Install coverage tool
+          run: cargo +stable install cargo-llvm-cov --locked
+        - name: Test project and generate coverage report
+          run: cargo llvm-cov --remap-path-prefix --show-missing-lines --branch --doctests --lcov --output-path lcov.info
+        - name: Publish coverage summary to job summary
+          uses: livewing/lcov-job-summary@v1.1.0
+          with:
+            lcov: lcov.info
+        - name: Fail build if coverage below 80%
+          uses: bigmeech/gha-simple-coverage@master
+          with:
+            lcov-file-path: lcov.info
+            fail-if-below: 80
