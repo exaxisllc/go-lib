@@ -258,7 +258,14 @@ unsafe fn copystack(gp: *mut G, old_stack: &Stack, new_stack: &Stack) -> isize {
         );
     }
 
-    let delta: isize = new_lo as isize - old_lo as isize;
+    // Delta is the displacement applied to old-stack pointers to produce
+    // new-stack pointers.  The live region is copied relative to `hi`
+    // (stacks grow downward), so the correct displacement is new_hi − old_hi,
+    // NOT new_lo − old_lo.  Using new_lo − old_lo would be wrong when the two
+    // stacks differ in size (the new stack is larger), which is always the
+    // case during growth.  This matches Go runtime's adjinfo.delta calculation:
+    //   delta = new.hi - old.hi
+    let delta: isize = new_hi as isize - old_hi as isize;
 
     // Conservative scan: adjust any pointer-sized word in the new live region
     // that falls within [old_lo, old_hi).

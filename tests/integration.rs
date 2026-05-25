@@ -220,7 +220,8 @@ fn select_fan_in() {
 #[test]
 fn done_channel_cancels_goroutine() {
     let ticks = Arc::new(AtomicI32::new(0));
-    let ticks2 = Arc::clone(&ticks);
+    let ticks2 = Arc::clone(&ticks); // moved into worker goroutine
+    let ticks3 = Arc::clone(&ticks); // used by polling loop inside run()
 
     go_lib::run(move || {
         let (done_tx, done_rx) = chan::<()>(0);
@@ -239,8 +240,15 @@ fn done_channel_cancels_goroutine() {
 
         // Send 3 ticks, then signal done.
         for _ in 0..3 { tick_tx.send(()); }
-        // Yield to let the worker process the ticks.
-        for _ in 0..50 { go_lib::gosched(); }
+        // Wait until the worker has processed all 3 ticks before sending done.
+        // A fixed gosched-loop is not deterministic under parallel test load;
+        // polling on the atomic counter is race-free and works on every platform.
+        let deadline = Instant::now() + Duration::from_millis(500);
+        loop {
+            if ticks3.load(Ordering::Acquire) >= 3 { break; }
+            if Instant::now() > deadline { panic!("ticks not all processed in time"); }
+            go_lib::gosched();
+        }
         done_tx.send(());
 
         // Give the worker time to observe done.
