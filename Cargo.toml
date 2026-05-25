@@ -9,7 +9,7 @@ license = "Apache-2.0"
 keywords = ["goroutines", "waitgroup"]
 repository = "https://github.com/exaxisllc/go-lib"
 readme = "README.md"
-exclude["target"]
+exclude = ["target"]
 categories = ["asynchronous"]
 
 [dependencies]
