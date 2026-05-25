@@ -157,6 +157,7 @@ pub(crate) enum WaitReason {
     ChanSend    = 15,  // "chan send"
     Semacquire  = 18,  // "semacquire"
     Sleep       = 19,  // "sleep"
+    CondVar     = 20,  // "condvar wait"
 }
 
 impl WaitReason {
@@ -169,6 +170,7 @@ impl WaitReason {
             Self::ChanSend    => "chan send",
             Self::Semacquire  => "semacquire",
             Self::Sleep       => "sleep",
+            Self::CondVar     => "condvar wait",
         }
     }
 }

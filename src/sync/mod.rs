@@ -6,10 +6,14 @@
 //! shim (see [`crate::runtime::syscall`]). Porting Go's `sync.Mutex` plus
 //! `runtime.sema` would add hundreds of lines for no measurable win.
 //!
-//! [`WaitGroup`] *is* ported, because the one-waiter / many-workers pattern
-//! benefits from awareness of the scheduler.
+//! [`WaitGroup`] and [`Cond`] *are* ported because they benefit from
+//! goroutine-level parking: waiters yield to the scheduler rather than
+//! blocking an OS thread.
 
 pub use std::sync::{Mutex, RwLock};
+
+mod cond;
+pub use cond::Cond;
 
 mod waitgroup;
 pub use waitgroup::WaitGroup;

@@ -17,9 +17,10 @@
 //! parts that need serialisation are guarded by `Mutex<SchedInner>`; the global
 //! run queue carries its own internal lock.
 
+use std::any::Any;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, Ordering::*};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use super::g::{current_g, set_current_g, G, GDEAD, GRUNNABLE, GRUNNING};
 use super::m::{current_m, M};
@@ -61,6 +62,9 @@ pub(crate) struct Sched {
     pub global_run_q: GlobalRunQueue,
     /// Number of Ms currently spinning (looking for work in `findrunnable`).
     pub nmspinning:   AtomicI32,
+    /// Current GOMAXPROCS value — readable without holding `inner`.
+    /// Updated by `schedinit` and `set_gomaxprocs`.
+    pub gomaxprocs:   AtomicI32,
     /// Locked parts of scheduler state.
     pub inner:        Mutex<SchedInner>,
 }
@@ -76,6 +80,7 @@ pub(crate) fn sched() -> &'static Sched {
     SCHED.get_or_init(|| Sched {
         global_run_q: GlobalRunQueue::new(),
         nmspinning:   AtomicI32::new(0),
+        gomaxprocs:   AtomicI32::new(1),
         inner: Mutex::new(SchedInner {
             idle_p:     ptr::null_mut(),
             idle_m:     ptr::null_mut(),
@@ -407,6 +412,111 @@ unsafe extern "C" fn gosched_m(gp: *mut G) {
 /// pointer.  Stored in `G.sched.ctxt` so `goroutine_entry` can retrieve it.
 struct GoFn(Box<dyn FnOnce() + Send + 'static>);
 
+// ---------------------------------------------------------------------------
+// Goroutine panic handler
+// ---------------------------------------------------------------------------
+
+/// User-settable handler for goroutine panics.  `None` → default stderr print.
+///
+/// Stored as `Arc<dyn Fn>` so we can clone it out of the lock before calling,
+/// preventing a deadlock if the handler itself calls `set_panic_handler`.
+static PANIC_HANDLER: Mutex<Option<Arc<dyn Fn(Box<dyn Any + Send + 'static>) + Send + Sync + 'static>>>
+    = Mutex::new(None);
+
+/// Register `f` as the global goroutine-panic handler.
+///
+/// `f` is called (on the scheduler loop, NOT the panicking goroutine's stack)
+/// with the panic payload whenever a goroutine's body panics.  The default
+/// handler prints the payload to stderr.  Calling `set_panic_handler` again
+/// replaces the previous handler.
+///
+/// The process does **not** abort after the handler returns; the scheduler
+/// continues running other goroutines.
+pub fn set_panic_handler<F>(f: F)
+where
+    F: Fn(Box<dyn Any + Send + 'static>) + Send + Sync + 'static,
+{
+    *PANIC_HANDLER.lock().unwrap() = Some(Arc::new(f));
+}
+
+/// Called from `goroutine_entry` when a goroutine's body panics.
+fn handle_goroutine_panic(payload: Box<dyn Any + Send + 'static>) {
+    // Clone the Arc out before releasing the lock so the handler can call
+    // `set_panic_handler` without deadlocking.
+    let handler = PANIC_HANDLER.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    match handler {
+        Some(f) => f(payload),
+        None    => {
+            // Default: print to stderr, matching Go's "goroutine panicked" output.
+            let msg = payload.downcast_ref::<String>()
+                .map(|s| s.as_str())
+                .or_else(|| payload.downcast_ref::<&str>().copied())
+                .unwrap_or("(unknown panic payload)");
+            eprintln!("goroutine panicked: {msg}");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GOMAXPROCS — query and dynamic adjustment
+// ---------------------------------------------------------------------------
+
+/// Return the current value of GOMAXPROCS (number of active logical processors).
+pub fn gomaxprocs() -> usize {
+    sched().gomaxprocs.load(Relaxed) as usize
+}
+
+/// Set GOMAXPROCS to `n` (clamped to `[1, 256]`) and return the previous value.
+///
+/// **Increasing** — allocates new Ps and spawns one M per new P; takes effect
+/// immediately.
+///
+/// **Decreasing** — updates the counter so `gomaxprocs()` returns the new
+/// value; excess Ps remain in `allp` but their Ms will not be recruited for
+/// new goroutines until GOMAXPROCS is increased again.  Work-stealing
+/// continues across the full `allp` slice for v1.1.
+///
+/// Has no effect before the scheduler is initialised (before `run()`).
+pub fn set_gomaxprocs(n: usize) -> usize {
+    let n = (n.max(1).min(256)) as i32;
+    let sc = sched();
+
+    let old = {
+        let mut inner = sc.inner.lock().unwrap();
+        let old = inner.gomaxprocs;
+
+        if n > old {
+            // Add Ps for the new slots.
+            let new_ps: Vec<*mut P> = (old..n)
+                .map(|id| Box::into_raw(P::new(id)))
+                .collect();
+            inner.allp.extend_from_slice(&new_ps);
+            inner.gomaxprocs = n;
+            sc.gomaxprocs.store(n, Relaxed);
+            drop(inner);
+
+            // Spawn one M per new P (mirrors schedinit).
+            for p_ptr in new_ps {
+                let id = NEXT_MID.fetch_add(1, Relaxed);
+                unsafe { spawn_m(id, p_ptr) };
+            }
+        } else {
+            // Decrease: just update the counters.  Excess Ms self-park when
+            // they find no work; they can be re-recruited if GOMAXPROCS rises.
+            inner.gomaxprocs = n;
+            sc.gomaxprocs.store(n, Relaxed);
+        }
+
+        old
+    };
+
+    old as usize
+}
+
+// ---------------------------------------------------------------------------
+// Goroutine ID / M ID counters
+// ---------------------------------------------------------------------------
+
 /// Monotonically-increasing goroutine ID counter.  Starts at 1; 0 is reserved
 /// for g0 goroutines (one per M).
 static NEXT_GOID: AtomicU64 = AtomicU64::new(1);
@@ -435,7 +545,17 @@ unsafe extern "C" fn goroutine_entry() {
         (*gp).sched.ctxt = ptr::null_mut();
         Box::from_raw(fn_ptr)
     };
-    (go_fn.0)();
+
+    // Catch panics so they don't abort the process.  The closure may capture
+    // non-UnwindSafe types (raw pointers, RefCell, …) so we assert that it is
+    // safe — the goroutine's stack is unwound by catch_unwind and no invariants
+    // observable to other goroutines are left broken (channels are locked
+    // briefly and always released before goroutines block or return).
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (go_fn.0)()));
+    if let Err(payload) = result {
+        handle_goroutine_panic(payload);
+    }
+
     // Returning here drops through to goexit_trampoline via the pre-wired
     // return address (AMD64: [rsp], AArch64: x30 / lr).
 }
@@ -566,6 +686,13 @@ pub(crate) fn schedinit(nprocs: i32) {
     }
     assert!(nprocs >= 1, "schedinit: nprocs must be ≥ 1");
 
+    // Allow the GOMAXPROCS environment variable to override the caller's value.
+    let nprocs = std::env::var("GOMAXPROCS")
+        .ok()
+        .and_then(|s| s.parse::<i32>().ok())
+        .filter(|&n| n >= 1 && n <= 256)
+        .unwrap_or(nprocs);
+
     let sc = sched();
 
     // Create all Ps.
@@ -578,6 +705,7 @@ pub(crate) fn schedinit(nprocs: i32) {
         inner.gomaxprocs = nprocs;
         inner.allp       = ps.clone();
     }
+    sc.gomaxprocs.store(nprocs, Relaxed);
 
     // Spawn one M per P.  Each M thread calls schedule() and loops forever.
     for p_ptr in ps {
