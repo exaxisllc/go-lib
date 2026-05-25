@@ -13,13 +13,27 @@
 //!
 //! ## Implementation
 //!
-//! Uses `Mutex<WgState> + Condvar` rather than Go's semaphore / `sync/atomic`.
-//! The blocking path is wrapped in [`crate::with_syscall`] so the goroutine's
-//! P is handed off to another M while the OS thread sleeps in the kernel.
+//! ### Goroutine path (the common case)
+//!
+//! `wait` uses [`gopark`][crate::runtime::park::gopark] to suspend the calling
+//! goroutine back into the scheduler **without blocking the OS thread**.  The
+//! M and its P remain free to run other goroutines.  When `add` decrements the
+//! counter to zero it drains the waiters list and calls
+//! [`goready`][crate::runtime::park::goready] on each, re-enqueuing them for
+//! scheduling.
+//!
+//! ### Non-goroutine / loom path
+//!
+//! If `wait` is called from a bare OS thread (outside the go-lib scheduler, or
+//! from a loom model thread) it falls back to blocking on a `Condvar`.  This
+//! path is also used by the `negative_counter_panics` unit test which never
+//! enters the scheduler.
 //!
 //! Ported from `sync/waitgroup.go`.
 
 use crate::loom_shim::{Condvar, Mutex};
+use crate::runtime::g::{current_g, WaitReason, G};
+use crate::runtime::park::{gopark, goready};
 
 // ---------------------------------------------------------------------------
 // Internal state
@@ -27,8 +41,18 @@ use crate::loom_shim::{Condvar, Mutex};
 
 struct WgState {
     /// Number of outstanding workers (`Add` increments, `Done` decrements).
-    count: i64,
+    count:   i64,
+    /// Goroutines suspended in [`WaitGroup::wait`].  Drained by
+    /// [`WaitGroup::add`] when the counter reaches zero; each entry is woken
+    /// via [`goready`].
+    waiters: Vec<*mut G>,
 }
+
+// SAFETY: `WgState` is always accessed under the `WaitGroup`'s `Mutex`.
+// The `*mut G` pointers are goroutines owned by the scheduler; we never
+// dereference them without holding the lock (except to pass to `goready`,
+// which is safe once the goroutine has reached `GWAITING`).
+unsafe impl Send for WgState {}
 
 // ---------------------------------------------------------------------------
 // WaitGroup
@@ -54,6 +78,7 @@ struct WgState {
 /// ```
 pub struct WaitGroup {
     state: Mutex<WgState>,
+    /// Condvar used only on the non-goroutine fallback path.
     cond:  Condvar,
 }
 
@@ -61,7 +86,7 @@ impl WaitGroup {
     /// Create a new `WaitGroup` with a counter of zero.
     pub fn new() -> Self {
         Self {
-            state: Mutex::new(WgState { count: 0 }),
+            state: Mutex::new(WgState { count: 0, waiters: Vec::new() }),
             cond:  Condvar::new(),
         }
     }
@@ -75,16 +100,30 @@ impl WaitGroup {
     ///
     /// Panics if the counter drops below zero.
     pub fn add(&self, delta: i64) {
-        let mut state = self.state.lock().unwrap();
-        state.count += delta;
-        if state.count < 0 {
-            drop(state);
-            panic!("sync: negative WaitGroup counter");
-        }
-        if state.count == 0 {
-            // Notify all waiters — counter has reached zero.
-            drop(state);
-            self.cond.notify_all();
+        // Collect goroutine waiters to wake (if counter reaches zero).
+        let goroutine_waiters: Vec<*mut G> = {
+            let mut state = self.state.lock().unwrap();
+            state.count += delta;
+            if state.count < 0 {
+                drop(state);
+                panic!("sync: negative WaitGroup counter");
+            }
+            if state.count == 0 {
+                // Wake condvar waiters (non-goroutine / loom path).
+                // Drain goroutine waiters to wake via goready below.
+                let w = std::mem::take(&mut state.waiters);
+                drop(state);
+                self.cond.notify_all();
+                w
+            } else {
+                Vec::new()
+            }
+        };
+
+        // Wake goroutine waiters outside the lock so we don't hold it during
+        // the goready spin (which waits for GRUNNING → GWAITING).
+        for gp in goroutine_waiters {
+            unsafe { goready(gp) };
         }
     }
 
@@ -97,25 +136,43 @@ impl WaitGroup {
 
     /// Block until the counter is zero.
     ///
-    /// The calling goroutine's P is handed off while waiting so other
-    /// goroutines can run on this M's processor.
+    /// When called from a goroutine: suspends the goroutine back into the
+    /// scheduler via `gopark` so the M and P remain free to run other
+    /// goroutines.  Resumed by `add` calling `goready` when the counter
+    /// reaches zero.
+    ///
+    /// When called from a bare OS thread (outside the go-lib scheduler):
+    /// blocks the thread on an internal `Condvar`.
     pub fn wait(&self) {
-        // Fast path: already zero.
-        {
-            let state = self.state.lock().unwrap();
+        // ── Goroutine path ──────────────────────────────────────────────────
+        // gopark suspends this goroutine without blocking the OS thread.
+        // The M+P are returned to the scheduler to run other goroutines
+        // (including whoever will call done() to reach count == 0).
+        let gp = current_g();
+        if !gp.is_null() {
+            let mut state = self.state.lock().unwrap();
             if state.count == 0 {
-                return;
+                return; // fast path: already done
             }
+            // Register as a waiter *before* releasing the lock so that any
+            // concurrent add() that drives count to zero will see us and call
+            // goready.  goready itself spins until our status reaches GWAITING,
+            // which closes the window between drop(state) and gopark().
+            state.waiters.push(gp);
+            drop(state);
+            // Suspend this goroutine.  Execution resumes here after add()
+            // calls goready(gp) once the counter reaches zero.
+            unsafe { gopark(WaitReason::Semacquire) };
+            return;
         }
 
-        // Slow path: block until notified.  Wrap in with_syscall so the P is
-        // released to the scheduler while this OS thread sleeps.
-        crate::with_syscall(|| {
-            let mut state = self.state.lock().unwrap();
-            while state.count > 0 {
-                state = self.cond.wait(state).unwrap();
-            }
-        });
+        // ── Non-goroutine / loom path ───────────────────────────────────────
+        // Block the calling OS thread on the condvar.  Used by tests that call
+        // wait() from a bare thread and by loom model threads.
+        let mut state = self.state.lock().unwrap();
+        while state.count > 0 {
+            state = self.cond.wait(state).unwrap();
+        }
     }
 }
 
@@ -216,7 +273,7 @@ mod tests {
                 }
             }
 
-            // Yield so the waiters have a chance to call wg.wait() and block.
+            // Yield so the waiters have a chance to call wg.wait() and park.
             for _ in 0..20 { crate::gosched(); }
             wg.done();
 
