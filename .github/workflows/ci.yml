@@ -37,8 +37,8 @@ jobs:
 
       - name: Update tool chain
         run: |
-          rustup update ${{ matrix.target }}
-          rustup default ${{ matrix.target }}
+          rustup update
+          rustup default
           rustup component add clippy
 
       - name: Cache cargo registry
@@ -68,8 +68,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Update tool chain
+        run: |
+          rustup update
+          rustup default
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -90,8 +92,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Update tool chain
+        run: |
+          rustup update
+          rustup default
 
       - name: Cache cargo registry
         uses: actions/cache@v4
