@@ -5,7 +5,8 @@
 //!
 //! 1. **Netpoll** — calls [`netpoll::netpoll_wait(0)`][super::netpoll::netpoll_wait]
 //!    (non-blocking) and issues [`goready`][super::park::goready] for every
-//!    goroutine whose I/O fd became ready.  *(v2.0 — Step 5)*
+//!    goroutine whose I/O fd became ready (Unix) or whose overlapped operation
+//!    completed (Windows IOCP).  *(v2.0 — Step 5)*
 //!
 //! 2. **Async preemption** — for every P in `PRUNNING` whose `schedtick` has
 //!    not advanced for more than `FORCE_PREEMPT_NS` (10 ms), `preemptone`:

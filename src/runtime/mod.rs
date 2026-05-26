@@ -13,7 +13,7 @@
 //! | `sched` — `async_preempt2`, `sigurg_handler` | Non-cooperative goroutine preemption via SIGURG (Step 4) |
 //! | `asm_amd64`/`asm_arm64` — `async_preempt_trampoline` | Save/restore all registers around the preemption yield (Step 4) |
 //! | `sysmon` — `pthread_kill(SIGURG)` in `preemptone` | Signal delivery for async preemption (Step 4) |
-//! | `netpoll` | epoll (Linux) / kqueue (macOS) fd-readiness backend (Step 5) |
+//! | `netpoll` | epoll (Linux) / kqueue (macOS) / IOCP (Windows) I/O backend (Step 5) |
 //!
 //! | This module   | Go source                                                   |
 //! |---------------|-------------------------------------------------------------|
@@ -22,7 +22,7 @@
 //! | `p`           | `runtime/runtime2.go`, `runtime/proc.go`                    |
 //! | `sched`       | `runtime/proc.go`, `runtime/preempt.go`                     |
 //! | `stack`       | `runtime/stack.go`, `runtime/signal_unix.go`                |
-//! | `netpoll`     | `runtime/netpoll_epoll.go`, `runtime/netpoll_kqueue.go`     |
+//! | `netpoll`     | `runtime/netpoll_epoll.go`, `runtime/netpoll_kqueue.go`, `runtime/netpoll_windows.go` |
 //! | `park`        | `runtime/proc.go` (gopark / goready)                        |
 //! | `sudog`       | `runtime/runtime2.go`, `runtime/proc.go`                    |
 //! | `syscall`     | `runtime/proc.go` (entersyscall / exitsyscall)              |

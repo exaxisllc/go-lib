@@ -32,7 +32,8 @@
 //! ### Netpoll integration (`findrunnable`)
 //! After the three work-stealing steps, `findrunnable` calls
 //! `netpoll::netpoll_wait(0)` (non-blocking) and issues `goready` for every
-//! file descriptor that became ready since the last poll.
+//! goroutine whose I/O became ready (Unix) or whose overlapped operation
+//! completed (Windows IOCP) since the last poll.
 //!
 //! ## Global state
 //!
