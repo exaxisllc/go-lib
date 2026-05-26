@@ -41,7 +41,10 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: cargo test
-        run: cargo test
+        # --nocapture: print test output immediately so crash context is
+        # visible in the job log even when the process exits abnormally
+        # (e.g. STATUS_ACCESS_VIOLATION on Windows).
+        run: cargo test -- --nocapture
 
       - name: cargo doc (no deps, no-run)
         run: cargo doc --no-deps
