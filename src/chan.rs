@@ -731,6 +731,7 @@ mod tests {
 
         let got_none = Arc::new(AtomicI32::new(0));
         let got2 = Arc::clone(&got_none);
+        let got3 = Arc::clone(&got_none); // checked inside run_impl to bound the post-close loop
 
         run_impl(move || {
             let (tx, rx) = chan::<i32>(0);
@@ -742,9 +743,20 @@ mod tests {
                 }
             });
 
-            for _ in 0..20 { crate::gosched(); }
+            // Give the spawned goroutine time to start and block on recv.
+            // More iterations than before because parallel test load on CI can
+            // starve goroutines for many scheduler rounds.
+            for _ in 0..500 { crate::gosched(); }
             tx.close();
-            for _ in 0..20 { crate::gosched(); }
+            // Wait for the goroutine to observe the close and record its result.
+            // A wall-clock deadline is robust across CI runner speeds.
+            let deadline =
+                std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while got3.load(Ordering::Acquire) == 0
+                && std::time::Instant::now() < deadline
+            {
+                crate::gosched();
+            }
         });
 
         assert_eq!(got_none.load(Ordering::Acquire), 1);

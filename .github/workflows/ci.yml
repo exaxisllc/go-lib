@@ -19,6 +19,7 @@ jobs:
     name: Build & Test
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false   # always run all platforms; don't cancel Windows when macOS fails
       matrix:
         os: [ubuntu-latest, macOS-latest, windows-latest]
         toolchain: [stable]
