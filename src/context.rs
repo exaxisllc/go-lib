@@ -227,15 +227,12 @@ pub fn with_deadline(parent: &Context, deadline: Instant) -> (Context, CancelFn)
     } else {
         let d = deadline.duration_since(now);
         let inner_weak = Arc::downgrade(&cancel_dl.0);
-        // SAFETY: spawn_goroutine only requires the scheduler to be running.
-        unsafe {
-            crate::runtime::sched::spawn_goroutine(move || {
-                crate::sleep(d);
-                if let Some(inner) = inner_weak.upgrade() {
-                    inner.cancel(ContextError::DeadlineExceeded);
-                }
-            });
-        }
+        crate::runtime::sched::spawn_goroutine(move || {
+            crate::sleep(d);
+            if let Some(inner) = inner_weak.upgrade() {
+                inner.cancel(ContextError::DeadlineExceeded);
+            }
+        });
     }
 
     (ctx, cancel)
@@ -370,12 +367,10 @@ mod tests {
             let bg = background();
             let (ctx, cancel) = with_cancel(&bg);
 
-            unsafe {
-                crate::runtime::sched::spawn_goroutine(move || {
-                    ctx.done().recv(); // blocks until cancelled
-                    fired2.store(true, Ordering::Release);
-                });
-            }
+            crate::runtime::sched::spawn_goroutine(move || {
+                ctx.done().recv(); // blocks until cancelled
+                fired2.store(true, Ordering::Release);
+            });
 
             // Let the goroutine park on the done channel.
             for _ in 0..20 { crate::gosched(); }

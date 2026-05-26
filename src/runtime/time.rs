@@ -191,21 +191,19 @@ pub(crate) unsafe fn sleep(d: Duration) {
         t.unpark();
     }
 
-    unsafe { gopark(WaitReason::Sleep) };
+    gopark(WaitReason::Sleep);
     // Returns here after the timer fires and goready transitions us to GRUNNABLE.
 }
 
 // ---------------------------------------------------------------------------
-// Public API re-exported from lib.rs
+// Crate-internal entry point — called by lib.rs::sleep()
 // ---------------------------------------------------------------------------
 
-/// Sleep for `d` inside a goroutine.
-///
-/// Exposed as a standalone function so `select!` can handle timeouts.
+/// Thin wrapper around [`sleep`] used by `lib.rs::sleep`.
 ///
 /// # Safety
-/// Must be called from a goroutine stack.
-pub unsafe fn goroutine_sleep(d: Duration) {
+/// Must be called from a goroutine stack (not g0 or a bare OS thread).
+pub(crate) unsafe fn goroutine_sleep(d: Duration) {
     unsafe { sleep(d) };
 }
 
@@ -214,7 +212,6 @@ pub unsafe fn goroutine_sleep(d: Duration) {
 // ---------------------------------------------------------------------------
 
 #[cfg(all(test, not(loom)))]
-#[allow(unused_unsafe)] // closures calling unsafe fn inside an outer unsafe{} block
 mod tests {
     use super::*;
     use crate::runtime::sched::run_impl;
@@ -269,12 +266,10 @@ mod tests {
         let done2 = Arc::clone(&done);
 
         run_impl(move || {
-            unsafe {
-                spawn_goroutine(move || {
-                    unsafe { sleep(Duration::from_millis(5)) };
-                    done2.store(1, Ordering::Relaxed);
-                });
-            }
+            spawn_goroutine(move || {
+                unsafe { sleep(Duration::from_millis(5)) };
+                done2.store(1, Ordering::Relaxed);
+            });
 
             // Spin-yield for up to 200 ms waiting for the sleeper to finish.
             let deadline = Instant::now() + Duration::from_millis(200);
@@ -300,12 +295,10 @@ mod tests {
         run_impl(move || {
             for _ in 0..N {
                 let awoke3 = Arc::clone(&awoke2);
-                unsafe {
-                    spawn_goroutine(move || {
-                        unsafe { sleep(Duration::from_millis(10)) };
-                        awoke3.fetch_add(1, Ordering::Relaxed);
-                    });
-                }
+                spawn_goroutine(move || {
+                    unsafe { sleep(Duration::from_millis(10)) };
+                    awoke3.fetch_add(1, Ordering::Relaxed);
+                });
             }
 
             let deadline = Instant::now() + Duration::from_millis(500);

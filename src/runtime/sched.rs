@@ -864,8 +864,23 @@ pub(crate) fn new_goroutine(f: impl FnOnce() + Send + 'static) -> Box<G> {
 ///
 /// The goroutine will be picked up by whichever M's `findrunnable` finds it
 /// first.
-pub(crate) unsafe fn spawn_goroutine(f: impl FnOnce() + Send + 'static) {
+///
+/// # Precondition
+///
+/// The go-lib scheduler must be running (i.e. [`schedinit`] has been called).
+/// Violating this precondition will not cause undefined behaviour — the goroutine
+/// is simply never executed — but it is almost certainly a programming mistake.
+/// A `debug_assert` fires in debug builds if called before the scheduler starts.
+pub(crate) fn spawn_goroutine(f: impl FnOnce() + Send + 'static) {
+    debug_assert!(
+        INITIALIZED.load(Acquire),
+        "spawn_goroutine called before schedinit; goroutine will never run"
+    );
     let g_ptr = Box::into_raw(new_goroutine(f));
+    // SAFETY: g_ptr is a freshly-allocated, uniquely-owned G.  push_batch and
+    // startm are unsafe because they manipulate the scheduler's internal queues
+    // without a typed lock; their preconditions (non-null pointer, valid G
+    // layout) are satisfied by the new_goroutine constructor above.
     unsafe {
         (*g_ptr).schedlink = ptr::null_mut();
         sched().global_run_q.push_batch(g_ptr, g_ptr, 1);
@@ -981,7 +996,7 @@ pub(crate) fn run_impl<F: FnOnce() + Send + 'static>(f: F) {
         caller.unpark();
     };
 
-    unsafe { spawn_goroutine(wrapper) };
+    spawn_goroutine(wrapper);
 
     // Block until the goroutine calls caller.unpark().
     std::thread::park();
@@ -1138,11 +1153,9 @@ mod tests {
 
         run_impl(move || {
             // Goroutine 1: spawn goroutine 2 then yield until it sets the flag.
-            unsafe {
-                spawn_goroutine(move || {
-                    flag_setter.store(true, Ordering::Release);
-                });
-            }
+            spawn_goroutine(move || {
+                flag_setter.store(true, Ordering::Release);
+            });
             while !flag.load(Ordering::Acquire) {
                 unsafe { gosched() };
             }

@@ -87,32 +87,24 @@ macro_rules! select {
 
     // ─── A1: single recv, blocking ────────────────────────────────────────────
     ( recv($r:expr) -> $v:ident => $b:block $(,)? ) => {{
-        let mut __r0: ::std::mem::MaybeUninit<_> = ::std::mem::MaybeUninit::uninit();
+        let mut __r0: ::std::option::Option<_> = ::std::option::Option::None;
         let mut __sel = ::std::vec![
             $crate::select::recv_case_of(&($r), &mut __r0),
         ];
-        let (_i, __ok) = unsafe { $crate::select::selectgo(&mut __sel, false) };
-        let $v: ::std::option::Option<_> = if __ok {
-            ::std::option::Option::Some(unsafe { __r0.assume_init() })
-        } else {
-            ::std::option::Option::None
-        };
+        $crate::select::selectgo(&mut __sel, false);
+        let $v = __r0;
         $b
     }};
 
     // ─── B1: single recv + default ────────────────────────────────────────────
     ( recv($r:expr) -> $v:ident => $b:block $(,)? default => $d:block $(,)? ) => {{
-        let mut __r0: ::std::mem::MaybeUninit<_> = ::std::mem::MaybeUninit::uninit();
+        let mut __r0: ::std::option::Option<_> = ::std::option::Option::None;
         let mut __sel = ::std::vec![
             $crate::select::recv_case_of(&($r), &mut __r0),
         ];
-        let (__idx, __ok) = unsafe { $crate::select::selectgo(&mut __sel, true) };
+        let (__idx, _ok) = $crate::select::selectgo(&mut __sel, true);
         if __idx == 0 {
-            let $v: ::std::option::Option<_> = if __ok {
-                ::std::option::Option::Some(unsafe { __r0.assume_init() })
-            } else {
-                ::std::option::Option::None
-            };
+            let $v = __r0;
             $b
         } else { $d }
     }};
@@ -120,18 +112,18 @@ macro_rules! select {
     // ─── A2: two recv, blocking ───────────────────────────────────────────────
     ( recv($r1:expr) -> $v1:ident => $b1:block $(,)?
       recv($r2:expr) -> $v2:ident => $b2:block $(,)? ) => {{
-        let mut __r0: ::std::mem::MaybeUninit<_> = ::std::mem::MaybeUninit::uninit();
-        let mut __r1: ::std::mem::MaybeUninit<_> = ::std::mem::MaybeUninit::uninit();
+        let mut __r0: ::std::option::Option<_> = ::std::option::Option::None;
+        let mut __r1: ::std::option::Option<_> = ::std::option::Option::None;
         let mut __sel = ::std::vec![
             $crate::select::recv_case_of(&($r1), &mut __r0),
             $crate::select::recv_case_of(&($r2), &mut __r1),
         ];
-        let (__idx, __ok) = unsafe { $crate::select::selectgo(&mut __sel, false) };
+        let (__idx, _ok) = $crate::select::selectgo(&mut __sel, false);
         if __idx == 0 {
-            let $v1: ::std::option::Option<_> = if __ok { ::std::option::Option::Some(unsafe { __r0.assume_init() }) } else { ::std::option::Option::None };
+            let $v1 = __r0;
             $b1
         } else {
-            let $v2: ::std::option::Option<_> = if __ok { ::std::option::Option::Some(unsafe { __r1.assume_init() }) } else { ::std::option::Option::None };
+            let $v2 = __r1;
             $b2
         }
     }};
@@ -140,18 +132,18 @@ macro_rules! select {
     ( recv($r1:expr) -> $v1:ident => $b1:block $(,)?
       recv($r2:expr) -> $v2:ident => $b2:block $(,)?
       default => $d:block $(,)? ) => {{
-        let mut __r0: ::std::mem::MaybeUninit<_> = ::std::mem::MaybeUninit::uninit();
-        let mut __r1: ::std::mem::MaybeUninit<_> = ::std::mem::MaybeUninit::uninit();
+        let mut __r0: ::std::option::Option<_> = ::std::option::Option::None;
+        let mut __r1: ::std::option::Option<_> = ::std::option::Option::None;
         let mut __sel = ::std::vec![
             $crate::select::recv_case_of(&($r1), &mut __r0),
             $crate::select::recv_case_of(&($r2), &mut __r1),
         ];
-        let (__idx, __ok) = unsafe { $crate::select::selectgo(&mut __sel, true) };
+        let (__idx, _ok) = $crate::select::selectgo(&mut __sel, true);
         if __idx == 0 {
-            let $v1: ::std::option::Option<_> = if __ok { ::std::option::Option::Some(unsafe { __r0.assume_init() }) } else { ::std::option::Option::None };
+            let $v1 = __r0;
             $b1
         } else if __idx == 1 {
-            let $v2: ::std::option::Option<_> = if __ok { ::std::option::Option::Some(unsafe { __r1.assume_init() }) } else { ::std::option::Option::None };
+            let $v2 = __r1;
             $b2
         } else { $d }
     }};
@@ -160,23 +152,23 @@ macro_rules! select {
     ( recv($r1:expr) -> $v1:ident => $b1:block $(,)?
       recv($r2:expr) -> $v2:ident => $b2:block $(,)?
       recv($r3:expr) -> $v3:ident => $b3:block $(,)? ) => {{
-        let mut __r0: ::std::mem::MaybeUninit<_> = ::std::mem::MaybeUninit::uninit();
-        let mut __r1: ::std::mem::MaybeUninit<_> = ::std::mem::MaybeUninit::uninit();
-        let mut __r2: ::std::mem::MaybeUninit<_> = ::std::mem::MaybeUninit::uninit();
+        let mut __r0: ::std::option::Option<_> = ::std::option::Option::None;
+        let mut __r1: ::std::option::Option<_> = ::std::option::Option::None;
+        let mut __r2: ::std::option::Option<_> = ::std::option::Option::None;
         let mut __sel = ::std::vec![
             $crate::select::recv_case_of(&($r1), &mut __r0),
             $crate::select::recv_case_of(&($r2), &mut __r1),
             $crate::select::recv_case_of(&($r3), &mut __r2),
         ];
-        let (__idx, __ok) = unsafe { $crate::select::selectgo(&mut __sel, false) };
+        let (__idx, _ok) = $crate::select::selectgo(&mut __sel, false);
         if __idx == 0 {
-            let $v1: ::std::option::Option<_> = if __ok { ::std::option::Option::Some(unsafe { __r0.assume_init() }) } else { ::std::option::Option::None };
+            let $v1 = __r0;
             $b1
         } else if __idx == 1 {
-            let $v2: ::std::option::Option<_> = if __ok { ::std::option::Option::Some(unsafe { __r1.assume_init() }) } else { ::std::option::Option::None };
+            let $v2 = __r1;
             $b2
         } else {
-            let $v3: ::std::option::Option<_> = if __ok { ::std::option::Option::Some(unsafe { __r2.assume_init() }) } else { ::std::option::Option::None };
+            let $v3 = __r2;
             $b3
         }
     }};
@@ -186,23 +178,23 @@ macro_rules! select {
       recv($r2:expr) -> $v2:ident => $b2:block $(,)?
       recv($r3:expr) -> $v3:ident => $b3:block $(,)?
       default => $d:block $(,)? ) => {{
-        let mut __r0: ::std::mem::MaybeUninit<_> = ::std::mem::MaybeUninit::uninit();
-        let mut __r1: ::std::mem::MaybeUninit<_> = ::std::mem::MaybeUninit::uninit();
-        let mut __r2: ::std::mem::MaybeUninit<_> = ::std::mem::MaybeUninit::uninit();
+        let mut __r0: ::std::option::Option<_> = ::std::option::Option::None;
+        let mut __r1: ::std::option::Option<_> = ::std::option::Option::None;
+        let mut __r2: ::std::option::Option<_> = ::std::option::Option::None;
         let mut __sel = ::std::vec![
             $crate::select::recv_case_of(&($r1), &mut __r0),
             $crate::select::recv_case_of(&($r2), &mut __r1),
             $crate::select::recv_case_of(&($r3), &mut __r2),
         ];
-        let (__idx, __ok) = unsafe { $crate::select::selectgo(&mut __sel, true) };
+        let (__idx, _ok) = $crate::select::selectgo(&mut __sel, true);
         if __idx == 0 {
-            let $v1: ::std::option::Option<_> = if __ok { ::std::option::Option::Some(unsafe { __r0.assume_init() }) } else { ::std::option::Option::None };
+            let $v1 = __r0;
             $b1
         } else if __idx == 1 {
-            let $v2: ::std::option::Option<_> = if __ok { ::std::option::Option::Some(unsafe { __r1.assume_init() }) } else { ::std::option::Option::None };
+            let $v2 = __r1;
             $b2
         } else if __idx == 2 {
-            let $v3: ::std::option::Option<_> = if __ok { ::std::option::Option::Some(unsafe { __r2.assume_init() }) } else { ::std::option::Option::None };
+            let $v3 = __r2;
             $b3
         } else { $d }
     }};
@@ -212,28 +204,28 @@ macro_rules! select {
       recv($r2:expr) -> $v2:ident => $b2:block $(,)?
       recv($r3:expr) -> $v3:ident => $b3:block $(,)?
       recv($r4:expr) -> $v4:ident => $b4:block $(,)? ) => {{
-        let mut __r0: ::std::mem::MaybeUninit<_> = ::std::mem::MaybeUninit::uninit();
-        let mut __r1: ::std::mem::MaybeUninit<_> = ::std::mem::MaybeUninit::uninit();
-        let mut __r2: ::std::mem::MaybeUninit<_> = ::std::mem::MaybeUninit::uninit();
-        let mut __r3: ::std::mem::MaybeUninit<_> = ::std::mem::MaybeUninit::uninit();
+        let mut __r0: ::std::option::Option<_> = ::std::option::Option::None;
+        let mut __r1: ::std::option::Option<_> = ::std::option::Option::None;
+        let mut __r2: ::std::option::Option<_> = ::std::option::Option::None;
+        let mut __r3: ::std::option::Option<_> = ::std::option::Option::None;
         let mut __sel = ::std::vec![
             $crate::select::recv_case_of(&($r1), &mut __r0),
             $crate::select::recv_case_of(&($r2), &mut __r1),
             $crate::select::recv_case_of(&($r3), &mut __r2),
             $crate::select::recv_case_of(&($r4), &mut __r3),
         ];
-        let (__idx, __ok) = unsafe { $crate::select::selectgo(&mut __sel, false) };
+        let (__idx, _ok) = $crate::select::selectgo(&mut __sel, false);
         if __idx == 0 {
-            let $v1: ::std::option::Option<_> = if __ok { ::std::option::Option::Some(unsafe { __r0.assume_init() }) } else { ::std::option::Option::None };
+            let $v1 = __r0;
             $b1
         } else if __idx == 1 {
-            let $v2: ::std::option::Option<_> = if __ok { ::std::option::Option::Some(unsafe { __r1.assume_init() }) } else { ::std::option::Option::None };
+            let $v2 = __r1;
             $b2
         } else if __idx == 2 {
-            let $v3: ::std::option::Option<_> = if __ok { ::std::option::Option::Some(unsafe { __r2.assume_init() }) } else { ::std::option::Option::None };
+            let $v3 = __r2;
             $b3
         } else {
-            let $v4: ::std::option::Option<_> = if __ok { ::std::option::Option::Some(unsafe { __r3.assume_init() }) } else { ::std::option::Option::None };
+            let $v4 = __r3;
             $b4
         }
     }};
@@ -244,28 +236,28 @@ macro_rules! select {
       recv($r3:expr) -> $v3:ident => $b3:block $(,)?
       recv($r4:expr) -> $v4:ident => $b4:block $(,)?
       default => $d:block $(,)? ) => {{
-        let mut __r0: ::std::mem::MaybeUninit<_> = ::std::mem::MaybeUninit::uninit();
-        let mut __r1: ::std::mem::MaybeUninit<_> = ::std::mem::MaybeUninit::uninit();
-        let mut __r2: ::std::mem::MaybeUninit<_> = ::std::mem::MaybeUninit::uninit();
-        let mut __r3: ::std::mem::MaybeUninit<_> = ::std::mem::MaybeUninit::uninit();
+        let mut __r0: ::std::option::Option<_> = ::std::option::Option::None;
+        let mut __r1: ::std::option::Option<_> = ::std::option::Option::None;
+        let mut __r2: ::std::option::Option<_> = ::std::option::Option::None;
+        let mut __r3: ::std::option::Option<_> = ::std::option::Option::None;
         let mut __sel = ::std::vec![
             $crate::select::recv_case_of(&($r1), &mut __r0),
             $crate::select::recv_case_of(&($r2), &mut __r1),
             $crate::select::recv_case_of(&($r3), &mut __r2),
             $crate::select::recv_case_of(&($r4), &mut __r3),
         ];
-        let (__idx, __ok) = unsafe { $crate::select::selectgo(&mut __sel, true) };
+        let (__idx, _ok) = $crate::select::selectgo(&mut __sel, true);
         if __idx == 0 {
-            let $v1: ::std::option::Option<_> = if __ok { ::std::option::Option::Some(unsafe { __r0.assume_init() }) } else { ::std::option::Option::None };
+            let $v1 = __r0;
             $b1
         } else if __idx == 1 {
-            let $v2: ::std::option::Option<_> = if __ok { ::std::option::Option::Some(unsafe { __r1.assume_init() }) } else { ::std::option::Option::None };
+            let $v2 = __r1;
             $b2
         } else if __idx == 2 {
-            let $v3: ::std::option::Option<_> = if __ok { ::std::option::Option::Some(unsafe { __r2.assume_init() }) } else { ::std::option::Option::None };
+            let $v3 = __r2;
             $b3
         } else if __idx == 3 {
-            let $v4: ::std::option::Option<_> = if __ok { ::std::option::Option::Some(unsafe { __r3.assume_init() }) } else { ::std::option::Option::None };
+            let $v4 = __r3;
             $b4
         } else { $d }
     }};
@@ -276,12 +268,13 @@ macro_rules! select {
         let mut __sel = ::std::vec![
             $crate::select::send_case_of(&($tx), &mut __s0),
         ];
-        let (__idx, _ok) = unsafe { $crate::select::selectgo(&mut __sel, true) };
+        let (__idx, _ok) = $crate::select::selectgo(&mut __sel, true);
         if __idx == 0 {
             // Send won — value consumed, do NOT drop __s0.
             $sb
         } else {
             // Default — drop the unsent value.
+            // SAFETY: __s0 was not consumed by selectgo (default taken).
             unsafe { ::std::mem::ManuallyDrop::drop(&mut __s0) };
             $d
         }
@@ -290,16 +283,17 @@ macro_rules! select {
     // ─── D1: 1 recv + 1 send, blocking ───────────────────────────────────────
     ( recv($r1:expr) -> $v1:ident => $rb:block $(,)?
       send($tx:expr, $sv:expr)    => $sb:block $(,)? ) => {{
-        let mut __r0: ::std::mem::MaybeUninit<_> = ::std::mem::MaybeUninit::uninit();
+        let mut __r0: ::std::option::Option<_> = ::std::option::Option::None;
         let mut __s0: ::std::mem::ManuallyDrop<_> = ::std::mem::ManuallyDrop::new($sv);
         let mut __sel = ::std::vec![
             $crate::select::recv_case_of(&($r1), &mut __r0),
             $crate::select::send_case_of(&($tx), &mut __s0),
         ];
-        let (__idx, __ok) = unsafe { $crate::select::selectgo(&mut __sel, false) };
+        let (__idx, _ok) = $crate::select::selectgo(&mut __sel, false);
         if __idx == 0 {
+            // SAFETY: recv won, send value was not consumed.
             unsafe { ::std::mem::ManuallyDrop::drop(&mut __s0) };
-            let $v1: ::std::option::Option<_> = if __ok { ::std::option::Option::Some(unsafe { __r0.assume_init() }) } else { ::std::option::Option::None };
+            let $v1 = __r0;
             $rb
         } else {
             // Send won — value consumed.
@@ -311,20 +305,22 @@ macro_rules! select {
     ( recv($r1:expr) -> $v1:ident => $rb:block $(,)?
       send($tx:expr, $sv:expr)    => $sb:block $(,)?
       default                     => $d:block $(,)? ) => {{
-        let mut __r0: ::std::mem::MaybeUninit<_> = ::std::mem::MaybeUninit::uninit();
+        let mut __r0: ::std::option::Option<_> = ::std::option::Option::None;
         let mut __s0: ::std::mem::ManuallyDrop<_> = ::std::mem::ManuallyDrop::new($sv);
         let mut __sel = ::std::vec![
             $crate::select::recv_case_of(&($r1), &mut __r0),
             $crate::select::send_case_of(&($tx), &mut __s0),
         ];
-        let (__idx, __ok) = unsafe { $crate::select::selectgo(&mut __sel, true) };
+        let (__idx, _ok) = $crate::select::selectgo(&mut __sel, true);
         if __idx == 0 {
+            // SAFETY: recv won, send value was not consumed.
             unsafe { ::std::mem::ManuallyDrop::drop(&mut __s0) };
-            let $v1: ::std::option::Option<_> = if __ok { ::std::option::Option::Some(unsafe { __r0.assume_init() }) } else { ::std::option::Option::None };
+            let $v1 = __r0;
             $rb
         } else if __idx == 1 {
             $sb
         } else {
+            // SAFETY: default taken, send value was not consumed.
             unsafe { ::std::mem::ManuallyDrop::drop(&mut __s0) };
             $d
         }
@@ -334,22 +330,22 @@ macro_rules! select {
     ( recv($r1:expr) -> $v1:ident => $b1:block $(,)?
       recv($r2:expr) -> $v2:ident => $b2:block $(,)?
       send($tx:expr, $sv:expr)    => $sb:block $(,)? ) => {{
-        let mut __r0: ::std::mem::MaybeUninit<_> = ::std::mem::MaybeUninit::uninit();
-        let mut __r1: ::std::mem::MaybeUninit<_> = ::std::mem::MaybeUninit::uninit();
+        let mut __r0: ::std::option::Option<_> = ::std::option::Option::None;
+        let mut __r1: ::std::option::Option<_> = ::std::option::Option::None;
         let mut __s0: ::std::mem::ManuallyDrop<_> = ::std::mem::ManuallyDrop::new($sv);
         let mut __sel = ::std::vec![
             $crate::select::recv_case_of(&($r1), &mut __r0),
             $crate::select::recv_case_of(&($r2), &mut __r1),
             $crate::select::send_case_of(&($tx), &mut __s0),
         ];
-        let (__idx, __ok) = unsafe { $crate::select::selectgo(&mut __sel, false) };
+        let (__idx, _ok) = $crate::select::selectgo(&mut __sel, false);
         if __idx == 0 {
             unsafe { ::std::mem::ManuallyDrop::drop(&mut __s0) };
-            let $v1: ::std::option::Option<_> = if __ok { ::std::option::Option::Some(unsafe { __r0.assume_init() }) } else { ::std::option::Option::None };
+            let $v1 = __r0;
             $b1
         } else if __idx == 1 {
             unsafe { ::std::mem::ManuallyDrop::drop(&mut __s0) };
-            let $v2: ::std::option::Option<_> = if __ok { ::std::option::Option::Some(unsafe { __r1.assume_init() }) } else { ::std::option::Option::None };
+            let $v2 = __r1;
             $b2
         } else {
             $sb
@@ -361,22 +357,22 @@ macro_rules! select {
       recv($r2:expr) -> $v2:ident => $b2:block $(,)?
       send($tx:expr, $sv:expr)    => $sb:block $(,)?
       default                     => $d:block $(,)? ) => {{
-        let mut __r0: ::std::mem::MaybeUninit<_> = ::std::mem::MaybeUninit::uninit();
-        let mut __r1: ::std::mem::MaybeUninit<_> = ::std::mem::MaybeUninit::uninit();
+        let mut __r0: ::std::option::Option<_> = ::std::option::Option::None;
+        let mut __r1: ::std::option::Option<_> = ::std::option::Option::None;
         let mut __s0: ::std::mem::ManuallyDrop<_> = ::std::mem::ManuallyDrop::new($sv);
         let mut __sel = ::std::vec![
             $crate::select::recv_case_of(&($r1), &mut __r0),
             $crate::select::recv_case_of(&($r2), &mut __r1),
             $crate::select::send_case_of(&($tx), &mut __s0),
         ];
-        let (__idx, __ok) = unsafe { $crate::select::selectgo(&mut __sel, true) };
+        let (__idx, _ok) = $crate::select::selectgo(&mut __sel, true);
         if __idx == 0 {
             unsafe { ::std::mem::ManuallyDrop::drop(&mut __s0) };
-            let $v1: ::std::option::Option<_> = if __ok { ::std::option::Option::Some(unsafe { __r0.assume_init() }) } else { ::std::option::Option::None };
+            let $v1 = __r0;
             $b1
         } else if __idx == 1 {
             unsafe { ::std::mem::ManuallyDrop::drop(&mut __s0) };
-            let $v2: ::std::option::Option<_> = if __ok { ::std::option::Option::Some(unsafe { __r1.assume_init() }) } else { ::std::option::Option::None };
+            let $v2 = __r1;
             $b2
         } else if __idx == 2 {
             $sb
@@ -391,9 +387,9 @@ macro_rules! select {
       recv($r2:expr) -> $v2:ident => $b2:block $(,)?
       recv($r3:expr) -> $v3:ident => $b3:block $(,)?
       send($tx:expr, $sv:expr)    => $sb:block $(,)? ) => {{
-        let mut __r0: ::std::mem::MaybeUninit<_> = ::std::mem::MaybeUninit::uninit();
-        let mut __r1: ::std::mem::MaybeUninit<_> = ::std::mem::MaybeUninit::uninit();
-        let mut __r2: ::std::mem::MaybeUninit<_> = ::std::mem::MaybeUninit::uninit();
+        let mut __r0: ::std::option::Option<_> = ::std::option::Option::None;
+        let mut __r1: ::std::option::Option<_> = ::std::option::Option::None;
+        let mut __r2: ::std::option::Option<_> = ::std::option::Option::None;
         let mut __s0: ::std::mem::ManuallyDrop<_> = ::std::mem::ManuallyDrop::new($sv);
         let mut __sel = ::std::vec![
             $crate::select::recv_case_of(&($r1), &mut __r0),
@@ -401,18 +397,18 @@ macro_rules! select {
             $crate::select::recv_case_of(&($r3), &mut __r2),
             $crate::select::send_case_of(&($tx), &mut __s0),
         ];
-        let (__idx, __ok) = unsafe { $crate::select::selectgo(&mut __sel, false) };
+        let (__idx, _ok) = $crate::select::selectgo(&mut __sel, false);
         if __idx == 0 {
             unsafe { ::std::mem::ManuallyDrop::drop(&mut __s0) };
-            let $v1: ::std::option::Option<_> = if __ok { ::std::option::Option::Some(unsafe { __r0.assume_init() }) } else { ::std::option::Option::None };
+            let $v1 = __r0;
             $b1
         } else if __idx == 1 {
             unsafe { ::std::mem::ManuallyDrop::drop(&mut __s0) };
-            let $v2: ::std::option::Option<_> = if __ok { ::std::option::Option::Some(unsafe { __r1.assume_init() }) } else { ::std::option::Option::None };
+            let $v2 = __r1;
             $b2
         } else if __idx == 2 {
             unsafe { ::std::mem::ManuallyDrop::drop(&mut __s0) };
-            let $v3: ::std::option::Option<_> = if __ok { ::std::option::Option::Some(unsafe { __r2.assume_init() }) } else { ::std::option::Option::None };
+            let $v3 = __r2;
             $b3
         } else {
             $sb
@@ -423,7 +419,7 @@ macro_rules! select {
     ( recv($r1:expr) -> $v1:ident => $rb:block $(,)?
       send($tx1:expr, $sv1:expr)  => $sb1:block $(,)?
       send($tx2:expr, $sv2:expr)  => $sb2:block $(,)? ) => {{
-        let mut __r0: ::std::mem::MaybeUninit<_> = ::std::mem::MaybeUninit::uninit();
+        let mut __r0: ::std::option::Option<_> = ::std::option::Option::None;
         let mut __s0: ::std::mem::ManuallyDrop<_> = ::std::mem::ManuallyDrop::new($sv1);
         let mut __s1: ::std::mem::ManuallyDrop<_> = ::std::mem::ManuallyDrop::new($sv2);
         let mut __sel = ::std::vec![
@@ -431,10 +427,10 @@ macro_rules! select {
             $crate::select::send_case_of(&($tx1), &mut __s0),
             $crate::select::send_case_of(&($tx2), &mut __s1),
         ];
-        let (__idx, __ok) = unsafe { $crate::select::selectgo(&mut __sel, false) };
+        let (__idx, _ok) = $crate::select::selectgo(&mut __sel, false);
         if __idx == 0 {
             unsafe { ::std::mem::ManuallyDrop::drop(&mut __s0); ::std::mem::ManuallyDrop::drop(&mut __s1) };
-            let $v1: ::std::option::Option<_> = if __ok { ::std::option::Option::Some(unsafe { __r0.assume_init() }) } else { ::std::option::Option::None };
+            let $v1 = __r0;
             $rb
         } else if __idx == 1 {
             // __s0 consumed; drop __s1
@@ -452,7 +448,7 @@ macro_rules! select {
       send($tx1:expr, $sv1:expr)  => $sb1:block $(,)?
       send($tx2:expr, $sv2:expr)  => $sb2:block $(,)?
       default                     => $d:block $(,)? ) => {{
-        let mut __r0: ::std::mem::MaybeUninit<_> = ::std::mem::MaybeUninit::uninit();
+        let mut __r0: ::std::option::Option<_> = ::std::option::Option::None;
         let mut __s0: ::std::mem::ManuallyDrop<_> = ::std::mem::ManuallyDrop::new($sv1);
         let mut __s1: ::std::mem::ManuallyDrop<_> = ::std::mem::ManuallyDrop::new($sv2);
         let mut __sel = ::std::vec![
@@ -460,10 +456,10 @@ macro_rules! select {
             $crate::select::send_case_of(&($tx1), &mut __s0),
             $crate::select::send_case_of(&($tx2), &mut __s1),
         ];
-        let (__idx, __ok) = unsafe { $crate::select::selectgo(&mut __sel, true) };
+        let (__idx, _ok) = $crate::select::selectgo(&mut __sel, true);
         if __idx == 0 {
             unsafe { ::std::mem::ManuallyDrop::drop(&mut __s0); ::std::mem::ManuallyDrop::drop(&mut __s1) };
-            let $v1: ::std::option::Option<_> = if __ok { ::std::option::Option::Some(unsafe { __r0.assume_init() }) } else { ::std::option::Option::None };
+            let $v1 = __r0;
             $rb
         } else if __idx == 1 {
             unsafe { ::std::mem::ManuallyDrop::drop(&mut __s1) };
@@ -483,7 +479,6 @@ macro_rules! select {
 // ---------------------------------------------------------------------------
 
 #[cfg(all(test, not(loom)))]
-#[allow(unused_assignments)] // sentinel initial values are always overwritten by select arms
 mod tests {
     use crate::chan::chan;
     use crate::runtime::sched::run_impl;

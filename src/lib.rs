@@ -186,8 +186,7 @@ pub fn sleep(d: std::time::Duration) {
 /// Debug-panics if called from outside a goroutine context.
 #[doc(hidden)]
 pub fn __spawn<F: FnOnce() + Send + 'static>(f: F) {
-    // SAFETY: callers are expected to be inside a goroutine context.
-    unsafe { runtime::sched::spawn_goroutine(f) }
+    runtime::sched::spawn_goroutine(f)
 }
 
 // ---------------------------------------------------------------------------
