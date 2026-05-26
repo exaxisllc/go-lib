@@ -196,16 +196,14 @@ pub(crate) unsafe fn sleep(d: Duration) {
 }
 
 // ---------------------------------------------------------------------------
-// Public API re-exported from lib.rs
+// Crate-internal entry point — called by lib.rs::sleep()
 // ---------------------------------------------------------------------------
 
-/// Sleep for `d` inside a goroutine.
-///
-/// Exposed as a standalone function so `select!` can handle timeouts.
+/// Thin wrapper around [`sleep`] used by `lib.rs::sleep`.
 ///
 /// # Safety
-/// Must be called from a goroutine stack.
-pub unsafe fn goroutine_sleep(d: Duration) {
+/// Must be called from a goroutine stack (not g0 or a bare OS thread).
+pub(crate) unsafe fn goroutine_sleep(d: Duration) {
     unsafe { sleep(d) };
 }
 
@@ -214,7 +212,6 @@ pub unsafe fn goroutine_sleep(d: Duration) {
 // ---------------------------------------------------------------------------
 
 #[cfg(all(test, not(loom)))]
-#[allow(unused_unsafe)] // closures calling unsafe fn inside an outer unsafe{} block
 mod tests {
     use super::*;
     use crate::runtime::sched::run_impl;

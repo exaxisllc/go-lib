@@ -479,7 +479,6 @@ macro_rules! select {
 // ---------------------------------------------------------------------------
 
 #[cfg(all(test, not(loom)))]
-#[allow(unused_assignments)] // sentinel initial values are always overwritten by select arms
 mod tests {
     use crate::chan::chan;
     use crate::runtime::sched::run_impl;

@@ -138,8 +138,8 @@ pub struct SCase {
     ///
     /// Signature: `(chan_ptr, elem) -> TryResult`
     ///
-    /// For a send case, `elem` is `*mut T` (the value to send).
-    /// For a recv case, `elem` is `*mut MaybeUninit<T>` (the output slot).
+    /// For a send case, `elem` is `*mut ManuallyDrop<T>` (the value to send).
+    /// For a recv case, `elem` is `*mut Option<T>` (the output slot).
     pub(crate) try_fn: unsafe fn(*const (), *mut u8) -> TryResult,
 
     /// Enqueue `sg` on the channel's sendq or recvq (under the lock).
@@ -507,7 +507,6 @@ pub fn send_case_of<T: Send + 'static>(tx: &Sender<T>, val: *mut ManuallyDrop<T>
 // ---------------------------------------------------------------------------
 
 #[cfg(all(test, not(loom)))]
-#[allow(unused_unsafe)] // some closures call unsafe fn inside an outer unsafe{} block
 mod tests {
     use super::*;
     use crate::chan::{chan, Hchan};

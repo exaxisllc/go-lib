@@ -455,7 +455,6 @@ unsafe extern "C" fn sigsegv_handler(
 /// Update the stack pointer saved in the signal `ucontext_t` by `delta`.
 /// Platform-specific: Linux x86-64, Linux AArch64, macOS x86-64, macOS AArch64.
 #[cfg(not(windows))]
-#[allow(unused_variables)]
 unsafe fn update_sp_in_context(ctx: *mut libc::c_void, delta: isize) {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     unsafe {
