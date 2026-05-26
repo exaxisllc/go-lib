@@ -716,6 +716,143 @@ unsafe extern "C" fn sigbus_handler(
 }
 
 // ---------------------------------------------------------------------------
+// Windows VEH — vectored exception handler for STATUS_ACCESS_VIOLATION
+// ---------------------------------------------------------------------------
+
+/// Guard against recursive exceptions inside the VEH itself.
+#[cfg(windows)]
+static VEH_HANDLING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Windows kernel32 imports for the VEH.
+#[cfg(windows)]
+mod win_veh_sys {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        /// Register a vectored exception handler.
+        /// `first_handler = 1` places it before all SEH handlers.
+        pub fn AddVectoredExceptionHandler(
+            FirstHandler:    u32,
+            VectoredHandler: unsafe extern "system" fn(*mut u8) -> i32,
+        ) -> *mut u8;
+
+        /// Terminate the process immediately (no atexit).
+        pub fn ExitProcess(uExitCode: u32) -> !;
+    }
+}
+
+/// Install a Vectored Exception Handler that catches `STATUS_ACCESS_VIOLATION`,
+/// prints diagnostics (faulting address, fault target, RSP/RIP from the
+/// interrupted CONTEXT, and a Rust backtrace), then exits.
+///
+/// This is the Windows equivalent of the Unix SIGBUS/SIGSEGV handlers and
+/// gives us the crash location we need to diagnose scheduler bugs.
+///
+/// # Safety
+/// Call once during `schedinit`.
+#[cfg(windows)]
+pub(crate) fn install_windows_veh() {
+    unsafe {
+        win_veh_sys::AddVectoredExceptionHandler(1, windows_veh_handler);
+    }
+}
+
+/// Vectored Exception Handler: print crash diagnostics and exit.
+///
+/// Windows delivers this on the **faulting thread's own stack**, so the Rust
+/// backtrace captures the real call chain that caused the AV.
+///
+/// ## EXCEPTION_POINTERS layout (x64)
+/// ```text
+/// +0  *EXCEPTION_RECORD
+/// +8  *CONTEXT
+/// ```
+///
+/// ## EXCEPTION_RECORD layout (x64)
+/// ```text
+/// +0   ExceptionCode      (u32)
+/// +4   ExceptionFlags     (u32)
+/// +8   *ExceptionRecord   (usize — chained record)
+/// +16  ExceptionAddress   (usize — faulting instruction)
+/// +24  NumberParameters   (u32)
+/// +28  _pad               (u32)
+/// +32  ExceptionInformation[0..14] (usize each)
+///        [0] = 0 (read) | 1 (write) | 8 (DEP)
+///        [1] = inaccessible target address
+/// ```
+///
+/// ## CONTEXT offsets for x64 (from WinNT.h — stable across Windows versions)
+/// ```text
+/// +120 Rax   +128 Rcx   +136 Rdx   +144 Rbx
+/// +152 Rsp   +160 Rbp   +168 Rsi   +176 Rdi
+/// +184 R8  … +240 R15
+/// +248 Rip
+/// ```
+#[cfg(windows)]
+unsafe extern "system" fn windows_veh_handler(ep: *mut u8) -> i32 {
+    const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+    const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
+
+    // Prevent re-entry (e.g. if eprintln! itself faults).
+    if VEH_HANDLING.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    // --- Decode EXCEPTION_POINTERS ---
+    // struct EXCEPTION_POINTERS { *EXCEPTION_RECORD; *CONTEXT }
+    // Each field is a native pointer (8 bytes on x64).
+    let ptrs     = ep as *const usize;
+    let er_ptr   = unsafe { *ptrs       } as *const u8; // EXCEPTION_RECORD
+    let ctx_ptr  = unsafe { *ptrs.add(1) } as *const u8; // CONTEXT
+
+    // --- Decode EXCEPTION_RECORD ---
+    let code: u32 = unsafe { (er_ptr as *const u32).read() };
+    if code != STATUS_ACCESS_VIOLATION {
+        VEH_HANDLING.store(false, std::sync::atomic::Ordering::Release);
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    let instr_addr: usize = unsafe { *(er_ptr.add(16) as *const usize) };
+    let n_params:   u32   = unsafe { *(er_ptr.add(24) as *const u32)   };
+    let fault_type: usize = if n_params >= 1 {
+        unsafe { *(er_ptr.add(32) as *const usize) }
+    } else { 0 };
+    let fault_addr: usize = if n_params >= 2 {
+        unsafe { *(er_ptr.add(40) as *const usize) }
+    } else { 0 };
+
+    // --- Decode CONTEXT (x64 stable offsets) ---
+    let rax: u64 = unsafe { *(ctx_ptr.add(120) as *const u64) };
+    let rcx: u64 = unsafe { *(ctx_ptr.add(128) as *const u64) };
+    let rdx: u64 = unsafe { *(ctx_ptr.add(136) as *const u64) };
+    let rbx: u64 = unsafe { *(ctx_ptr.add(144) as *const u64) };
+    let rsp: u64 = unsafe { *(ctx_ptr.add(152) as *const u64) };
+    let rbp: u64 = unsafe { *(ctx_ptr.add(160) as *const u64) };
+    let rip: u64 = unsafe { *(ctx_ptr.add(248) as *const u64) };
+
+    eprintln!("[go-lib AV] STATUS_ACCESS_VIOLATION");
+    eprintln!("[go-lib AV] ExceptionAddress (instr) = {instr_addr:#018x}");
+    eprintln!("[go-lib AV] fault type  = {fault_type} (0=read, 1=write, 8=DEP)");
+    eprintln!("[go-lib AV] fault addr  = {fault_addr:#018x}");
+    eprintln!("[go-lib AV] CONTEXT.Rip = {rip:#018x}");
+    eprintln!("[go-lib AV] CONTEXT.Rsp = {rsp:#018x}");
+    eprintln!("[go-lib AV] CONTEXT.Rbp = {rbp:#018x}");
+    eprintln!("[go-lib AV] CONTEXT.Rax = {rax:#018x}");
+    eprintln!("[go-lib AV] CONTEXT.Rcx = {rcx:#018x}");
+    eprintln!("[go-lib AV] CONTEXT.Rdx = {rdx:#018x}");
+    eprintln!("[go-lib AV] CONTEXT.Rbx = {rbx:#018x}");
+
+    // force_capture() ignores RUST_BACKTRACE — always captures.
+    // This runs on the faulting thread's stack, so frames reflect the
+    // actual call chain that triggered the AV.
+    let bt = std::backtrace::Backtrace::force_capture();
+    eprintln!("[go-lib AV] backtrace:\n{bt}");
+
+    // Terminate with a distinct exit code so the CI runner highlights it.
+    unsafe { win_veh_sys::ExitProcess(0xC000_0005) };
+}
+
+// ---------------------------------------------------------------------------
 // Goroutine creation — goroutine_entry, goexit_trampoline, new_goroutine
 // ---------------------------------------------------------------------------
 
@@ -1049,6 +1186,11 @@ pub(crate) fn schedinit(nprocs: i32) {
     // in background scheduler threads produce actionable diagnostics in CI.
     #[cfg(not(windows))]
     unsafe { install_sigbus_handler() };
+    // VEH: catch STATUS_ACCESS_VIOLATION on Windows and print diagnostics.
+    // This gives us the faulting RIP/RSP and a Rust backtrace so we can
+    // identify which scheduler path is crashing.
+    #[cfg(windows)]
+    install_windows_veh();
 
     // Start the background monitor thread (sysmon).
     start_sysmon();
