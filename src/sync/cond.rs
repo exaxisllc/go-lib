@@ -113,8 +113,7 @@ impl Cond {
         drop(guard);
 
         // Park until goready transitions us back to GRUNNABLE.
-        // SAFETY: we are on a goroutine stack (asserted above).
-        unsafe { gopark(WaitReason::CondVar) };
+        gopark(WaitReason::CondVar);
 
         // Woken — re-acquire the user's mutex.
         mu.lock().unwrap()
@@ -168,15 +167,13 @@ mod tests {
 
         run_impl(move || {
             // Spawn a waiter goroutine.
-            unsafe {
-                crate::runtime::sched::spawn_goroutine(move || {
-                    let mut guard = mu2.lock().unwrap();
-                    while !*guard {
-                        guard = cnd2.wait(&mu2, guard);
-                    }
-                    woke2.fetch_add(1, Ordering::Relaxed);
-                });
-            }
+            crate::runtime::sched::spawn_goroutine(move || {
+                let mut guard = mu2.lock().unwrap();
+                while !*guard {
+                    guard = cnd2.wait(&mu2, guard);
+                }
+                woke2.fetch_add(1, Ordering::Relaxed);
+            });
 
             // Yield so the waiter parks, then signal.
             for _ in 0..20 { crate::gosched(); }
@@ -216,15 +213,13 @@ mod tests {
                     let mu2   = Arc::clone(&mu);
                     let cnd2  = Arc::clone(&cnd);
                     let woke2 = Arc::clone(&woke);
-                    unsafe {
-                        crate::runtime::sched::spawn_goroutine(move || {
-                            let mut guard = mu2.lock().unwrap();
-                            while !*guard {
-                                guard = cnd2.wait(&mu2, guard);
-                            }
-                            woke2.fetch_add(1, Ordering::Relaxed);
-                        });
-                    }
+                    crate::runtime::sched::spawn_goroutine(move || {
+                        let mut guard = mu2.lock().unwrap();
+                        while !*guard {
+                            guard = cnd2.wait(&mu2, guard);
+                        }
+                        woke2.fetch_add(1, Ordering::Relaxed);
+                    });
                 }
 
                 for _ in 0..40 { crate::gosched(); }

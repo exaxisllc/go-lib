@@ -42,16 +42,21 @@ use super::asm_arm64::mcall;
 /// and enters the scheduler on g0's stack via `mcall`.  Control does not
 /// return to the caller; it is restored only when `goready` re-enqueues the G.
 ///
-/// Must be called from a goroutine's stack (not g0).
+/// # Precondition
+///
+/// Must be called from a goroutine's stack (not g0 or a bare OS thread).
+/// A `debug_assert` fires in debug builds if this is violated.
 ///
 /// Ported from `gopark` in `runtime/proc.go`.
-pub(crate) unsafe fn gopark(reason: WaitReason) {
+pub(crate) fn gopark(reason: WaitReason) {
     let gp = current_g();
-    debug_assert!(!gp.is_null(), "gopark: called from g0");
-
+    debug_assert!(!gp.is_null(), "gopark: called from g0 or bare OS thread");
+    // SAFETY: gp is non-null (asserted above) and points to the current goroutine.
     unsafe { (*gp).waitreason = reason };
+    // SAFETY: mcall switches to g0 and invokes park_fn, which sets GWAITING
+    // and re-enters schedule().  This is safe to call when gp is a live goroutine.
     unsafe { mcall(gp, park_fn) };
-    // park_fn → schedule() — control never returns here.
+    // park_fn → schedule() — control never returns here until goready re-enqueues gp.
 }
 
 /// Mcall target for `gopark`.  Runs on g0's stack.
@@ -169,11 +174,9 @@ mod tests {
         run_impl(move || {
             // spawn_goroutine calls goready internally (via push_batch + startm).
             // Verify that the goroutine runs, which proves the ready path works.
-            unsafe {
-                crate::runtime::sched::spawn_goroutine(move || {
-                    ran2.store(true, Ordering::Release);
-                });
-            }
+            crate::runtime::sched::spawn_goroutine(move || {
+                ran2.store(true, Ordering::Release);
+            });
             // Yield until the spawned goroutine runs.
             for _ in 0..200 { crate::gosched(); }
         });

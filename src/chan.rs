@@ -30,7 +30,8 @@
 //!
 //! When a goroutine must block it:
 //! 1. Allocates a `Sudog` from the pool.
-//! 2. Heap-allocates a `MaybeUninit<T>` as the value staging area (`sudog.elem`).
+//! 2. Heap-allocates a `ManuallyDrop<T>` (send) or `Option<T>` (recv) as the
+//!    value staging area (`sudog.elem`).
 //! 3. Enqueues the sudog in `sendq` / `recvq` (under the channel lock).
 //! 4. Releases the lock.
 //! 5. Calls `gopark` — `park_fn` sets `GWAITING` on g0's stack.
@@ -52,7 +53,7 @@
 
 use std::cell::UnsafeCell;
 use std::collections::VecDeque;
-use std::mem::MaybeUninit;
+use std::mem::ManuallyDrop;
 use std::ptr;
 use std::sync::Arc;
 
@@ -242,9 +243,10 @@ pub(crate) unsafe fn chansend<T: Send + 'static>(
     let recv_sg = unsafe { state.recvq.dequeue() };
     if !recv_sg.is_null() {
         let gp       = unsafe { (*recv_sg).g };
-        let elem_ptr = unsafe { (*recv_sg).elem as *mut MaybeUninit<T> };
+        // recv_sg.elem points to Option<T> (allocated by chanrecv or selectgo).
+        let elem_ptr = unsafe { (*recv_sg).elem as *mut Option<T> };
         if !elem_ptr.is_null() {
-            unsafe { (*elem_ptr).write(val) };
+            unsafe { *elem_ptr = Some(val) };
         }
         unsafe {
             (*recv_sg).success = true;
@@ -270,13 +272,14 @@ pub(crate) unsafe fn chansend<T: Send + 'static>(
     let gp = current_g();
     debug_assert!(!gp.is_null(), "chansend: called from g0");
 
-    let elem_ptr = Box::into_raw(Box::new(MaybeUninit::new(val))) as *mut u8;
+    // Box<ManuallyDrop<T>> — the receiver moves the value out and frees the box.
+    let elem_ptr = Box::into_raw(Box::new(ManuallyDrop::new(val))) as *mut u8;
 
     let s = acquire_sudog();
     unsafe {
         (*s).g          = gp;
         (*s).elem       = elem_ptr;
-        (*s).boxed_elem = true; // Box<MaybeUninit<T>> — must be freed by receiver
+        (*s).boxed_elem = true; // Box<ManuallyDrop<T>> — must be freed by receiver
         (*s).success    = false;
         (*s).c          = Arc::as_ptr(c) as *mut u8;
         (*gp).param     = ptr::null_mut();
@@ -284,7 +287,7 @@ pub(crate) unsafe fn chansend<T: Send + 'static>(
     }
 
     drop(_g); // release lock BEFORE parking
-    unsafe { gopark(WaitReason::ChanSend) };
+    gopark(WaitReason::ChanSend);
 
     // ── Resumed: inspect outcome ─────────────────────────────────────────────
     let ok = unsafe {
@@ -293,9 +296,11 @@ pub(crate) unsafe fn chansend<T: Send + 'static>(
         let ok = (*s2).success;
 
         if !ok && !(*s2).elem.is_null() {
-            let ep = (*s2).elem as *mut MaybeUninit<T>;
+            // Send was rejected (channel closed after we parked).
+            // elem points to ManuallyDrop<T> — drop the value, then free the box.
+            let ep = (*s2).elem as *mut ManuallyDrop<T>;
             (*s2).elem = ptr::null_mut();
-            (*ep).assume_init_drop();
+            ManuallyDrop::drop(&mut *ep); // run T's destructor
             if (*s2).boxed_elem { let _ = Box::from_raw(ep); }
         }
         (*s2).g = ptr::null_mut();
@@ -358,13 +363,15 @@ pub(crate) unsafe fn chanrecv<T: Send + 'static>(
     let gp = current_g();
     debug_assert!(!gp.is_null(), "chanrecv: called from g0");
 
-    let elem_ptr = Box::into_raw(Box::new(MaybeUninit::<T>::uninit())) as *mut u8;
+    // Box<Option<T>> — the sender writes Some(val) into this slot, or it
+    // stays None if the channel closes.  Freed on wakeup.
+    let elem_ptr = Box::into_raw(Box::new(None::<T>)) as *mut u8;
 
     let s = acquire_sudog();
     unsafe {
         (*s).g          = gp;
         (*s).elem       = elem_ptr;
-        (*s).boxed_elem = true; // Box<MaybeUninit<T>> — must be freed on wakeup
+        (*s).boxed_elem = true; // Box<Option<T>> — must be freed on wakeup
         (*s).success    = false;
         (*s).c          = Arc::as_ptr(c) as *mut u8;
         (*gp).param     = ptr::null_mut();
@@ -372,7 +379,7 @@ pub(crate) unsafe fn chanrecv<T: Send + 'static>(
     }
 
     drop(_g);
-    unsafe { gopark(WaitReason::ChanReceive) };
+    gopark(WaitReason::ChanReceive);
 
     // ── Resumed: read outcome ─────────────────────────────────────────────────
     unsafe {
@@ -381,18 +388,21 @@ pub(crate) unsafe fn chanrecv<T: Send + 'static>(
         let ok = (*s2).success;
 
         let boxed = (*s2).boxed_elem;
+        // elem points to Option<T>: Some(val) if sender delivered, None if closed.
         let result = if ok {
             debug_assert!(!(*s2).elem.is_null(), "chanrecv: success but elem is null");
-            let ep = (*s2).elem as *mut MaybeUninit<T>;
+            let ep = (*s2).elem as *mut Option<T>;
             (*s2).elem = ptr::null_mut();
-            let val = (*ep).assume_init_read();
+            // ptr::read moves the Option<T> out without running its destructor on ep.
+            let val = ptr::read(ep).expect("chanrecv: elem was None on success");
             if boxed { let _ = Box::from_raw(ep); }
             Some(val)
         } else {
             if !(*s2).elem.is_null() {
-                let ep = (*s2).elem as *mut MaybeUninit<T>;
+                // Channel was closed — slot is None; just free the allocation.
+                let ep = (*s2).elem as *mut Option<T>;
                 (*s2).elem = ptr::null_mut();
-                if boxed { let _ = Box::from_raw(ep); } // uninitialised — don't assume_init
+                if boxed { let _ = Box::from_raw(ep); }
             }
             None
         };
@@ -456,9 +466,11 @@ fn recv_from_sender<T: Send + 'static>(
 
     let boxed = unsafe { (*send_sg).boxed_elem };
 
+    // send_sg.elem points to ManuallyDrop<T> (both chansend and selectgo use
+    // ManuallyDrop semantics — same memory layout as T, no destructor).
     let val = if state.cap == 0 {
-        let ep = unsafe { (*send_sg).elem as *mut MaybeUninit<T> };
-        let v  = unsafe { (*ep).assume_init_read() };
+        let ep = unsafe { (*send_sg).elem as *mut ManuallyDrop<T> };
+        let v  = unsafe { ManuallyDrop::into_inner(ptr::read(ep)) };
         unsafe {
             if boxed { let _ = Box::from_raw(ep); }
             (*send_sg).elem = ptr::null_mut();
@@ -466,8 +478,8 @@ fn recv_from_sender<T: Send + 'static>(
         v
     } else {
         let head = state.buf.pop_front().unwrap();
-        let ep   = unsafe { (*send_sg).elem as *mut MaybeUninit<T> };
-        let sv   = unsafe { (*ep).assume_init_read() };
+        let ep   = unsafe { (*send_sg).elem as *mut ManuallyDrop<T> };
+        let sv   = unsafe { ManuallyDrop::into_inner(ptr::read(ep)) };
         unsafe {
             if boxed { let _ = Box::from_raw(ep); }
             (*send_sg).elem = ptr::null_mut();
@@ -652,9 +664,7 @@ mod tests {
 
         run_impl(|| {
             let (tx, rx) = chan::<i32>(0);
-            unsafe {
-                spawn_goroutine(move || { tx.send(99); });
-            }
+            spawn_goroutine(move || { tx.send(99); });
             assert_eq!(rx.recv(), Some(99));
         });
     }
@@ -668,14 +678,12 @@ mod tests {
             let (ping_tx, ping_rx) = chan::<i32>(0);
             let (pong_tx, pong_rx) = chan::<i32>(0);
 
-            unsafe {
-                spawn_goroutine(move || {
-                    for _ in 0..10 {
-                        let v = ping_rx.recv().unwrap();
-                        pong_tx.send(v + 1);
-                    }
-                });
-            }
+            spawn_goroutine(move || {
+                for _ in 0..10 {
+                    let v = ping_rx.recv().unwrap();
+                    pong_tx.send(v + 1);
+                }
+            });
 
             let mut n = 0_i32;
             for _ in 0..10 {
@@ -699,20 +707,16 @@ mod tests {
             let (tx, rx) = chan::<i32>(4);
             let sum3 = Arc::clone(&sum2);
 
-            unsafe {
-                spawn_goroutine(move || {
-                    for i in 0..N { tx.send(i); }
-                    tx.close();
-                });
-            }
+            spawn_goroutine(move || {
+                for i in 0..N { tx.send(i); }
+                tx.close();
+            });
 
-            unsafe {
-                spawn_goroutine(move || {
-                    while let Some(v) = rx.recv() {
-                        sum3.fetch_add(v, Ordering::Relaxed);
-                    }
-                });
-            }
+            spawn_goroutine(move || {
+                while let Some(v) = rx.recv() {
+                    sum3.fetch_add(v, Ordering::Relaxed);
+                }
+            });
 
             for _ in 0..500 { crate::gosched(); }
         });
@@ -731,14 +735,12 @@ mod tests {
         run_impl(move || {
             let (tx, rx) = chan::<i32>(0);
 
-            unsafe {
-                spawn_goroutine(move || {
-                    // Block on recv until the channel is closed.
-                    if rx.recv().is_none() {
-                        got2.fetch_add(1, Ordering::Relaxed);
-                    }
-                });
-            }
+            spawn_goroutine(move || {
+                // Block on recv until the channel is closed.
+                if rx.recv().is_none() {
+                    got2.fetch_add(1, Ordering::Relaxed);
+                }
+            });
 
             for _ in 0..20 { crate::gosched(); }
             tx.close();

@@ -94,13 +94,14 @@ pub(crate) struct Sudog {
     /// completed the complementary operation.  Mirrors Go's `sudog.success`.
     pub success: bool,
 
-    /// Whether `elem` points to a heap-allocated `Box<MaybeUninit<T>>` that
-    /// must be freed after the value is consumed.
+    /// Whether `elem` is a heap-allocated `Box` that must be freed after the
+    /// value is consumed.
     ///
-    /// `true`  — allocated by `chansend` / `chanrecv` blocking paths; the
-    ///           receiving side must call `Box::from_raw(elem)` after reading.
-    /// `false` — `elem` is a direct pointer (goroutine stack or select slot);
-    ///           the receiving side must NOT call `Box::from_raw`.
+    /// `true`  — allocated by `chansend` (send path: `Box<ManuallyDrop<T>>`)
+    ///           or `chanrecv` (recv path: `Box<Option<T>>`); the consuming
+    ///           side must call `Box::from_raw(elem)` after reading.
+    /// `false` — `elem` is a direct stack/select-slot pointer;
+    ///           the consuming side must NOT call `Box::from_raw`.
     pub boxed_elem: bool,
 
     /// The channel this sudog is queued on.
