@@ -45,10 +45,15 @@
 use std::ptr;
 use std::sync::atomic::Ordering::*;
 
-use super::g::current_g;
+use super::g::{current_g, set_current_g, G};
 use super::m::current_m;
 use super::p::{PRUNNING, PSYSCALL};
-use super::sched::{sched, startm};
+use super::sched::{execute, sched, schedule, startm};
+
+#[cfg(target_arch = "x86_64")]
+use super::asm_amd64::mcall;
+#[cfg(target_arch = "aarch64")]
+use super::asm_arm64::mcall;
 
 // ---------------------------------------------------------------------------
 // entersyscall
@@ -126,22 +131,38 @@ pub(crate) unsafe fn exitsyscall() {
         unsafe { (*m).oldp = ptr::null_mut() };
     }
 
-    // Slow path: P was stolen by sysmon.  Hand off to exitsyscall0 (runs on
-    // g0 via mcall so we can call stopm which may park this thread).
-    unsafe { exitsyscall0() };
+    // Slow path: P was stolen by sysmon.  Switch to g0 via mcall so that
+    // gp.sched captures the correct resume point *before* the goroutine is
+    // placed on the global run queue.  Without mcall, another M could resume
+    // the goroutine (via execute → gogo(gp.sched)) while this M is still
+    // executing on the goroutine's stack inside exitsyscall0 → park_m_no_p,
+    // causing two threads to share the same stack → STATUS_ACCESS_VIOLATION.
+    let gp = current_g();
+    unsafe { mcall(gp, exitsyscall0_mcall) };
+    // When gp is resumed (execute → gogo → mcall epilogue), execution returns
+    // here and unwinds normally through exitsyscall → with_syscall.
 }
 
-/// Slow path for `exitsyscall`: acquire any idle P or park.
+/// Slow-path mcall target for `exitsyscall`.  Runs on g0's stack.
 ///
-/// Runs on the goroutine's stack (not g0) — we avoid mcall here because
-/// parking from a non-g0 stack requires re-implementing stopm's logic in a
-/// way that doesn't need the mcall wrapper.  In Go this is an mcall target;
-/// our simplification is safe because we aren't running on a goroutine stack
-/// in the same sense as Go (goroutines run on Rust closures, and parking the
-/// OS thread is fine here since we'll loop and re-enter findrunnable).
-unsafe fn exitsyscall0() {
+/// `mcall` has already saved the goroutine's current PC and SP into
+/// `gp.sched`, so any M that later calls `execute(gp) → gogo(gp.sched)`
+/// will correctly resume the goroutine at the `mcall` return point inside
+/// `exitsyscall` — not restart it from `goroutine_entry`.
+///
+/// Ported from `exitsyscall0` in `runtime/proc.go`.
+unsafe extern "C" fn exitsyscall0_mcall(gp: *mut G) {
     let m  = current_m();
     let sc = sched();
+
+    // Detach the goroutine from this M.  We are on g0's stack, so there is
+    // no conflict with the goroutine's stack even after another M picks up gp.
+    unsafe {
+        (*gp).atomicstatus.store(crate::runtime::g::GRUNNABLE, Release);
+        (*gp).m   = ptr::null_mut();
+        (*m).curg = ptr::null_mut();
+        set_current_g(ptr::null_mut());
+    }
 
     // Try to grab an idle P.
     let p = {
@@ -155,31 +176,28 @@ unsafe fn exitsyscall0() {
     };
 
     if !p.is_null() {
-        // Attach the idle P and resume.
+        // Got an idle P — run gp immediately on this M.
+        // execute() transitions gp back to GRUNNING and calls gogo(gp.sched),
+        // which resumes the goroutine at the mcall return inside exitsyscall.
         unsafe {
             (*p).status.store(PRUNNING, Release);
             (*p).m  = m;
             (*m).p  = p;
         }
-        return;
+        unsafe { execute(gp) };  // → gogo(gp.sched) → never returns here
     }
 
-    // No idle P available — put the current G on the global run queue and
-    // park this M.  The G will be picked up by another M.
-    let gp = current_g();
-    if !gp.is_null() {
-        unsafe {
-            (*gp).atomicstatus
-                .store(crate::runtime::g::GRUNNABLE, Release);
-            (*gp).m = ptr::null_mut();
-        }
+    // No idle P — enqueue gp and wake another M to run it.
+    unsafe {
+        (*gp).schedlink = ptr::null_mut();
         sc.global_run_q.push_batch(gp, gp, 1);
-        // Wake an idle M if one is available (to run our displaced G).
-        unsafe { startm(ptr::null_mut()) };
+        startm(ptr::null_mut());
     }
 
-    // Park this M (no P attached).  It will be reused when startm needs it.
+    // Park this M (no P).  When startm hands us a P and wakes us, re-enter
+    // the scheduler loop to pick up goroutines.
     unsafe { park_m_no_p(m) };
+    unsafe { schedule() };  // never returns
 }
 
 /// Park an M that has no P.
