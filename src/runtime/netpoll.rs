@@ -85,7 +85,7 @@ static POLL_FD: AtomicI32 = AtomicI32::new(-1);
 /// On Windows, netpoll is not implemented (epoll/kqueue are Unix-specific).
 /// `POLL_FD` remains `-1` and all `netpoll_wait` calls return an empty vec.
 pub(crate) fn netpoll_init() {
-    // Windows: no epoll/kqueue backend — leave POLL_FD at -1.
+    // Unix: create the epoll / kqueue fd.
     #[cfg(not(windows))]
     {
         if POLL_FD.load(Relaxed) >= 0 {
@@ -101,6 +101,9 @@ pub(crate) fn netpoll_init() {
             unsafe { libc::close(fd) };
         }
     }
+    // Windows: initialise Winsock and create the I/O completion port.
+    #[cfg(windows)]
+    iocp_win_init();
 }
 
 // ---------------------------------------------------------------------------
@@ -127,6 +130,7 @@ pub(crate) unsafe fn netpoll_arm(fd: RawFd, mode: u32, gp: *mut G) {
         reg.insert(fd, (GRaw(gp as usize), mode));
     });
 
+    #[cfg(not(windows))]
     unsafe { poll_add(pfd, fd, mode) };
 }
 
@@ -137,10 +141,13 @@ pub(crate) unsafe fn netpoll_arm(fd: RawFd, mode: u32, gp: *mut G) {
 /// Remove `fd` from the netpoll backend.  Safe to call even if `fd` was never
 /// armed.
 pub(crate) fn netpoll_unarm(fd: RawFd) {
-    let pfd = POLL_FD.load(Acquire);
     with_reg(|reg| { reg.remove(&fd); });
-    if pfd >= 0 {
-        unsafe { poll_del(pfd, fd) };
+    #[cfg(not(windows))]
+    {
+        let pfd = POLL_FD.load(Acquire);
+        if pfd >= 0 {
+            unsafe { poll_del(pfd, fd) };
+        }
     }
 }
 
@@ -161,24 +168,29 @@ pub(crate) fn netpoll_unarm(fd: RawFd) {
 /// # Safety
 /// Must not be called concurrently with itself on the same `POLL_FD`.
 pub(crate) unsafe fn netpoll_wait(timeout_ms: i32) -> Vec<*mut G> {
-    let pfd = POLL_FD.load(Acquire);
-    if pfd < 0 {
-        return Vec::new();
-    }
+    // Windows: drain the IOCP.
+    #[cfg(windows)]
+    return unsafe { iocp_win_wait(timeout_ms) };
 
-    let ready_fds = unsafe { poll_wait(pfd, timeout_ms) };
-
-    let mut goroutines = Vec::with_capacity(ready_fds.len());
-    with_reg(|reg| {
-        for fd in &ready_fds {
-            if let Some((g_raw, _mode)) = reg.remove(fd) {
-                goroutines.push(g_raw.0 as *mut G);
-                // Remove from the OS poll set to avoid spurious wakeups.
-                unsafe { poll_del(pfd, *fd) };
-            }
+    // Unix: drain epoll / kqueue.
+    #[cfg(not(windows))]
+    {
+        let pfd = POLL_FD.load(Acquire);
+        if pfd < 0 {
+            return Vec::new();
         }
-    });
-    goroutines
+        let ready_fds = unsafe { poll_wait(pfd, timeout_ms) };
+        let mut goroutines = Vec::with_capacity(ready_fds.len());
+        with_reg(|reg| {
+            for fd in &ready_fds {
+                if let Some((g_raw, _mode)) = reg.remove(fd) {
+                    goroutines.push(g_raw.0 as *mut G);
+                    unsafe { poll_del(pfd, *fd) };
+                }
+            }
+        });
+        goroutines
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -349,19 +361,212 @@ unsafe fn poll_wait(kq: RawFd, timeout_ms: i32) -> Vec<RawFd> {
 }
 
 // ---------------------------------------------------------------------------
-// Windows stubs — no epoll/kqueue; netpoll is a no-op
+// Windows IOCP backend
 // ---------------------------------------------------------------------------
-// POLL_FD stays -1; netpoll_wait always returns empty; goroutines that need
-// I/O readiness must use platform threads or async runtimes on Windows.
+//
+// POLL_FD remains -1 on Windows; the readiness-based helpers (create_poll_fd,
+// poll_add, poll_del, poll_wait) are not defined.  Instead, goroutine-aware
+// sockets registered with the global I/O Completion Port drive all async I/O.
+//
+// Flow:
+//   1. `netpoll_init` calls `iocp_win_init` which runs `WSAStartup` and
+//      `CreateIoCompletionPort`, storing the handle in `WIN_IOCP`.
+//   2. `net_windows.rs` creates each socket with `WSA_FLAG_OVERLAPPED`, then
+//      calls `netpoll_iocp_associate` to attach it to the IOCP.
+//   3. For each read/write, `net_windows.rs` allocates a heap `IocpOp`,
+//      passes `&mut op.overlapped` to `WSARecv`/`WSASend`, then calls
+//      `gopark(IOWait)`.
+//   4. `netpoll_wait` (called from `findrunnable` / `sysmon`) drains the IOCP
+//      via `GetQueuedCompletionStatusEx`, fills `IocpOp.bytes_transferred` and
+//      `IocpOp.ntstatus`, and returns the goroutine pointers.
+//   5. The goroutine resumes, reads the result, and drops the `Box<IocpOp>`.
 
 #[cfg(windows)]
-fn create_poll_fd() -> RawFd { -1 }
+use std::sync::OnceLock;
+
+/// Process-wide IOCP handle (stored as `usize`; 0 = not yet initialised).
+#[cfg(windows)]
+static WIN_IOCP: OnceLock<usize> = OnceLock::new();
+
+/// Alias for Windows `HANDLE` — a nullable pointer-sized value.
+#[cfg(windows)]
+type WinHandle = *mut std::ffi::c_void;
+
+// ── Per-operation state ─────────────────────────────────────────────────────
+
+/// Per-overlapped-I/O state block.
+///
+/// **Must** be `repr(C)` with `overlapped` at offset 0: Windows delivers
+/// `LPOVERLAPPED` in the completion entry and we recover the full struct by
+/// casting.
+///
+/// Allocated with `Box::into_raw` before issuing `WSARecv`/`WSASend`;
+/// recovered and freed by the goroutine after it resumes.
+#[cfg(windows)]
+#[repr(C)]
+pub(crate) struct IocpOp {
+    /// Windows `OVERLAPPED` — **must be the first field** (offset 0).
+    pub overlapped:        WinOverlapped,
+    /// Goroutine waiting for this operation.
+    pub gp:                *mut G,
+    /// Bytes transferred; written by `netpoll_wait` on completion.
+    pub bytes_transferred: u32,
+    /// NTSTATUS completion code (0 = STATUS_SUCCESS).
+    pub ntstatus:          u32,
+}
+
+// SAFETY: IocpOp is owned by exactly one goroutine (which is parked) plus
+// the kernel writing into it; no concurrent Rust access occurs.
+#[cfg(windows)]
+unsafe impl Send for IocpOp {}
+
+/// Rust layout of Windows `OVERLAPPED` (32 bytes on 64-bit Windows).
+#[cfg(windows)]
+#[repr(C)]
+pub(crate) struct WinOverlapped {
+    pub internal:      usize,     // ULONG_PTR Internal
+    pub internal_high: usize,     // ULONG_PTR InternalHigh
+    pub offset:        u32,       // union { struct { Offset, OffsetHigh }
+    pub offset_high:   u32,       //         | PVOID Pointer }
+    pub h_event:       WinHandle, // HANDLE hEvent
+}
+
+/// Windows `OVERLAPPED_ENTRY` — one slot from `GetQueuedCompletionStatusEx`.
+#[cfg(windows)]
+#[repr(C)]
+struct OverlappedEntry {
+    completion_key:    usize,              // ULONG_PTR lpCompletionKey
+    overlapped:        *mut WinOverlapped, // LPOVERLAPPED
+    internal:          usize,              // ULONG_PTR Internal (NTSTATUS)
+    bytes_transferred: u32,                // DWORD dwNumberOfBytesTransferred
+    // 4 bytes implicit trailing padding to reach 8-byte struct alignment
+}
+
+// ── Opaque WSADATA (always 400 bytes on all Windows targets) ────────────────
 
 #[cfg(windows)]
-unsafe fn poll_add(_pfd: RawFd, _fd: RawFd, _mode: u32) {}
+#[repr(C)]
+struct WsaData([u8; 400]);
+
+// ── Windows FFI ─────────────────────────────────────────────────────────────
 
 #[cfg(windows)]
-unsafe fn poll_del(_pfd: RawFd, _fd: RawFd) {}
+#[link(name = "ws2_32")]
+unsafe extern "system" {
+    fn WSAStartup(w_version_required: u16, lp_wsa_data: *mut WsaData) -> i32;
+}
 
 #[cfg(windows)]
-unsafe fn poll_wait(_pfd: RawFd, _timeout_ms: i32) -> Vec<RawFd> { Vec::new() }
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn CreateIoCompletionPort(
+        file_handle:                  WinHandle,
+        existing_completion_port:     WinHandle,
+        completion_key:               usize,
+        number_of_concurrent_threads: u32,
+    ) -> WinHandle;
+
+    fn GetQueuedCompletionStatusEx(
+        completion_port:            WinHandle,
+        lp_completion_port_entries: *mut OverlappedEntry,
+        ul_count:                   u32,
+        ul_num_entries_removed:     *mut u32,
+        dw_milliseconds:            u32,
+        f_alertable:                i32,
+    ) -> i32;
+}
+
+// ── Initialisation ──────────────────────────────────────────────────────────
+
+/// Initialise Winsock 2.2 and create the process-wide IOCP.  Idempotent.
+#[cfg(windows)]
+pub(crate) fn iocp_win_init() {
+    if WIN_IOCP.get().is_some() {
+        return;
+    }
+    let mut data = WsaData([0u8; 400]);
+    let rc = unsafe { WSAStartup(0x0202u16, &mut data) };
+    assert_eq!(rc, 0, "netpoll_init: WSAStartup failed (error {rc})");
+
+    // INVALID_HANDLE_VALUE = (HANDLE)(LONG_PTR)-1
+    let invalid: WinHandle = usize::MAX as WinHandle;
+    let h = unsafe { CreateIoCompletionPort(invalid, std::ptr::null_mut(), 0, 0) };
+    assert!(!h.is_null(), "netpoll_init: CreateIoCompletionPort failed");
+
+    // If another thread raced us, we discard our handle (minor one-time leak).
+    let _ = WIN_IOCP.set(h as usize);
+}
+
+/// Return the global IOCP handle, or null if not yet initialised.
+#[cfg(windows)]
+#[inline]
+pub(crate) fn netpoll_iocp_handle() -> WinHandle {
+    WIN_IOCP.get().map(|&h| h as WinHandle).unwrap_or(std::ptr::null_mut())
+}
+
+/// Associate `socket` (a Windows `SOCKET` value) with the global IOCP so that
+/// overlapped operations on it complete via `GetQueuedCompletionStatusEx`.
+///
+/// Call once immediately after creating or accepting a socket.
+/// Returns `true` on success.
+#[cfg(windows)]
+pub(crate) fn netpoll_iocp_associate(socket: usize) -> bool {
+    let iocp = netpoll_iocp_handle();
+    if iocp.is_null() {
+        return false;
+    }
+    let result = unsafe {
+        CreateIoCompletionPort(socket as WinHandle, iocp, socket, 0)
+    };
+    !result.is_null()
+}
+
+// ── Completion drain ────────────────────────────────────────────────────────
+
+/// Drain the IOCP and return all goroutines whose operations completed.
+///
+/// Follows the same `timeout_ms` convention as `netpoll_wait`.
+#[cfg(windows)]
+unsafe fn iocp_win_wait(timeout_ms: i32) -> Vec<*mut G> {
+    let iocp = netpoll_iocp_handle();
+    if iocp.is_null() {
+        return Vec::new();
+    }
+
+    const MAX_ENTRIES: usize = 64;
+    let mut entries: [OverlappedEntry; MAX_ENTRIES] = unsafe { std::mem::zeroed() };
+    let mut removed: u32 = 0;
+    // timeout_ms: -1 → INFINITE (0xFFFF_FFFF), 0 → non-blocking, >0 → ms
+    let timeout_dw: u32 = if timeout_ms < 0 { u32::MAX } else { timeout_ms as u32 };
+
+    let ok = unsafe {
+        GetQueuedCompletionStatusEx(
+            iocp,
+            entries.as_mut_ptr(),
+            MAX_ENTRIES as u32,
+            &mut removed,
+            timeout_dw,
+            0, // fAlertable = FALSE
+        )
+    };
+    if ok == 0 || removed == 0 {
+        return Vec::new();
+    }
+
+    let mut goroutines = Vec::with_capacity(removed as usize);
+    for i in 0..removed as usize {
+        let lp = entries[i].overlapped;
+        if lp.is_null() {
+            continue;
+        }
+        // SAFETY: `lp` points to the `overlapped` field (offset 0) of a live
+        // `IocpOp` allocated by `net_windows.rs`.
+        let op: *mut IocpOp = lp as *mut IocpOp;
+        unsafe {
+            (*op).bytes_transferred = entries[i].bytes_transferred;
+            (*op).ntstatus          = entries[i].internal as u32;
+            goroutines.push((*op).gp);
+        }
+    }
+    goroutines
+}

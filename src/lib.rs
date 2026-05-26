@@ -35,8 +35,9 @@
 //!   goroutine has run > 10 ms.  The signal handler redirects execution to an
 //!   assembly trampoline that saves all registers, calls `async_preempt2`, and
 //!   restores state on resume — a transparent, non-cooperative yield.
-//! - **Netpoll / async I/O** (Step 5): `epoll` on Linux, `kqueue` on macOS.
-//!   Goroutines park on `EAGAIN` and are re-enqueued when the fd is ready.
+//! - **Netpoll / async I/O** (Step 5): `epoll` on Linux, `kqueue` on macOS,
+//!   IOCP on Windows.  Goroutines park on blocking I/O and are re-enqueued
+//!   when the operation is ready (Unix) or completes (Windows IOCP).
 //!   See the [`net`] module for `TcpListener` / `TcpStream`.
 //!
 //! ## Known limitations
@@ -71,9 +72,14 @@ pub mod context;
 ///
 /// See [`net::TcpListener`] and [`net::TcpStream`].
 ///
-/// **Note**: The networking module currently requires a Unix platform
-/// (epoll/kqueue).  On Windows it is not compiled.
+/// On Linux and macOS the backend is `epoll` / `kqueue` (readiness-based).
+/// On Windows the backend is I/O Completion Ports (IOCP): overlapped
+/// `WSARecv`/`WSASend` operations are issued and the goroutine parks until
+/// `GetQueuedCompletionStatusEx` signals completion.
 #[cfg(not(windows))]
+pub mod net;
+#[cfg(windows)]
+#[path = "net_windows.rs"]
 pub mod net;
 pub mod runtime;
 pub mod select;
