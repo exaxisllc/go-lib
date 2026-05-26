@@ -609,6 +609,113 @@ unsafe extern "C" fn preemptm(gp: *mut G) {
 }
 
 // ---------------------------------------------------------------------------
+// SIGBUS handler — diagnostic crash reporter
+// ---------------------------------------------------------------------------
+
+/// Previous SIGBUS handler (chained on non-scheduler signals).
+#[cfg(not(windows))]
+static PREV_SIGBUS: Mutex<Option<libc::sigaction>> = Mutex::new(None);
+
+/// Install a SIGBUS handler that prints PC/SP/LR and a forced backtrace before
+/// calling `abort`.  This surfaces crashes in background scheduler threads that
+/// would otherwise kill the process with no output.
+///
+/// # Safety
+/// Call once during `schedinit`.
+#[cfg(not(windows))]
+pub(crate) unsafe fn install_sigbus_handler() {
+    let mut sa: libc::sigaction = unsafe { std::mem::zeroed() };
+    sa.sa_sigaction = sigbus_handler as *const () as usize;
+    // SA_ONSTACK: run on the thread's alternate signal stack (installed by
+    // M::start) so the handler survives even if the goroutine stack overflowed.
+    sa.sa_flags = (libc::SA_SIGINFO | libc::SA_ONSTACK) as _;
+    unsafe { libc::sigemptyset(&mut sa.sa_mask) };
+
+    let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
+    let ret = unsafe { libc::sigaction(libc::SIGBUS, &sa, &mut old) };
+    assert_eq!(ret, 0, "install_sigbus_handler: sigaction failed");
+
+    *PREV_SIGBUS.lock().unwrap() = Some(old);
+}
+
+/// SIGBUS handler: print crash context (registers + backtrace) then abort.
+///
+/// Not async-signal-safe in the strictest sense, but we are aborting anyway;
+/// the goal is to emit useful diagnostics before the process exits.
+#[cfg(not(windows))]
+unsafe extern "C" fn sigbus_handler(
+    _sig:  libc::c_int,
+    _info: *mut libc::siginfo_t,
+    ctx:   *mut libc::c_void,
+) {
+    // Use write() directly for the first line — it is async-signal-safe.
+    let msg = b"[go-lib SIGBUS] crash detected\n";
+    unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len()) };
+
+    // Print register context from the interrupted ucontext_t.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if !ctx.is_null() {
+        unsafe {
+            let uc = ctx as *mut libc::ucontext_t;
+            let ss = &(*(*uc).uc_mcontext).__ss;
+            eprintln!("[go-lib SIGBUS] PC  = {:#018x}", ss.__pc);
+            eprintln!("[go-lib SIGBUS] LR  = {:#018x}", ss.__lr);
+            eprintln!("[go-lib SIGBUS] SP  = {:#018x}", ss.__sp);
+            eprintln!("[go-lib SIGBUS] FP  = {:#018x}", ss.__fp);
+            // Print non-zero GPRs (x0–x28) for more call-site context.
+            for (i, r) in ss.__x.iter().enumerate() {
+                if *r != 0 {
+                    eprintln!("[go-lib SIGBUS] x{i:02} = {r:#018x}");
+                }
+            }
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    if !ctx.is_null() {
+        unsafe {
+            let uc = ctx as *mut libc::ucontext_t;
+            let mc = &(*uc).uc_mcontext;
+            eprintln!("[go-lib SIGBUS] PC  = {:#018x}", mc.pc);
+            eprintln!("[go-lib SIGBUS] SP  = {:#018x}", mc.sp);
+            eprintln!("[go-lib SIGBUS] LR  = {:#018x}", mc.regs[30]);
+            for (i, r) in mc.regs.iter().enumerate() {
+                if *r != 0 {
+                    eprintln!("[go-lib SIGBUS] x{i:02} = {r:#018x}");
+                }
+            }
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    if !ctx.is_null() {
+        unsafe {
+            let uc  = ctx as *mut libc::ucontext_t;
+            let rip = (*uc).uc_mcontext.gregs[libc::REG_RIP as usize];
+            let rsp = (*uc).uc_mcontext.gregs[libc::REG_RSP as usize];
+            eprintln!("[go-lib SIGBUS] RIP = {rip:#018x}");
+            eprintln!("[go-lib SIGBUS] RSP = {rsp:#018x}");
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    if !ctx.is_null() {
+        unsafe {
+            let uc = ctx as *mut libc::ucontext_t;
+            let ss = &(*(*uc).uc_mcontext).__ss;
+            eprintln!("[go-lib SIGBUS] RIP = {:#018x}", ss.__rip);
+            eprintln!("[go-lib SIGBUS] RSP = {:#018x}", ss.__rsp);
+        }
+    }
+
+    // force_capture() captures regardless of RUST_BACKTRACE.
+    let bt = std::backtrace::Backtrace::force_capture();
+    eprintln!("[go-lib SIGBUS] backtrace:\n{bt}");
+
+    unsafe { libc::abort() };
+}
+
+// ---------------------------------------------------------------------------
 // Goroutine creation — goroutine_entry, goexit_trampoline, new_goroutine
 // ---------------------------------------------------------------------------
 
@@ -932,12 +1039,16 @@ pub(crate) fn schedinit(nprocs: i32) {
         unsafe { spawn_m(id, p_ptr) };
     }
 
-    // Install SIGSEGV / SIGURG handlers (Unix only — Windows has no POSIX
-    // signals; proactive growth and cooperative preemption are used there).
+    // Install SIGSEGV / SIGURG / SIGBUS handlers (Unix only — Windows has no
+    // POSIX signals; proactive growth and cooperative preemption are used there).
     #[cfg(not(windows))]
     unsafe { install_sigsegv_handler() };
     #[cfg(not(windows))]
     unsafe { install_sigurg_handler() };
+    // SIGBUS handler: print PC/SP/LR + backtrace before aborting, so crashes
+    // in background scheduler threads produce actionable diagnostics in CI.
+    #[cfg(not(windows))]
+    unsafe { install_sigbus_handler() };
 
     // Start the background monitor thread (sysmon).
     start_sysmon();
