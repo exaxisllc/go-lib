@@ -37,9 +37,11 @@ pub(crate) const PIDLE: u32 = 0;
 pub(crate) const PRUNNING: u32 = 1;
 /// P is in a syscall.
 pub(crate) const PSYSCALL: u32 = 2;
-/// P is stopped for GC (v1: unused).
+/// P is stopped for GC (stop-the-world).  Unused until GC is implemented.
+#[allow(dead_code)]
 pub(crate) const PGCSTOP: u32 = 3;
-/// P is dead.
+/// P has been destroyed.  Unused until GOMAXPROCS-decrease tears down Ps.
+#[allow(dead_code)]
 pub(crate) const PDEAD: u32 = 4;
 
 /// Capacity of the local run queue ring buffer. Must be a power of two.
@@ -147,6 +149,7 @@ impl GlobalRunQueue {
 /// Ported from `p` in `runtime/runtime2.go`.
 pub(crate) struct P {
     // ── identity ──────────────────────────────────────────────────────────
+    #[allow(dead_code)] // printed in debug traces; wired when P logging lands
     pub id:     i32,
 
     // ── status ────────────────────────────────────────────────────────────

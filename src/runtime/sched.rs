@@ -47,7 +47,7 @@ use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, Ordering::*};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use super::g::{current_g, set_current_g, G, GDEAD, GRUNNABLE, GRUNNING, STACK_GUARD};
+use super::g::{casgstatus, current_g, set_current_g, G, GDEAD, GPREEMPTED, GRUNNABLE, GRUNNING, STACK_GUARD};
 use super::m::{current_m, M};
 use super::p::{GlobalRunQueue, P, PIDLE, PRUNNING};
 use super::stack::{grow_stack_if_needed, stack_alloc};
@@ -369,7 +369,7 @@ pub(crate) unsafe fn execute(gp: *mut G) -> ! {
     unsafe {
         (*m).curg  = gp;
         (*gp).m    = m;
-        (*gp).atomicstatus.store(GRUNNING, Release);
+        casgstatus(gp, GRUNNABLE, GRUNNING);
     }
 
     // Bump the scheduling tick on the attached P.
@@ -404,7 +404,7 @@ pub(crate) unsafe extern "C" fn goexit0(gp: *mut G) {
     let m = current_m();
 
     unsafe {
-        (*gp).atomicstatus.store(GDEAD, Release);
+        casgstatus(gp, GRUNNING, GDEAD);
         (*gp).m   = ptr::null_mut();
         (*m).curg = ptr::null_mut();
         set_current_g(ptr::null_mut());
@@ -435,7 +435,7 @@ unsafe extern "C" fn gosched_m(gp: *mut G) {
     let m = current_m();
 
     unsafe {
-        (*gp).atomicstatus.store(GRUNNABLE, Release);
+        casgstatus(gp, GRUNNING, GRUNNABLE);
         (*gp).m   = ptr::null_mut();
         (*m).curg = ptr::null_mut();
         set_current_g(ptr::null_mut());
@@ -593,12 +593,21 @@ pub(crate) unsafe extern "C" fn async_preempt2() {
 
 /// `mcall` target for async preemption.  Runs on g0's stack.
 ///
-/// Marks the goroutine as `GRUNNABLE`, detaches it from the M, and re-enters
-/// the scheduler — equivalent to `gosched_m` but called from a signal context.
+/// Transitions `GRUNNING → GPREEMPTED` (a GC-safe scan point) then immediately
+/// to `GPREEMPTED → GRUNNABLE`, detaches the goroutine from the M, and
+/// re-enters the scheduler — equivalent to `gosched_m` but called from a
+/// signal context.
+///
+/// The two-step transition matches Go 1.14+: the brief `GPREEMPTED` window lets
+/// a future GC scanner observe that the goroutine was stopped at an async-safe
+/// point and scan its stack before it becomes runnable again.
 unsafe extern "C" fn preemptm(gp: *mut G) {
     let m = current_m();
     unsafe {
-        (*gp).atomicstatus.store(GRUNNABLE, Release);
+        // GRUNNING → GPREEMPTED: goroutine is at an async-safe preemption point.
+        casgstatus(gp, GRUNNING, GPREEMPTED);
+        // GPREEMPTED → GRUNNABLE: immediately re-queue (no GC scanner yet).
+        casgstatus(gp, GPREEMPTED, GRUNNABLE);
         (*gp).m   = ptr::null_mut();
         (*m).curg = ptr::null_mut();
         set_current_g(ptr::null_mut());

@@ -51,7 +51,7 @@ use libc::{MAP_ANON, MAP_FAILED, MAP_PRIVATE, PROT_NONE, PROT_READ, PROT_WRITE};
 // current_g is only needed by the SIGSEGV handler (Unix-only).
 #[cfg(not(windows))]
 use super::g::current_g;
-use super::g::{Stack, STACK_GUARD, G};
+use super::g::{casgstatus, readgstatus, Stack, GCOPYSTACK, STACK_GUARD, G};
 
 // ---------------------------------------------------------------------------
 // Windows: Win32 virtual-memory API (no libc wrappers available)
@@ -92,6 +92,7 @@ mod win32 {
 // ---------------------------------------------------------------------------
 
 /// Minimum goroutine stack size (bytes).  Matches Go's `stackMin = 8 KiB`.
+#[allow(dead_code)] // enforced by stack-alloc assertions; compiler doesn't see the check
 pub(crate) const STACK_MIN: usize = 8 * 1024;
 
 /// Maximum goroutine stack size (bytes). 1 GiB matches Go's `maxstacksize`.
@@ -326,6 +327,12 @@ pub(crate) unsafe fn newstack(gp: *mut G) -> isize {
 /// `old_stack` must be the goroutine's current live stack; `new_stack` must
 /// be freshly allocated with at least the same usable size.
 unsafe fn copystack(gp: *mut G, old_stack: &Stack, new_stack: &Stack) -> isize {
+    // Bracket the copy with GCOPYSTACK so a future GC scanner skips this G
+    // while its stack is in a half-copied state.
+    // GRUNNING → GCOPYSTACK → GRUNNING  (matches Go's casgcopystack protocol).
+    let old_status = unsafe { readgstatus(gp) };
+    unsafe { casgstatus(gp, old_status, GCOPYSTACK) };
+
     let old_lo = old_stack.lo;
     let old_hi = old_stack.hi;
     let new_lo = new_stack.lo;
@@ -396,6 +403,9 @@ unsafe fn copystack(gp: *mut G, old_stack: &Stack, new_stack: &Stack) -> isize {
             (*gp).sched.bp = ((bp as isize) + delta) as usize;
         }
     }
+
+    // Restore the original status: GCOPYSTACK → old_status.
+    unsafe { casgstatus(gp, GCOPYSTACK, old_status) };
 
     delta
 }

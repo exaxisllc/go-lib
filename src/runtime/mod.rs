@@ -15,6 +15,18 @@
 //! | `sysmon` — `pthread_kill(SIGURG)` in `preemptone` | Signal delivery for async preemption (Step 4) |
 //! | `netpoll` | epoll (Linux) / kqueue (macOS) / IOCP (Windows) I/O backend (Step 5) |
 //!
+//! ## v0.3.0 additions
+//!
+//! | New module / symbol | Purpose |
+//! |----|-----|
+//! | `g` — `casgstatus`, `castogscanstatus`, `casfrom_gscanstatus`, `readgstatus` | Centralised atomic G state-transition helpers (mirrors Go's `casgstatus`) |
+//! | `g` — `scan_stack` | GSCAN freeze/unfreeze scaffolding for a future GC stack scanner |
+//! | `syscall` — `entersyscall`/`exitsyscall` | G transitions to/from `GSYSCALL` state |
+//! | `stack` — `copystack` | G transitions through `GCOPYSTACK` during stack-copy |
+//! | `sched` — `preemptm` | G transitions through `GPREEMPTED` (Go 1.14+ async-preempt protocol) |
+//! | `park` — `goready` | Accepts `GPREEMPTED` as well as `GWAITING` when readying a G |
+//! | `asm_amd64`/`asm_arm64` — `systemstack`, `systemstack_call` | Runs a closure on the M's g0 stack via a naked RSP/SP switch |
+//!
 //! | This module   | Go source                                                   |
 //! |---------------|-------------------------------------------------------------|
 //! | `g`           | `runtime/runtime2.go`                                       |
@@ -31,9 +43,6 @@
 //! | `asm_amd64`   | `runtime/asm_amd64.s`, `runtime/preempt_amd64.s`           |
 //! | `asm_arm64`   | `runtime/asm_arm64.s`, `runtime/preempt_arm64.s`           |
 
-// Faithful Go-runtime ports contain symbols that will be used when deferred
-// features land.  Suppress dead-code warnings across the whole runtime module.
-#![allow(dead_code)]
 
 pub(crate) mod g;
 pub(crate) mod m;

@@ -45,7 +45,7 @@
 use std::ptr;
 use std::sync::atomic::Ordering::*;
 
-use super::g::{current_g, set_current_g, G};
+use super::g::{casgstatus, current_g, set_current_g, G, GRUNNABLE, GRUNNING, GSYSCALL};
 use super::m::current_m;
 use super::p::{PRUNNING, PSYSCALL};
 use super::sched::{execute, sched, schedule, startm};
@@ -92,6 +92,12 @@ pub(crate) unsafe fn entersyscall() {
         (*m).p    = ptr::null_mut();
         // P.m still points at m so exitsyscall can re-claim it via CAS.
     }
+
+    // Transition G: GRUNNING → GSYSCALL (mirrors Go's entersyscall).
+    let gp = current_g();
+    if !gp.is_null() {
+        unsafe { casgstatus(gp, GRUNNING, GSYSCALL) };
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -126,6 +132,11 @@ pub(crate) unsafe fn exitsyscall() {
                 (*m).oldp  = ptr::null_mut();
                 (*oldp).m  = m;
             }
+            // G: GSYSCALL → GRUNNING (fast path).
+            let gp = current_g();
+            if !gp.is_null() {
+                unsafe { casgstatus(gp, GSYSCALL, GRUNNING) };
+            }
             return; // fast path: back to running with our old P
         }
         unsafe { (*m).oldp = ptr::null_mut() };
@@ -157,8 +168,9 @@ unsafe extern "C" fn exitsyscall0_mcall(gp: *mut G) {
 
     // Detach the goroutine from this M.  We are on g0's stack, so there is
     // no conflict with the goroutine's stack even after another M picks up gp.
+    // G: GSYSCALL → GRUNNABLE (slow path — P was stolen by sysmon).
     unsafe {
-        (*gp).atomicstatus.store(crate::runtime::g::GRUNNABLE, Release);
+        casgstatus(gp, GSYSCALL, GRUNNABLE);
         (*gp).m   = ptr::null_mut();
         (*m).curg = ptr::null_mut();
         set_current_g(ptr::null_mut());
@@ -357,8 +369,11 @@ mod tests {
         let saw_psyscall = Arc::new(AtomicU32::new(0));
         let saw2 = Arc::clone(&saw_psyscall);
 
+        let saw_gsyscall = Arc::new(AtomicU32::new(0));
+        let saw_gsyscall2 = Arc::clone(&saw_gsyscall);
+
         run_impl(move || {
-            // Capture P status during the "syscall".
+            // Capture P and G status during the "syscall".
             let status_during = with_syscall(|| {
                 // Peek at our P's status from inside the syscall.
                 let m = current_m();
@@ -366,6 +381,16 @@ mod tests {
                 // After entersyscall, M.p is null; oldp has the P.
                 let p = unsafe { (*m).oldp };
                 if p.is_null() { return PIDLE; }
+
+                // Also check G status: should be GSYSCALL.
+                let gp = crate::runtime::g::current_g();
+                if !gp.is_null() {
+                    saw_gsyscall2.store(
+                        unsafe { (*gp).atomicstatus.load(Ordering::Acquire) },
+                        Ordering::Relaxed,
+                    );
+                }
+
                 unsafe { (*p).status.load(Ordering::Acquire) }
             });
             saw2.store(status_during, Ordering::Relaxed);
@@ -375,6 +400,11 @@ mod tests {
             saw_psyscall.load(std::sync::atomic::Ordering::Acquire),
             PSYSCALL,
             "P must be in PSYSCALL during with_syscall"
+        );
+        assert_eq!(
+            saw_gsyscall.load(std::sync::atomic::Ordering::Acquire),
+            crate::runtime::g::GSYSCALL,
+            "G must be in GSYSCALL during with_syscall"
         );
     }
 }

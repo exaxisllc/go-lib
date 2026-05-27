@@ -7,7 +7,7 @@
 //! - [`mcall`]                    — save current G, switch to g0's stack, call a fn.
 //! - [`async_preempt_trampoline`] — save all GPRs + d0–d31, call `async_preempt2`,
 //!   restore, ret to interrupted PC.  *(v0.2.0 — Step 4)*
-//! - [`systemstack`]              — run a closure on g0's stack (TODO).
+//! - [`systemstack`]              — run a closure on g0's stack.
 //!
 //! ## Design vs Go's approach
 //!
@@ -193,15 +193,74 @@ pub(crate) unsafe fn mcall(g: *mut G, fn_ptr: unsafe extern "C" fn(*mut G)) {
     }
 }
 
-/// Run `f` on the M's system stack (g0) then return to the current G's stack.
+// ---------------------------------------------------------------------------
+// systemstack — run a closure on g0's stack
+// ---------------------------------------------------------------------------
+
+/// Low-level stack switch for AArch64 (AAPCS64).
 ///
-/// Used by channel operations and the scheduler to ensure critical sections
-/// execute with sufficient stack headroom, regardless of how much of the
-/// goroutine's own stack is already in use.  Currently unimplemented; goroutines
-/// that need extra headroom should heap-allocate large temporaries instead.
-#[allow(dead_code)]
-pub(crate) unsafe fn systemstack<F: FnOnce()>(_f: F) {
-    todo!("systemstack not yet implemented")
+/// ## Register layout on entry
+/// - `x0` = g0_sp   (target stack pointer)
+/// - `x1` = arg     (opaque closure pointer)
+/// - `x2` = thunk   (function to call: `fn(*mut ())`)
+///
+/// Saves `x29` (frame pointer) and `x30` (link register / return address) on
+/// the goroutine's stack, switches `SP` to `g0_sp` (16-byte aligned), calls
+/// `thunk(arg)`, then restores the goroutine's SP and returns.
+///
+/// Ported from `runtime·systemstack` in `runtime/asm_arm64.s`.
+#[allow(dead_code)] // called by systemstack; no callers until systemstack is used
+#[unsafe(naked)]
+unsafe extern "C" fn systemstack_call(
+    _g0_sp: usize,
+    _arg:   *mut (),
+    _thunk: unsafe extern "C" fn(*mut ()),
+) {
+    core::arch::naked_asm!(
+        // Save FP (x29) and LR (x30) on the goroutine's stack.
+        "stp x29, x30, [sp, #-16]!",
+        // Record current SP (= goroutine SP after STP) in x29.
+        "mov x29, sp",
+        // Align g0_sp (x0) down to 16 bytes and switch SP.
+        "bic x3,  x0, #15",
+        "mov sp,  x3",
+        // Call thunk(arg): x0 = arg (x1), thunk = x2.
+        "mov x0,  x1",
+        "blr x2",
+        // Restore goroutine SP from FP (x29).
+        "mov sp,  x29",
+        "ldp x29, x30, [sp], #16",
+        "ret",
+    )
+}
+
+/// Run `f` on the M's g0 (system) stack, then return to the current goroutine.
+///
+/// If already on g0 (scheduler context — `CURRENT_G` is null), `f` is called
+/// directly without any stack switch.
+///
+/// See the x86-64 version in `asm_amd64.rs` for full documentation.
+///
+/// Ported from `systemstack` in `runtime/asm_arm64.s`.
+#[allow(dead_code)] // future callers: stack growth, signal handlers, GC hooks
+pub(crate) unsafe fn systemstack<F: FnOnce()>(f: F) {
+    if super::g::current_g().is_null() {
+        f();
+        return;
+    }
+
+    let g0_sp = unsafe { (*super::g::g0_sched()).sp };
+    debug_assert!(g0_sp != 0, "systemstack: g0_sched.sp is 0 — M not initialised");
+
+    let mut slot = std::mem::ManuallyDrop::new(f);
+    let arg = std::ptr::addr_of_mut!(slot) as *mut ();
+
+    unsafe extern "C" fn thunk<F: FnOnce()>(arg: *mut ()) {
+        let f = unsafe { std::ptr::read(arg as *mut F) };
+        f();
+    }
+
+    unsafe { systemstack_call(g0_sp, arg, thunk::<F>) };
 }
 
 // ---------------------------------------------------------------------------

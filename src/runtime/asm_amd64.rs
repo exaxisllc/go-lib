@@ -7,7 +7,7 @@
 //! - [`mcall`]                    — save current G, switch to g0's stack, call a fn.
 //! - [`async_preempt_trampoline`] — save all GPRs + XMMs, call `async_preempt2`,
 //!   restore, ret to interrupted PC.  *(v0.2.0 — Step 4)*
-//! - [`systemstack`]              — run a closure on g0's stack (TODO).
+//! - [`systemstack`]              — run a closure on g0's stack.
 //!
 //! ## Design vs Go's approach
 //!
@@ -254,14 +254,124 @@ pub(crate) unsafe fn mcall(g: *mut G, fn_ptr: unsafe extern "C" fn(*mut G)) {
     }
 }
 
-/// Run `f` on the M's system stack (g0) then return to the current G's stack.
+// ---------------------------------------------------------------------------
+// systemstack — run a closure on g0's stack
+// ---------------------------------------------------------------------------
+
+/// Low-level stack switch: save goroutine RSP/RBP, switch to `g0_sp`, call
+/// `thunk(arg)` on g0's stack, then restore the goroutine's RSP/RBP and return.
 ///
-/// Used by channel operations and the scheduler to ensure critical sections
-/// execute with sufficient stack headroom.  Currently unimplemented; goroutines
-/// that need extra headroom should heap-allocate large temporaries instead.
-#[allow(dead_code)]
-pub(crate) unsafe fn systemstack<F: FnOnce()>(_f: F) {
-    todo!("systemstack not yet implemented")
+/// ## Register layout on entry (System V AMD64 — Linux / macOS)
+/// - `rdi` = g0_sp   (target stack pointer, aligned to 16 bytes inside)
+/// - `rsi` = arg     (opaque closure pointer, forwarded to thunk)
+/// - `rdx` = thunk   (function to call on g0's stack)
+///
+/// ## Register layout on entry (Microsoft x64 — Windows)
+/// - `rcx` = g0_sp
+/// - `rdx` = arg
+/// - `r8`  = thunk
+///
+/// ## Safety
+/// `g0_sp` must be a valid, accessible stack address for this OS thread's g0.
+/// `thunk` must not panic or longjmp.
+///
+/// Ported from `runtime·systemstack` in `runtime/asm_amd64.s`.
+#[cfg(not(windows))]
+#[allow(dead_code)] // called by systemstack; no callers until systemstack is used
+#[unsafe(naked)]
+unsafe extern "C" fn systemstack_call(
+    _g0_sp: usize,
+    _arg:   *mut (),
+    _thunk: unsafe extern "C" fn(*mut ()),
+) {
+    core::arch::naked_asm!(
+        // Save goroutine frame pointer on goroutine's stack, then record the
+        // goroutine's current RSP in RBP for restoration after the call.
+        "push rbp",           // [goroutine stack] save old RBP
+        "mov  rbp, rsp",      // RBP = goroutine SP (post-push)
+        // Switch to g0 stack (rdi = g0_sp, already the arg).
+        "and  rdi, -16",      // 16-byte-align the target SP
+        "mov  rsp, rdi",      // RSP now on g0's stack
+        "sub  rsp, 8",        // maintain 16-byte alignment before CALL
+        // Call thunk(arg): arg is in rsi, thunk is in rdx.
+        "mov  rdi, rsi",      // 1st arg: rdi = arg
+        "call rdx",           // call thunk(arg) — ret addr lands on g0 stack
+        // Restore goroutine stack.
+        "mov  rsp, rbp",      // RSP = saved goroutine SP
+        "pop  rbp",           // restore old RBP
+        "ret",
+    )
+}
+
+/// Windows x64 variant: rcx=g0_sp, rdx=arg, r8=thunk.
+#[cfg(windows)]
+#[allow(dead_code)] // called by systemstack; no callers until systemstack is used
+#[unsafe(naked)]
+unsafe extern "C" fn systemstack_call(
+    _g0_sp: usize,
+    _arg:   *mut (),
+    _thunk: unsafe extern "C" fn(*mut ()),
+) {
+    core::arch::naked_asm!(
+        "push rbp",
+        "mov  rbp, rsp",
+        "and  rcx, -16",
+        "mov  rsp, rcx",
+        // 32-byte shadow space + 8-byte alignment pad for CALL.
+        "sub  rsp, 40",
+        "mov  rcx, rdx",      // 1st arg: rcx = arg
+        "call r8",            // call thunk(arg)
+        "mov  rsp, rbp",
+        "pop  rbp",
+        "ret",
+    )
+}
+
+/// Run `f` on the M's g0 (system) stack, then return to the current goroutine.
+///
+/// If already on g0 (scheduler context — `CURRENT_G` is null), `f` is called
+/// directly without any stack switch.
+///
+/// ## How the switch works
+///
+/// `gogo` saves g0's stack pointer into the thread-local `G0_SCHED.sp` every
+/// time it switches into a goroutine.  While the goroutine runs, g0 is idle —
+/// its stack memory is allocated and valid, just not active.  `systemstack`
+/// reads that saved SP, uses `systemstack_call` (a naked helper) to swap RSP,
+/// calls `f` on g0's stack, and restores RSP before returning.
+///
+/// The closure `f` is stored in a `ManuallyDrop` slot on the goroutine's own
+/// stack.  The goroutine stack memory remains valid throughout the switch (only
+/// RSP changes), so the pointer passed to the thunk is always live.
+///
+/// Ported from `systemstack` in `runtime/asm_amd64.s`.
+#[allow(dead_code)] // future callers: stack growth, signal handlers, GC hooks
+pub(crate) unsafe fn systemstack<F: FnOnce()>(f: F) {
+    // Already on g0 — call directly without switching stacks.
+    if super::g::current_g().is_null() {
+        f();
+        return;
+    }
+
+    let g0_sp = unsafe { (*super::g::g0_sched()).sp };
+    debug_assert!(g0_sp != 0, "systemstack: g0_sched.sp is 0 — M not initialised");
+
+    // Keep `f` on the goroutine's stack; it stays accessible after the RSP
+    // switch because the goroutine stack is allocated memory, not the
+    // currently-active stack in any CPU sense.
+    let mut slot = std::mem::ManuallyDrop::new(f);
+    let arg = std::ptr::addr_of_mut!(slot) as *mut ();
+
+    /// Thunk called on g0's stack: reads the closure out of `arg` and calls it.
+    ///
+    /// SAFETY: `arg` points to a `ManuallyDrop<F>` on the goroutine's stack,
+    /// which is still valid memory even though RSP has been switched to g0.
+    unsafe extern "C" fn thunk<F: FnOnce()>(arg: *mut ()) {
+        let f = unsafe { std::ptr::read(arg as *mut F) };
+        f();
+    }
+
+    unsafe { systemstack_call(g0_sp, arg, thunk::<F>) };
 }
 
 // ---------------------------------------------------------------------------

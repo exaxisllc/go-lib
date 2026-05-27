@@ -23,7 +23,7 @@
 
 use std::ptr;
 
-use super::g::{current_g, set_current_g, G, GRUNNABLE, GRUNNING, GWAITING, WaitReason};
+use super::g::{casgstatus, current_g, readgstatus, set_current_g, G, GPREEMPTED, GRUNNABLE, GRUNNING, GWAITING, WaitReason};
 use super::m::current_m;
 use super::sched::{sched, schedule, startm};
 
@@ -66,7 +66,7 @@ unsafe extern "C" fn park_fn(gp: *mut G) {
     let m = current_m();
 
     unsafe {
-        (*gp).atomicstatus.store(GWAITING, std::sync::atomic::Ordering::Release);
+        casgstatus(gp, GRUNNING, GWAITING);
         (*gp).m   = ptr::null_mut();
         (*m).curg = ptr::null_mut();
         set_current_g(ptr::null_mut());
@@ -101,22 +101,27 @@ unsafe extern "C" fn park_fn(gp: *mut G) {
 ///
 /// Ported from `goready` in `runtime/proc.go`.
 pub(crate) unsafe fn goready(gp: *mut G) {
-    use std::sync::atomic::Ordering::Acquire;
-
-    // Spin until the goroutine finishes its GRUNNING → GWAITING transition.
-    loop {
-        let s = unsafe { (*gp).atomicstatus.load(Acquire) };
-        if s == GWAITING {
-            break;
+    // Spin until the goroutine finishes its in-flight status transition.
+    // The two expected stable states are:
+    //   GWAITING   — normal gopark (channel / mutex / timer / condvar)
+    //   GPREEMPTED — async preemption landed before goready was called
+    // We spin briefly on GRUNNING because channel operations release their
+    // lock *before* calling gopark, so there is a tiny window where the G
+    // is still GRUNNING even though its sudog has been dequeued.
+    let old_status = loop {
+        let s = unsafe { readgstatus(gp) };
+        if s == GWAITING || s == GPREEMPTED {
+            break s;
         }
         debug_assert!(
             s == GRUNNING,
-            "goready: unexpected status {s} — G must be GRUNNING or GWAITING"
+            "goready: unexpected status {s} — expected GRUNNING, GWAITING, or GPREEMPTED"
         );
         std::hint::spin_loop();
-    }
+    };
 
-    unsafe { (*gp).atomicstatus.store(GRUNNABLE, std::sync::atomic::Ordering::Release) };
+    // GWAITING / GPREEMPTED → GRUNNABLE.
+    unsafe { casgstatus(gp, old_status, GRUNNABLE) };
 
     let sc = sched();
     let m  = current_m();
@@ -148,6 +153,7 @@ pub(crate) unsafe fn goready(gp: *mut G) {
 mod tests {
     use crate::runtime::g::{Stack, G};
 
+    #[allow(dead_code)] // shared test-helper; used by pending goready/gopark tests
     fn make_g(id: u64) -> Box<G> {
         let lo = (id as usize + 1) << 20;
         G::new(Stack { lo, hi: lo + 65536 }, id)

@@ -6,7 +6,7 @@
 //! `G` embeds `Gobuf` directly and they cannot be compiled in isolation.
 
 use std::cell::Cell;
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicU32, Ordering::*};
 
 use super::m::M;
 
@@ -164,6 +164,8 @@ pub(crate) enum WaitReason {
 
 impl WaitReason {
     /// Human-readable description matching Go's `waitReason.String()`.
+    /// Used by future debugger/trace integration.
+    #[allow(dead_code)]
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Zero        => "",
@@ -220,8 +222,9 @@ pub(crate) struct G {
     /// `null` when the G is not on any list.
     pub schedlink:   *mut G,
 
-    /// Nanosecond timestamp when the G entered `GWAITING` (from
-    /// `std::time::Instant`).  Zero when not waiting.
+    /// Nanosecond timestamp when the G entered `GWAITING`.
+    /// Ported from `g.waitsince`; used by future deadlock detector / tracer.
+    #[allow(dead_code)]
     pub waitsince:   i64,
 
     /// Why this G is waiting; meaningful only when
@@ -243,7 +246,8 @@ pub(crate) struct G {
     pub selectdone:  AtomicU32,
 
     /// Cached timer for `time::sleep`.  `null` when no timer is active.
-    /// Typed `*mut u8` until `runtime::time::Timer` is defined (step 17).
+    /// Typed `*mut u8` until `runtime::time::Timer` is fully defined (step 17).
+    #[allow(dead_code)]
     pub timer:       *mut u8,
 }
 
@@ -333,7 +337,179 @@ pub(crate) unsafe fn set_g0_sched(buf: *mut Gobuf) {
 
 /// Return g0's `Gobuf` for this OS thread.
 /// Returns `null` before `M::new` has been called.
+///
+/// Called by `systemstack` in `asm_amd64.rs` / `asm_arm64.rs` to locate g0's
+/// saved stack pointer before switching to g0's stack.
+#[allow(dead_code)] // used by systemstack (no callers of systemstack yet)
 #[inline]
 pub(crate) fn g0_sched() -> *mut Gobuf {
     G0_SCHED.with(|c| c.get())
+}
+
+// ---------------------------------------------------------------------------
+// Goroutine state-transition helpers — ported from runtime/proc.go
+// ---------------------------------------------------------------------------
+
+/// Validate that `from → to` is a legal goroutine status transition.
+///
+/// GSCAN bits are stripped before the lookup so every scan-combined state
+/// (e.g. `GSCAN | GWAITING`) automatically satisfies the table.
+fn is_valid_transition(from: u32, to: u32) -> bool {
+    let f = from & !GSCAN;
+    let t = to   & !GSCAN;
+    matches!((f, t),
+        (GIDLE,        GRUNNABLE)   // new goroutine queued for first time
+        | (GRUNNABLE,  GRUNNING)    // execute: scheduler picks G
+        | (GRUNNING,   GRUNNABLE)   // gosched / preempt final step
+        | (GRUNNING,   GWAITING)    // gopark: channel / mutex / timer
+        | (GWAITING,   GRUNNABLE)   // goready: unblocked
+        | (GRUNNING,   GSYSCALL)    // entersyscall
+        | (GSYSCALL,   GRUNNING)    // exitsyscall fast path
+        | (GSYSCALL,   GRUNNABLE)   // exitsyscall slow path
+        | (GRUNNING,   GCOPYSTACK)  // copystack begin
+        | (GCOPYSTACK, GRUNNING)    // copystack end
+        | (GRUNNING,   GPREEMPTED)  // async preemption signal received
+        | (GPREEMPTED, GRUNNABLE)   // scheduler re-enqueues preempted G
+        | (GRUNNING,   GDEAD)       // goexit0: goroutine finished
+    )
+}
+
+/// Atomically transition `gp` from `old_val` to `new_val`.
+///
+/// Spins while the G holds any `GSCAN` bit — matches Go's `casgstatus` loop
+/// that yields to a concurrent GC stack scan before retrying the CAS.
+///
+/// # Panics (debug)
+/// Panics if `old_val → new_val` is not in the valid-transition table.
+///
+/// # Safety
+/// `gp` must point to a live, heap-allocated `G`.
+///
+/// Ported from `casgstatus` in `runtime/proc.go`.
+pub(crate) unsafe fn casgstatus(gp: *mut G, old_val: u32, new_val: u32) {
+    debug_assert!(
+        is_valid_transition(old_val, new_val),
+        "casgstatus: invalid transition {old_val} → {new_val}",
+    );
+    loop {
+        let s = unsafe { (*gp).atomicstatus.load(Acquire) };
+        // If GC has OR'd in GSCAN, spin until it releases the bit.
+        if s & GSCAN != 0 {
+            std::hint::spin_loop();
+            continue;
+        }
+        if unsafe {
+            (*gp).atomicstatus
+                .compare_exchange(old_val, new_val, AcqRel, Relaxed)
+                .is_ok()
+        } {
+            return;
+        }
+        // CAS failed (status changed transiently) — retry.
+        std::hint::spin_loop();
+    }
+}
+
+/// Transition `gp` from `base_status` to `GSCAN | base_status`.
+///
+/// Used by the GC to "freeze" a goroutine's stack status while scanning.
+/// The goroutine must NOT be modified while the GSCAN bit is held.
+///
+/// Ported from `castogscanstatus` in `runtime/proc.go`.
+#[cfg_attr(not(test), allow(dead_code))] // called by scan_stack; GC callers pending
+pub(crate) unsafe fn castogscanstatus(gp: *mut G, base_status: u32) {
+    let result = unsafe {
+        (*gp).atomicstatus
+            .compare_exchange(base_status, GSCAN | base_status, AcqRel, Relaxed)
+    };
+    debug_assert!(
+        result.is_ok(),
+        "castogscanstatus: G not in expected status {base_status}",
+    );
+}
+
+/// Transition `gp` from `scan_status` (`GSCAN | x`) back to `new_val`.
+///
+/// Releases the GSCAN freeze after stack scanning is complete.
+///
+/// Ported from `casfrom_gscanstatus` in `runtime/proc.go`.
+#[cfg_attr(not(test), allow(dead_code))] // called by scan_stack; GC callers pending
+pub(crate) unsafe fn casfrom_gscanstatus(gp: *mut G, scan_status: u32, new_val: u32) {
+    let result = unsafe {
+        (*gp).atomicstatus
+            .compare_exchange(scan_status, new_val, AcqRel, Relaxed)
+    };
+    debug_assert!(
+        result.is_ok(),
+        "casfrom_gscanstatus: G not in expected scan status {scan_status}",
+    );
+}
+
+/// Read the goroutine's current status, stripping any `GSCAN` bit.
+///
+/// Ported from `readgstatus` in `runtime/proc.go`.
+#[inline]
+pub(crate) unsafe fn readgstatus(gp: *mut G) -> u32 {
+    unsafe { (*gp).atomicstatus.load(Acquire) & !GSCAN }
+}
+
+/// Temporarily freeze `gp`'s stack status for GC stack scanning, invoke
+/// `scanner`, then release the freeze.
+///
+/// Currently a no-op (no garbage collector is implemented); provides the
+/// state-machine infrastructure so a future GC can integrate without
+/// changing call sites.
+///
+/// Ported from `scanstack` in `runtime/mgcmark.go`.
+#[cfg_attr(not(test), allow(dead_code))] // exercises GSCAN state machine; GC callers pending
+pub(crate) unsafe fn scan_stack(gp: *mut G, scanner: impl FnOnce()) {
+    let base = unsafe { readgstatus(gp) };
+    unsafe { castogscanstatus(gp, base) };          // base → GSCAN | base
+    scanner();                                       // GC scanner runs here
+    unsafe { casfrom_gscanstatus(gp, GSCAN | base, base) }; // GSCAN | base → base
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::Ordering::Relaxed;
+
+    use super::*;
+    use crate::runtime::stack::{stack_alloc, stack_free};
+
+    /// `castogscanstatus` / `casfrom_gscanstatus` / `scan_stack` must
+    /// correctly bracket a goroutine status with the GSCAN bit and restore
+    /// it on completion.
+    #[test]
+    fn gscan_round_trip() {
+        let stack = unsafe { stack_alloc().expect("stack_alloc failed") };
+        let stack_bounds = Stack { lo: stack.lo, hi: stack.hi };
+        let mut g = G::new(stack, 999);
+        let gp: *mut G = &mut *g;
+
+        // Start in GWAITING to exercise a non-GRUNNING base status.
+        unsafe { (*gp).atomicstatus.store(GWAITING, Relaxed) };
+
+        unsafe {
+            scan_stack(gp, || {
+                assert_eq!(
+                    (*gp).atomicstatus.load(Relaxed),
+                    GSCAN | GWAITING,
+                    "GSCAN bit should be set during scan"
+                );
+            });
+        }
+
+        assert_eq!(
+            unsafe { (*gp).atomicstatus.load(Relaxed) },
+            GWAITING,
+            "GSCAN bit should be cleared after scan"
+        );
+
+        // Free the stack we allocated above (G::new moved it into the G).
+        unsafe { stack_free(&stack_bounds) };
+    }
 }

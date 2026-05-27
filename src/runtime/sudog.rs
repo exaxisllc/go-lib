@@ -163,6 +163,7 @@ impl WaitQ {
 
     /// Return `true` if the queue has no waiters.
     #[inline]
+    #[allow(dead_code)] // used by channel drain check; wired when chan drain lands
     pub(crate) fn is_empty(&self) -> bool {
         self.first.is_null()
     }

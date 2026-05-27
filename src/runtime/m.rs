@@ -136,6 +136,7 @@ impl Note {
     /// Must not be called concurrently with `sleep` or `wakeup`.
     ///
     /// Ported from `noteclear` in `runtime/lock_sema.go`.
+    #[allow(dead_code)] // used by stopm/startm; wired when M-park protocol lands
     pub(crate) fn clear(&self) {
         *self.flag.lock().unwrap() = false;
     }
@@ -181,6 +182,7 @@ pub(crate) struct M {
     // ── scheduler state ───────────────────────────────────────────────────
     /// `true` while this M is actively spinning in `findrunnable` looking
     /// for work.  At most `GOMAXPROCS/2` Ms may spin simultaneously.
+    #[allow(dead_code)] // read by findrunnable spin-count check; wired in Step 9
     pub spinning: bool,
 
     /// `true` while this M is parked in `park.sleep()`.
@@ -194,6 +196,7 @@ pub(crate) struct M {
     // ── linked-list links ─────────────────────────────────────────────────
     /// Link in the global `allm` singly-linked list (wired during step 9
     /// bootstrap).
+    #[allow(dead_code)] // traversed by sysmon/GC allm walk; wired in Step 9
     pub alllink: *mut M,
 
     /// Link used by the scheduler for idle-M and other internal lists.

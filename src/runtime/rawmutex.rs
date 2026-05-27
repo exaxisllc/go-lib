@@ -57,6 +57,7 @@ impl RawMutex {
     ///
     /// Returns `true` if the lock was acquired, `false` if it was already
     /// held by someone else.
+    #[allow(dead_code)] // used by sysmon fast-path lock; wired when sysmon gains trylock
     pub(crate) fn try_lock(&self) -> bool {
         self.locked
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
