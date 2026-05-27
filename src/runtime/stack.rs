@@ -98,7 +98,24 @@ pub(crate) const STACK_MIN: usize = 8 * 1024;
 pub(crate) const STACK_MAX: usize = 1024 * 1024 * 1024;
 
 /// Initial stack size for every new goroutine.
-pub(crate) const GOROUTINE_STACK_BYTES: usize = STACK_MIN;
+///
+/// Go uses 8 KiB (`stackMin`) and relies on explicit `morestack` checks
+/// (inserted by the compiler at every function entry) to grow the stack
+/// before exhaustion.  We use guard-page detection instead, which works well
+/// on Unix where the SIGSEGV handler is delivered on an alternate signal stack
+/// (`SA_ONSTACK`).  On Windows, however, exception dispatch pushes the
+/// EXCEPTION_RECORD onto the *current* stack: if the goroutine's stack is
+/// already exhausted the exception frame cannot be written, the VEH is never
+/// reached, and Windows terminates the process silently.
+///
+/// Additionally, debug builds on Windows generate 3–5× larger stack frames
+/// than release builds or Unix equivalents, so the goroutine-entry call chain
+/// (`goroutine_entry` → user closure → `with_syscall` → Winsock → `gopark`)
+/// can exceed 8 KiB before the guard page fires.
+///
+/// 64 KiB provides comfortable headroom across all platforms and build
+/// profiles while remaining negligible per-goroutine overhead in practice.
+pub(crate) const GOROUTINE_STACK_BYTES: usize = 64 * 1024;
 
 /// Stack size for each M's g0 (the scheduler stack).
 ///
