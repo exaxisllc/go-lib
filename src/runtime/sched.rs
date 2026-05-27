@@ -760,6 +760,26 @@ mod win_veh_sys {
         /// hooks, which makes it safe to call from inside a VEH where locks
         /// may be held.
         pub fn TerminateProcess(hProcess: *mut u8, uExitCode: u32) -> i32;
+
+        /// Create or open a file.  Used to write crash diagnostics to disk so
+        /// they survive pipe teardown when the process exits.
+        pub fn CreateFileW(
+            lpFileName:            *const u16,
+            dwDesiredAccess:       u32,
+            dwShareMode:           u32,
+            lpSecurityAttributes:  *mut u8,
+            dwCreationDisposition: u32,
+            dwFlagsAndAttributes:  u32,
+            hTemplateFile:         *mut u8,
+        ) -> *mut u8;
+
+        /// Close a kernel object handle.
+        pub fn CloseHandle(hObject: *mut u8) -> i32;
+
+        /// Sleep for `dwMilliseconds` milliseconds.  Called before
+        /// `TerminateProcess` to give the parent process (cargo) time to drain
+        /// the stderr pipe and capture the VEH output in CI logs.
+        pub fn Sleep(dwMilliseconds: u32);
     }
 }
 
@@ -772,6 +792,42 @@ unsafe fn veh_write(h: *mut u8, s: &[u8]) {
     unsafe {
         win_veh_sys::WriteFile(h, s.as_ptr(), s.len() as u32, &mut n,
                                core::ptr::null_mut());
+    }
+}
+
+/// Open (or create) the VEH crash file and return its HANDLE.
+///
+/// Path: `.\go-lib-crash-veh.txt` (relative to the working directory —
+/// in CI this lands in `D:\a\go-lib\go-lib\` next to the binary).
+///
+/// Returns `INVALID_HANDLE_VALUE` on failure so callers can skip file writes.
+#[cfg(windows)]
+unsafe fn veh_open_crash_file() -> *mut u8 {
+    // UTF-16LE: ".\go-lib-crash-veh.txt\0"
+    const PATH: &[u16] = &[
+        b'.' as u16, b'\\' as u16,
+        b'g' as u16, b'o' as u16, b'-' as u16, b'l' as u16, b'i' as u16,
+        b'b' as u16, b'-' as u16, b'c' as u16, b'r' as u16, b'a' as u16,
+        b's' as u16, b'h' as u16, b'-' as u16, b'v' as u16, b'e' as u16,
+        b'h' as u16, b'.' as u16, b't' as u16, b'x' as u16, b't' as u16,
+        0u16, // NUL terminator
+    ];
+    const GENERIC_WRITE:       u32 = 0x4000_0000;
+    const FILE_SHARE_READ:     u32 = 0x0000_0001;
+    const OPEN_ALWAYS:         u32 = 4; // create if not exist, open if exists
+    const FILE_APPEND_DATA:    u32 = 0x0000_0004;
+    const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+
+    unsafe {
+        win_veh_sys::CreateFileW(
+            PATH.as_ptr(),
+            GENERIC_WRITE | FILE_APPEND_DATA,
+            FILE_SHARE_READ,
+            core::ptr::null_mut(),
+            OPEN_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL,
+            core::ptr::null_mut(),
+        )
     }
 }
 
@@ -808,6 +864,23 @@ unsafe fn veh_write_hex(h: *mut u8, val: u64) {
 pub(crate) fn install_windows_veh() {
     unsafe {
         win_veh_sys::AddVectoredExceptionHandler(1, windows_veh_handler);
+
+        // Write an installation marker to both stderr and the crash file so we
+        // can verify in CI that the VEH was registered before any crash.
+        let stderr = win_veh_sys::GetStdHandle(0xFFFF_FFF4u32); // STD_ERROR_HANDLE
+        let marker = b"[go-lib] VEH installed\r\n";
+        let mut n = 0u32;
+        win_veh_sys::WriteFile(stderr, marker.as_ptr(), marker.len() as u32,
+                               &mut n, core::ptr::null_mut());
+        win_veh_sys::FlushFileBuffers(stderr);
+
+        let fh = veh_open_crash_file();
+        const INVALID_HANDLE: *mut u8 = usize::MAX as *mut u8;
+        if !fh.is_null() && fh != INVALID_HANDLE {
+            win_veh_sys::WriteFile(fh, marker.as_ptr(), marker.len() as u32,
+                                   &mut n, core::ptr::null_mut());
+            win_veh_sys::CloseHandle(fh);
+        }
     }
 }
 
@@ -920,9 +993,59 @@ unsafe extern "system" fn windows_veh_handler(ep: *mut u8) -> i32 {
         veh_write(h, b"[go-lib VEH] R8  : "); veh_write_hex(h, r8);
         veh_write(h, b"[go-lib VEH] R9  : "); veh_write_hex(h, r9);
 
-        // Flush the pipe before exiting so the parent process (cargo) can read
-        // all bytes written above.
+        // Mirror diagnostics to stdout (in case stderr pipe is broken in CI).
+        let stdout = win_veh_sys::GetStdHandle(0xFFFF_FFF5u32); // STD_OUTPUT_HANDLE = -11
+        veh_write(stdout, b"[go-lib VEH] exception code   : ");
+        veh_write_hex(stdout, code as u64);
+        let instr2: usize = *(er_ptr.add(16) as *const usize);
+        veh_write(stdout, b"[go-lib VEH] ExceptionAddress : ");
+        veh_write_hex(stdout, instr2 as u64);
+        let rip2: u64 = *(ctx_ptr.add(248) as *const u64);
+        let rsp2: u64 = *(ctx_ptr.add(152) as *const u64);
+        veh_write(stdout, b"[go-lib VEH] RIP : "); veh_write_hex(stdout, rip2);
+        veh_write(stdout, b"[go-lib VEH] RSP : "); veh_write_hex(stdout, rsp2);
+        win_veh_sys::FlushFileBuffers(stdout);
+
+        // Write ALL diagnostics to a crash file that survives pipe teardown.
+        // In CI the file lands at <cwd>\go-lib-crash-veh.txt.
+        let fh = veh_open_crash_file();
+        const INVALID_HANDLE: *mut u8 = usize::MAX as *mut u8;
+        if !fh.is_null() && fh != INVALID_HANDLE {
+            veh_write(fh, b"[go-lib VEH] exception code   : ");
+            veh_write_hex(fh, code as u64);
+            let instr3: usize = *(er_ptr.add(16) as *const usize);
+            veh_write(fh, b"[go-lib VEH] ExceptionAddress : ");
+            veh_write_hex(fh, instr3 as u64);
+            if n_params >= 2 {
+                let ft2: usize = *(er_ptr.add(32) as *const usize);
+                let fa2: usize = *(er_ptr.add(40) as *const usize);
+                veh_write(fh, b"[go-lib VEH] fault_type : ");
+                veh_write_hex(fh, ft2 as u64);
+                veh_write(fh, b"[go-lib VEH] fault_addr : ");
+                veh_write_hex(fh, fa2 as u64);
+            }
+            let rip3: u64 = *(ctx_ptr.add(248) as *const u64);
+            let rsp3: u64 = *(ctx_ptr.add(152) as *const u64);
+            let rbp3: u64 = *(ctx_ptr.add(160) as *const u64);
+            let rax3: u64 = *(ctx_ptr.add(120) as *const u64);
+            let rcx3: u64 = *(ctx_ptr.add(128) as *const u64);
+            let rdx3: u64 = *(ctx_ptr.add(136) as *const u64);
+            veh_write(fh, b"[go-lib VEH] RIP : "); veh_write_hex(fh, rip3);
+            veh_write(fh, b"[go-lib VEH] RSP : "); veh_write_hex(fh, rsp3);
+            veh_write(fh, b"[go-lib VEH] RBP : "); veh_write_hex(fh, rbp3);
+            veh_write(fh, b"[go-lib VEH] RAX : "); veh_write_hex(fh, rax3);
+            veh_write(fh, b"[go-lib VEH] RCX : "); veh_write_hex(fh, rcx3);
+            veh_write(fh, b"[go-lib VEH] RDX : "); veh_write_hex(fh, rdx3);
+            win_veh_sys::CloseHandle(fh);
+        }
+
+        // Flush the stderr pipe before exiting so the parent process (cargo)
+        // can read all bytes written above.
         win_veh_sys::FlushFileBuffers(h);
+
+        // Sleep briefly to give cargo's pipe reader time to drain the buffer.
+        // Without this, TerminateProcess can race with the parent's read loop.
+        win_veh_sys::Sleep(500);
 
         // TerminateProcess is safer than ExitProcess inside a VEH: it skips
         // all atexit/DLL-detach hooks that might try to acquire locks already

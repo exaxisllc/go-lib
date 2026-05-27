@@ -102,12 +102,17 @@ pub(crate) const GOROUTINE_STACK_BYTES: usize = STACK_MIN;
 
 /// Stack size for each M's g0 (the scheduler stack).
 ///
-/// The scheduler loop (`schedule` → `findrunnable` → `stopm` → locking) has a
-/// deeper call chain than a typical goroutine.  64 KiB gives comfortable
-/// headroom without per-goroutine waste.  Go uses the OS thread's native stack
-/// (typically 8 MiB) for g0; we use a fixed 64 KiB mmap'd region with the
-/// same guard-page layout as a normal goroutine stack.
-pub(crate) const G0_STACK_BYTES: usize = 64 * 1024;
+/// The scheduler loop (`schedule` → `findrunnable` → `stopm` → locking →
+/// `Condvar::wait`) has a deeper call chain than a typical goroutine, and on
+/// Windows in debug builds lock operations and system-call trampolines consume
+/// 3–5× more stack than on Unix.  The `exitsyscall0_mcall` slow path adds an
+/// extra frame level because `schedule()` is called from within
+/// `exitsyscall0_mcall`'s frame rather than from the top of g0.  512 KiB
+/// provides comfortable headroom across all platforms and build profiles.
+/// Go uses the OS thread's native stack (typically 8 MiB) for g0; we use a
+/// fixed 512 KiB mmap'd region with the same guard-page layout as a normal
+/// goroutine stack.
+pub(crate) const G0_STACK_BYTES: usize = 512 * 1024;
 
 // ---------------------------------------------------------------------------
 // Page size
