@@ -170,6 +170,7 @@ mod tests {
 
         let ran = Arc::new(AtomicBool::new(false));
         let ran2 = Arc::clone(&ran);
+        let ran3 = Arc::clone(&ran); // checked inside run_impl to bound the loop
 
         run_impl(move || {
             // spawn_goroutine calls goready internally (via push_batch + startm).
@@ -177,8 +178,16 @@ mod tests {
             crate::runtime::sched::spawn_goroutine(move || {
                 ran2.store(true, Ordering::Release);
             });
-            // Yield until the spawned goroutine runs.
-            for _ in 0..200 { crate::gosched(); }
+            // Yield until the spawned goroutine runs.  A fixed iteration count
+            // is fragile under heavy parallel test load; use a wall-clock
+            // deadline instead so the test passes even on slow CI runners.
+            let deadline =
+                std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !ran3.load(Ordering::Acquire)
+                && std::time::Instant::now() < deadline
+            {
+                crate::gosched();
+            }
         });
 
         assert!(ran.load(Ordering::Acquire), "goroutine should have run via goready path");

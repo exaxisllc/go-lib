@@ -16,11 +16,21 @@
 //! `thread_local!` (`CURRENT_G` in `g.rs`) updated from the Rust wrapper,
 //! keeping the naked asm free of OS-specific TLS segment tricks.
 //!
-//! ## Calling convention (System V AMD64 ABI)
-//! Arguments: `rdi`, `rsi`, `rdx`, `rcx`, `r8`, `r9`.
+//! ## Calling convention
+//!
+//! **System V AMD64 (Linux, macOS)** — arguments in `rdi`, `rsi`, `rdx`, `rcx`, `r8`, `r9`.
 //! Caller-saved: `rax`, `rcx`, `rdx`, `rsi`, `rdi`, `r8`–`r11`.
 //! Callee-saved: `rbx`, `rbp`, `r12`–`r15`.
-//! Stack alignment: 16-byte aligned before a `call` instruction.
+//! Stack: 16-byte aligned before a `call`.  No shadow space.
+//!
+//! **Microsoft x64 (Windows)** — arguments in `rcx`, `rdx`, `r8`, `r9`.
+//! Caller-saved: `rax`, `rcx`, `rdx`, `r8`–`r11`.
+//! Callee-saved: `rbx`, `rbp`, `rdi`, `rsi`, `r12`–`r15`, `xmm6`–`xmm15`.
+//! Stack: 16-byte aligned before a `call`.  **Caller must allocate 32 bytes
+//! of shadow space below RSP before any `call`** — the callee may write its
+//! first four register arguments there.  Without it a callee that spills its
+//! first argument (`rcx`) would write to `[rsp+8]`, which equals `g0.stack.hi+8`
+//! — just past the end of the VirtualAlloc region → `STATUS_ACCESS_VIOLATION`.
 //!
 //! ## Gobuf field offsets (verified by compile-time assertions in `g.rs`)
 //! ```text
@@ -173,10 +183,15 @@ unsafe extern "C" fn mcall_asm(
         "mov [rdx + {g}],  rcx",           // g_sched.g  = g
 
         // ── switch to g0's stack (r8 = g0_gobuf) ─────────────────────────
-        "mov rsp, [r8 + {sp}]",            // rsp = g0.sp (stack switch)
+        "mov rsp, [r8 + {sp}]",            // rsp = g0.sp (= g0.stack.hi — top of allocation)
         "mov rbp, [r8 + {bp}]",            // rbp = g0.bp
 
         // ── call fn_ptr(g) on g0's stack ─────────────────────────────────
+        // Microsoft x64 ABI requires the *caller* to allocate 32 bytes of
+        // "home space" (shadow space) before any CALL.  Without it the callee
+        // prologue writes rcx → [rsp+8], which equals g0.stack.hi+8 — one
+        // byte past the VirtualAlloc region → STATUS_ACCESS_VIOLATION.
+        "sub rsp, 32",                     // allocate shadow space (keeps rsp 16-byte aligned)
         // rcx = g (still holds g — Microsoft x64 first arg in rcx ✓)
         // r9  = fn_ptr
         "call r9",

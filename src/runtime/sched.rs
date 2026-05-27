@@ -32,7 +32,8 @@
 //! ### Netpoll integration (`findrunnable`)
 //! After the three work-stealing steps, `findrunnable` calls
 //! `netpoll::netpoll_wait(0)` (non-blocking) and issues `goready` for every
-//! file descriptor that became ready since the last poll.
+//! goroutine whose I/O became ready (Unix) or whose overlapped operation
+//! completed (Windows IOCP) since the last poll.
 //!
 //! ## Global state
 //!
@@ -608,6 +609,463 @@ unsafe extern "C" fn preemptm(gp: *mut G) {
 }
 
 // ---------------------------------------------------------------------------
+// SIGBUS handler — diagnostic crash reporter
+// ---------------------------------------------------------------------------
+
+/// Previous SIGBUS handler (chained on non-scheduler signals).
+#[cfg(not(windows))]
+static PREV_SIGBUS: Mutex<Option<libc::sigaction>> = Mutex::new(None);
+
+/// Install a SIGBUS handler that prints PC/SP/LR and a forced backtrace before
+/// calling `abort`.  This surfaces crashes in background scheduler threads that
+/// would otherwise kill the process with no output.
+///
+/// # Safety
+/// Call once during `schedinit`.
+#[cfg(not(windows))]
+pub(crate) unsafe fn install_sigbus_handler() {
+    let mut sa: libc::sigaction = unsafe { std::mem::zeroed() };
+    sa.sa_sigaction = sigbus_handler as *const () as usize;
+    // SA_ONSTACK: run on the thread's alternate signal stack (installed by
+    // M::start) so the handler survives even if the goroutine stack overflowed.
+    sa.sa_flags = (libc::SA_SIGINFO | libc::SA_ONSTACK) as _;
+    unsafe { libc::sigemptyset(&mut sa.sa_mask) };
+
+    let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
+    let ret = unsafe { libc::sigaction(libc::SIGBUS, &sa, &mut old) };
+    assert_eq!(ret, 0, "install_sigbus_handler: sigaction failed");
+
+    *PREV_SIGBUS.lock().unwrap() = Some(old);
+}
+
+/// SIGBUS handler: print crash context (registers + backtrace) then abort.
+///
+/// Not async-signal-safe in the strictest sense, but we are aborting anyway;
+/// the goal is to emit useful diagnostics before the process exits.
+#[cfg(not(windows))]
+unsafe extern "C" fn sigbus_handler(
+    _sig:  libc::c_int,
+    _info: *mut libc::siginfo_t,
+    ctx:   *mut libc::c_void,
+) {
+    // Use write() directly for the first line — it is async-signal-safe.
+    let msg = b"[go-lib SIGBUS] crash detected\n";
+    unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len()) };
+
+    // Print register context from the interrupted ucontext_t.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if !ctx.is_null() {
+        unsafe {
+            let uc = ctx as *mut libc::ucontext_t;
+            let ss = &(*(*uc).uc_mcontext).__ss;
+            eprintln!("[go-lib SIGBUS] PC  = {:#018x}", ss.__pc);
+            eprintln!("[go-lib SIGBUS] LR  = {:#018x}", ss.__lr);
+            eprintln!("[go-lib SIGBUS] SP  = {:#018x}", ss.__sp);
+            eprintln!("[go-lib SIGBUS] FP  = {:#018x}", ss.__fp);
+            // Print non-zero GPRs (x0–x28) for more call-site context.
+            for (i, r) in ss.__x.iter().enumerate() {
+                if *r != 0 {
+                    eprintln!("[go-lib SIGBUS] x{i:02} = {r:#018x}");
+                }
+            }
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    if !ctx.is_null() {
+        unsafe {
+            let uc = ctx as *mut libc::ucontext_t;
+            let mc = &(*uc).uc_mcontext;
+            eprintln!("[go-lib SIGBUS] PC  = {:#018x}", mc.pc);
+            eprintln!("[go-lib SIGBUS] SP  = {:#018x}", mc.sp);
+            eprintln!("[go-lib SIGBUS] LR  = {:#018x}", mc.regs[30]);
+            for (i, r) in mc.regs.iter().enumerate() {
+                if *r != 0 {
+                    eprintln!("[go-lib SIGBUS] x{i:02} = {r:#018x}");
+                }
+            }
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    if !ctx.is_null() {
+        unsafe {
+            let uc  = ctx as *mut libc::ucontext_t;
+            let rip = (*uc).uc_mcontext.gregs[libc::REG_RIP as usize];
+            let rsp = (*uc).uc_mcontext.gregs[libc::REG_RSP as usize];
+            eprintln!("[go-lib SIGBUS] RIP = {rip:#018x}");
+            eprintln!("[go-lib SIGBUS] RSP = {rsp:#018x}");
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    if !ctx.is_null() {
+        unsafe {
+            let uc = ctx as *mut libc::ucontext_t;
+            let ss = &(*(*uc).uc_mcontext).__ss;
+            eprintln!("[go-lib SIGBUS] RIP = {:#018x}", ss.__rip);
+            eprintln!("[go-lib SIGBUS] RSP = {:#018x}", ss.__rsp);
+        }
+    }
+
+    // force_capture() captures regardless of RUST_BACKTRACE.
+    let bt = std::backtrace::Backtrace::force_capture();
+    eprintln!("[go-lib SIGBUS] backtrace:\n{bt}");
+
+    unsafe { libc::abort() };
+}
+
+// ---------------------------------------------------------------------------
+// Windows VEH — vectored exception handler for STATUS_ACCESS_VIOLATION
+// ---------------------------------------------------------------------------
+
+/// Guard against recursive exceptions inside the VEH itself.
+#[cfg(windows)]
+static VEH_HANDLING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Windows kernel32 imports for the VEH.
+#[cfg(windows)]
+mod win_veh_sys {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        /// Register a vectored exception handler.
+        /// `first_handler = 1` places it before all SEH handlers.
+        pub fn AddVectoredExceptionHandler(
+            FirstHandler:    u32,
+            VectoredHandler: unsafe extern "system" fn(*mut u8) -> i32,
+        ) -> *mut u8;
+
+        /// Return the standard-error file handle (STD_ERROR_HANDLE = 0xFFFFFFF4).
+        pub fn GetStdHandle(nStdHandle: u32) -> *mut u8;
+
+        /// Synchronous write to a file handle.  Safe to call from a VEH
+        /// because it does not allocate heap memory.
+        pub fn WriteFile(
+            hFile:                  *mut u8,
+            lpBuffer:               *const u8,
+            nNumberOfBytesToWrite:  u32,
+            lpNumberOfBytesWritten: *mut u32,
+            lpOverlapped:           *mut u8,
+        ) -> i32;
+
+        /// Flush all pending writes on a file handle (drains the pipe buffer
+        /// so data is readable by the parent process before we terminate).
+        pub fn FlushFileBuffers(hFile: *mut u8) -> i32;
+
+        /// Return a pseudo-handle for the current process.
+        pub fn GetCurrentProcess() -> *mut u8;
+
+        /// Terminate the process immediately — does NOT run atexit/DLL detach
+        /// hooks, which makes it safe to call from inside a VEH where locks
+        /// may be held.
+        pub fn TerminateProcess(hProcess: *mut u8, uExitCode: u32) -> i32;
+
+        /// Create or open a file.  Used to write crash diagnostics to disk so
+        /// they survive pipe teardown when the process exits.
+        pub fn CreateFileW(
+            lpFileName:            *const u16,
+            dwDesiredAccess:       u32,
+            dwShareMode:           u32,
+            lpSecurityAttributes:  *mut u8,
+            dwCreationDisposition: u32,
+            dwFlagsAndAttributes:  u32,
+            hTemplateFile:         *mut u8,
+        ) -> *mut u8;
+
+        /// Close a kernel object handle.
+        pub fn CloseHandle(hObject: *mut u8) -> i32;
+
+        /// Sleep for `dwMilliseconds` milliseconds.  Called before
+        /// `TerminateProcess` to give the parent process (cargo) time to drain
+        /// the stderr pipe and capture the VEH output in CI logs.
+        pub fn Sleep(dwMilliseconds: u32);
+    }
+}
+
+/// Write a static byte slice to a Windows HANDLE using WriteFile.
+///
+/// Async-signal-safe: no heap allocation, no Rust I/O locks.
+#[cfg(windows)]
+unsafe fn veh_write(h: *mut u8, s: &[u8]) {
+    let mut n = 0u32;
+    unsafe {
+        win_veh_sys::WriteFile(h, s.as_ptr(), s.len() as u32, &mut n,
+                               core::ptr::null_mut());
+    }
+}
+
+/// Open (or create-and-append to) the VEH crash file and return its HANDLE.
+///
+/// Path: `.\go-lib-crash-veh.txt` (relative to the working directory —
+/// in CI this lands in `D:\a\go-lib\go-lib\` next to the binary).
+///
+/// Opening with `FILE_APPEND_DATA` causes every `WriteFile` call to append
+/// to the end of the file regardless of the current file pointer, so both
+/// the VEH-install marker and a subsequent crash dump accumulate in the
+/// same file without overwriting each other.
+///
+/// Returns `INVALID_HANDLE_VALUE` on failure so callers can skip file writes.
+#[cfg(windows)]
+unsafe fn veh_open_crash_file() -> *mut u8 {
+    // UTF-16LE: ".\go-lib-crash-veh.txt\0"
+    const PATH: &[u16] = &[
+        b'.' as u16, b'\\' as u16,
+        b'g' as u16, b'o' as u16, b'-' as u16, b'l' as u16, b'i' as u16,
+        b'b' as u16, b'-' as u16, b'c' as u16, b'r' as u16, b'a' as u16,
+        b's' as u16, b'h' as u16, b'-' as u16, b'v' as u16, b'e' as u16,
+        b'h' as u16, b'.' as u16, b't' as u16, b'x' as u16, b't' as u16,
+        0u16, // NUL terminator
+    ];
+    // FILE_APPEND_DATA (0x4) alone — every WriteFile goes to the end of file.
+    // Using only FILE_APPEND_DATA (not GENERIC_WRITE) prevents accidental
+    // truncation and allows multiple opens (install marker + crash dump) to
+    // accumulate in the same file.
+    const FILE_APPEND_DATA:     u32 = 0x0000_0004;
+    const FILE_SHARE_READ:      u32 = 0x0000_0001;
+    const OPEN_ALWAYS:          u32 = 4; // create if absent, open if present
+    const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+
+    unsafe {
+        win_veh_sys::CreateFileW(
+            PATH.as_ptr(),
+            FILE_APPEND_DATA,
+            FILE_SHARE_READ,
+            core::ptr::null_mut(),
+            OPEN_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL,
+            core::ptr::null_mut(),
+        )
+    }
+}
+
+/// Write `val` as `0xXXXXXXXXXXXXXXXX\r\n` to `h`.
+///
+/// Uses only stack-allocated storage — safe from a VEH.
+#[cfg(windows)]
+unsafe fn veh_write_hex(h: *mut u8, val: u64) {
+    const HEX: &[u8] = b"0123456789abcdef";
+    // "0x" + 16 hex digits + "\r\n" = 20 bytes
+    let mut buf = [b'0'; 20];
+    buf[0] = b'0'; buf[1] = b'x';
+    for i in 0..16usize {
+        buf[17 - i] = HEX[((val >> (i * 4)) & 0xf) as usize];
+    }
+    buf[18] = b'\r'; buf[19] = b'\n';
+    let mut n = 0u32;
+    unsafe {
+        win_veh_sys::WriteFile(h, buf.as_ptr(), 20, &mut n,
+                               core::ptr::null_mut());
+    }
+}
+
+/// Install a Vectored Exception Handler that catches `STATUS_ACCESS_VIOLATION`,
+/// prints diagnostics (faulting address, fault target, RSP/RIP from the
+/// interrupted CONTEXT, and a Rust backtrace), then exits.
+///
+/// This is the Windows equivalent of the Unix SIGBUS/SIGSEGV handlers and
+/// gives us the crash location we need to diagnose scheduler bugs.
+///
+/// # Safety
+/// Call once during `schedinit`.
+#[cfg(windows)]
+pub(crate) fn install_windows_veh() {
+    unsafe {
+        win_veh_sys::AddVectoredExceptionHandler(1, windows_veh_handler);
+
+        // Write an installation marker to both stderr and the crash file so we
+        // can verify in CI that the VEH was registered before any crash.
+        let stderr = win_veh_sys::GetStdHandle(0xFFFF_FFF4u32); // STD_ERROR_HANDLE
+        let marker = b"[go-lib] VEH installed\r\n";
+        let mut n = 0u32;
+        win_veh_sys::WriteFile(stderr, marker.as_ptr(), marker.len() as u32,
+                               &mut n, core::ptr::null_mut());
+        win_veh_sys::FlushFileBuffers(stderr);
+
+        let fh = veh_open_crash_file();
+        const INVALID_HANDLE: *mut u8 = usize::MAX as *mut u8;
+        if !fh.is_null() && fh != INVALID_HANDLE {
+            win_veh_sys::WriteFile(fh, marker.as_ptr(), marker.len() as u32,
+                                   &mut n, core::ptr::null_mut());
+            win_veh_sys::CloseHandle(fh);
+        }
+    }
+}
+
+/// Vectored Exception Handler: print crash diagnostics and exit.
+///
+/// Uses **only** `WriteFile` (no heap allocation, no Rust I/O locks) so it
+/// cannot deadlock inside the exception context.  `eprintln!` + backtrace
+/// capture were removed because they both allocate and could acquire locks
+/// already held by the crashing thread, causing a deadlock before any output
+/// is written.
+///
+/// ## EXCEPTION_POINTERS layout (x64)
+/// ```text
+/// +0  *EXCEPTION_RECORD
+/// +8  *CONTEXT
+/// ```
+///
+/// ## EXCEPTION_RECORD layout (x64)
+/// ```text
+/// +0   ExceptionCode      (u32)
+/// +4   ExceptionFlags     (u32)
+/// +8   *ExceptionRecord   (usize — chained record)
+/// +16  ExceptionAddress   (usize — faulting instruction)
+/// +24  NumberParameters   (u32)
+/// +28  _pad               (u32)
+/// +32  ExceptionInformation[0..14] (usize each)
+///        [0] = 0 (read) | 1 (write) | 8 (DEP)
+///        [1] = inaccessible target address
+/// ```
+///
+/// ## CONTEXT offsets for x64 (from WinNT.h — stable across Windows versions)
+/// ```text
+/// +120 Rax   +128 Rcx   +136 Rdx   +144 Rbx
+/// +152 Rsp   +160 Rbp   +168 Rsi   +176 Rdi
+/// +184 R8  … +240 R15
+/// +248 Rip
+/// ```
+#[cfg(windows)]
+unsafe extern "system" fn windows_veh_handler(ep: *mut u8) -> i32 {
+    const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+    const STATUS_STACK_OVERFLOW:   u32 = 0xC000_00FD;
+    const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
+    const STD_ERROR_HANDLE: u32 = 0xFFFF_FFF4; // ((DWORD)-12)
+
+    // Prevent re-entry (e.g. if a WriteFile call itself faults).
+    if VEH_HANDLING.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    let h = unsafe { win_veh_sys::GetStdHandle(STD_ERROR_HANDLE) };
+
+    // --- Decode EXCEPTION_POINTERS ---
+    // struct EXCEPTION_POINTERS { *EXCEPTION_RECORD; *CONTEXT }
+    // Each field is a native pointer (8 bytes on x64).
+    let ptrs    = ep as *const usize;
+    let er_ptr  = unsafe { *ptrs       } as *const u8; // EXCEPTION_RECORD*
+    let ctx_ptr = unsafe { *ptrs.add(1) } as *const u8; // CONTEXT*
+
+    // --- Filter by exception code ---
+    let code: u32 = unsafe { (er_ptr as *const u32).read() };
+    if code != STATUS_ACCESS_VIOLATION && code != STATUS_STACK_OVERFLOW {
+        VEH_HANDLING.store(false, std::sync::atomic::Ordering::Release);
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    // --- Emit diagnostics (WriteFile only — no heap, no Rust locks) ---
+    unsafe {
+        // Header
+        veh_write(h, b"[go-lib VEH] exception code   : ");
+        veh_write_hex(h, code as u64);
+
+        // Faulting instruction address
+        let instr: usize = *(er_ptr.add(16) as *const usize);
+        veh_write(h, b"[go-lib VEH] ExceptionAddress : ");
+        veh_write_hex(h, instr as u64);
+
+        // Fault type and target address (AV parameters)
+        let n_params: u32 = *(er_ptr.add(24) as *const u32);
+        if n_params >= 2 {
+            let ft: usize = *(er_ptr.add(32) as *const usize);
+            let fa: usize = *(er_ptr.add(40) as *const usize);
+            veh_write(h, b"[go-lib VEH] fault_type (0=rd,1=wr,8=DEP) : ");
+            veh_write_hex(h, ft as u64);
+            veh_write(h, b"[go-lib VEH] fault_addr  : ");
+            veh_write_hex(h, fa as u64);
+        }
+
+        // Key registers from CONTEXT (x64 stable offsets)
+        let rip: u64 = *(ctx_ptr.add(248) as *const u64);
+        let rsp: u64 = *(ctx_ptr.add(152) as *const u64);
+        let rbp: u64 = *(ctx_ptr.add(160) as *const u64);
+        let rax: u64 = *(ctx_ptr.add(120) as *const u64);
+        let rcx: u64 = *(ctx_ptr.add(128) as *const u64);
+        let rdx: u64 = *(ctx_ptr.add(136) as *const u64);
+        let rbx: u64 = *(ctx_ptr.add(144) as *const u64);
+        let rsi: u64 = *(ctx_ptr.add(168) as *const u64);
+        let rdi: u64 = *(ctx_ptr.add(176) as *const u64);
+        let r8:  u64 = *(ctx_ptr.add(184) as *const u64);
+        let r9:  u64 = *(ctx_ptr.add(192) as *const u64);
+
+        veh_write(h, b"[go-lib VEH] RIP : "); veh_write_hex(h, rip);
+        veh_write(h, b"[go-lib VEH] RSP : "); veh_write_hex(h, rsp);
+        veh_write(h, b"[go-lib VEH] RBP : "); veh_write_hex(h, rbp);
+        veh_write(h, b"[go-lib VEH] RAX : "); veh_write_hex(h, rax);
+        veh_write(h, b"[go-lib VEH] RCX : "); veh_write_hex(h, rcx);
+        veh_write(h, b"[go-lib VEH] RDX : "); veh_write_hex(h, rdx);
+        veh_write(h, b"[go-lib VEH] RBX : "); veh_write_hex(h, rbx);
+        veh_write(h, b"[go-lib VEH] RSI : "); veh_write_hex(h, rsi);
+        veh_write(h, b"[go-lib VEH] RDI : "); veh_write_hex(h, rdi);
+        veh_write(h, b"[go-lib VEH] R8  : "); veh_write_hex(h, r8);
+        veh_write(h, b"[go-lib VEH] R9  : "); veh_write_hex(h, r9);
+
+        // Mirror diagnostics to stdout (in case stderr pipe is broken in CI).
+        let stdout = win_veh_sys::GetStdHandle(0xFFFF_FFF5u32); // STD_OUTPUT_HANDLE = -11
+        veh_write(stdout, b"[go-lib VEH] exception code   : ");
+        veh_write_hex(stdout, code as u64);
+        let instr2: usize = *(er_ptr.add(16) as *const usize);
+        veh_write(stdout, b"[go-lib VEH] ExceptionAddress : ");
+        veh_write_hex(stdout, instr2 as u64);
+        let rip2: u64 = *(ctx_ptr.add(248) as *const u64);
+        let rsp2: u64 = *(ctx_ptr.add(152) as *const u64);
+        veh_write(stdout, b"[go-lib VEH] RIP : "); veh_write_hex(stdout, rip2);
+        veh_write(stdout, b"[go-lib VEH] RSP : "); veh_write_hex(stdout, rsp2);
+        win_veh_sys::FlushFileBuffers(stdout);
+
+        // Write ALL diagnostics to a crash file that survives pipe teardown.
+        // In CI the file lands at <cwd>\go-lib-crash-veh.txt.
+        let fh = veh_open_crash_file();
+        const INVALID_HANDLE: *mut u8 = usize::MAX as *mut u8;
+        if !fh.is_null() && fh != INVALID_HANDLE {
+            veh_write(fh, b"[go-lib VEH] exception code   : ");
+            veh_write_hex(fh, code as u64);
+            let instr3: usize = *(er_ptr.add(16) as *const usize);
+            veh_write(fh, b"[go-lib VEH] ExceptionAddress : ");
+            veh_write_hex(fh, instr3 as u64);
+            if n_params >= 2 {
+                let ft2: usize = *(er_ptr.add(32) as *const usize);
+                let fa2: usize = *(er_ptr.add(40) as *const usize);
+                veh_write(fh, b"[go-lib VEH] fault_type : ");
+                veh_write_hex(fh, ft2 as u64);
+                veh_write(fh, b"[go-lib VEH] fault_addr : ");
+                veh_write_hex(fh, fa2 as u64);
+            }
+            let rip3: u64 = *(ctx_ptr.add(248) as *const u64);
+            let rsp3: u64 = *(ctx_ptr.add(152) as *const u64);
+            let rbp3: u64 = *(ctx_ptr.add(160) as *const u64);
+            let rax3: u64 = *(ctx_ptr.add(120) as *const u64);
+            let rcx3: u64 = *(ctx_ptr.add(128) as *const u64);
+            let rdx3: u64 = *(ctx_ptr.add(136) as *const u64);
+            veh_write(fh, b"[go-lib VEH] RIP : "); veh_write_hex(fh, rip3);
+            veh_write(fh, b"[go-lib VEH] RSP : "); veh_write_hex(fh, rsp3);
+            veh_write(fh, b"[go-lib VEH] RBP : "); veh_write_hex(fh, rbp3);
+            veh_write(fh, b"[go-lib VEH] RAX : "); veh_write_hex(fh, rax3);
+            veh_write(fh, b"[go-lib VEH] RCX : "); veh_write_hex(fh, rcx3);
+            veh_write(fh, b"[go-lib VEH] RDX : "); veh_write_hex(fh, rdx3);
+            win_veh_sys::CloseHandle(fh);
+        }
+
+        // Flush the stderr pipe before exiting so the parent process (cargo)
+        // can read all bytes written above.
+        win_veh_sys::FlushFileBuffers(h);
+
+        // Sleep briefly to give cargo's pipe reader time to drain the buffer.
+        // Without this, TerminateProcess can race with the parent's read loop.
+        win_veh_sys::Sleep(500);
+
+        // TerminateProcess is safer than ExitProcess inside a VEH: it skips
+        // all atexit/DLL-detach hooks that might try to acquire locks already
+        // held by the crashing thread.
+        win_veh_sys::TerminateProcess(win_veh_sys::GetCurrentProcess(), code);
+    }
+
+    // Unreachable — TerminateProcess does not return for the current process.
+    EXCEPTION_CONTINUE_SEARCH
+}
+
+// ---------------------------------------------------------------------------
 // Goroutine creation — goroutine_entry, goexit_trampoline, new_goroutine
 // ---------------------------------------------------------------------------
 
@@ -931,12 +1389,21 @@ pub(crate) fn schedinit(nprocs: i32) {
         unsafe { spawn_m(id, p_ptr) };
     }
 
-    // Install SIGSEGV / SIGURG handlers (Unix only — Windows has no POSIX
-    // signals; proactive growth and cooperative preemption are used there).
+    // Install SIGSEGV / SIGURG / SIGBUS handlers (Unix only — Windows has no
+    // POSIX signals; proactive growth and cooperative preemption are used there).
     #[cfg(not(windows))]
     unsafe { install_sigsegv_handler() };
     #[cfg(not(windows))]
     unsafe { install_sigurg_handler() };
+    // SIGBUS handler: print PC/SP/LR + backtrace before aborting, so crashes
+    // in background scheduler threads produce actionable diagnostics in CI.
+    #[cfg(not(windows))]
+    unsafe { install_sigbus_handler() };
+    // VEH: catch STATUS_ACCESS_VIOLATION on Windows and print diagnostics.
+    // This gives us the faulting RIP/RSP and a Rust backtrace so we can
+    // identify which scheduler path is crashing.
+    #[cfg(windows)]
+    install_windows_veh();
 
     // Start the background monitor thread (sysmon).
     start_sysmon();

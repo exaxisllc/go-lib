@@ -6,6 +6,7 @@ on:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -18,6 +19,7 @@ jobs:
     name: Build & Test
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false   # always run all platforms; don't cancel Windows when macOS fails
       matrix:
         os: [ubuntu-latest, macOS-latest, windows-latest]
         toolchain: [stable]
@@ -40,7 +42,24 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: cargo test
-        run: cargo test
+        # --nocapture: print test output immediately so crash context is
+        # visible in the job log even when the process exits abnormally
+        # (e.g. STATUS_ACCESS_VIOLATION on Windows).
+        run: cargo test -- --nocapture
+
+      - name: Print Windows VEH crash file (if present)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        # The VEH writes .\go-lib-crash-veh.txt on crash.  Print it so the
+        # diagnostics appear in the CI log even when the test binary exits via
+        # TerminateProcess (which may race with pipe drain).
+        run: |
+          if (Test-Path "go-lib-crash-veh.txt") {
+            Write-Host "=== go-lib-crash-veh.txt ==="
+            Get-Content "go-lib-crash-veh.txt"
+          } else {
+            Write-Host "(no crash file — process either did not crash or VEH was not reached)"
+          }
 
       - name: cargo doc (no deps, no-run)
         run: cargo doc --no-deps
