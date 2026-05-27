@@ -508,12 +508,10 @@ mod tests {
         run_impl(|| {
             let (tx, rx) = chan::<i32>(1);
             tx.send(7);
-            let mut got = -1_i32;
             select! {
-                recv(rx) -> v => { got = v.unwrap(); }
+                recv(rx) -> v => { assert_eq!(v.unwrap(), 7); }
                 default      => { panic!("default should not fire"); }
             }
-            assert_eq!(got, 7);
         });
     }
 
@@ -522,12 +520,10 @@ mod tests {
     fn select_default_when_empty() {
         run_impl(|| {
             let (_tx, rx) = chan::<i32>(1);
-            let mut took_default = false;
             select! {
                 recv(rx) -> _v => { panic!("should not recv"); }
-                default        => { took_default = true; }
+                default        => {} // default arm correctly taken
             }
-            assert!(took_default);
         });
     }
 
@@ -538,13 +534,11 @@ mod tests {
             let (tx1, rx1) = chan::<i32>(1);
             let (_tx2, rx2) = chan::<i32>(1);
             tx1.send(42);
-            let mut winner = -1_i32;
             select! {
-                recv(rx1) -> v => { winner = v.unwrap(); }
+                recv(rx1) -> v  => { assert_eq!(v.unwrap(), 42); }
                 recv(rx2) -> _v => { panic!("rx2 should not fire"); }
-                default => {}
+                default         => { panic!("unexpected default — rx1 should have been ready"); }
             }
-            assert_eq!(winner, 42);
         });
     }
 
@@ -553,12 +547,10 @@ mod tests {
     fn select_send_default_space_available() {
         run_impl(|| {
             let (tx, rx) = chan::<i32>(1);
-            let mut sent = false;
             select! {
-                send(tx, 99_i32) => { sent = true; }
+                send(tx, 99_i32) => {} // send arm correctly taken
                 default          => { panic!("default should not fire"); }
             }
-            assert!(sent);
             assert_eq!(rx.recv(), Some(99));
         });
     }
@@ -569,12 +561,10 @@ mod tests {
         run_impl(|| {
             let (tx, rx) = chan::<i32>(1);
             tx.send(1);   // fill the buffer
-            let mut took_default = false;
             select! {
-                send(tx, 2_i32) => { panic!("should not send"); }
-                default         => { took_default = true; }
+                send(tx, 2_i32) => { panic!("should not send — buffer is full"); }
+                default         => {} // default arm correctly taken
             }
-            assert!(took_default);
             assert_eq!(rx.recv(), Some(1));
         });
     }
@@ -669,11 +659,9 @@ mod tests {
         run_impl(|| {
             let (tx, rx) = chan::<i32>(0);
             tx.close();
-            let mut ok_flag = true;
             select! {
-                recv(rx) -> v => { ok_flag = v.is_some(); }
+                recv(rx) -> v => { assert!(v.is_none(), "should be None for closed channel"); }
             }
-            assert!(!ok_flag, "should be None for closed channel");
         });
     }
 }

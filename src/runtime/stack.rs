@@ -190,7 +190,7 @@ pub(crate) unsafe fn stack_alloc_size(size: usize) -> Result<Stack, &'static str
             return Err("stack_alloc_size: mprotect guard page failed");
         }
         let base_addr = base as usize;
-        return Ok(Stack { lo: base_addr + ps, hi: base_addr + total });
+        Ok(Stack { lo: base_addr + ps, hi: base_addr + total })
     }
 
     #[cfg(windows)]
@@ -213,7 +213,7 @@ pub(crate) unsafe fn stack_alloc_size(size: usize) -> Result<Stack, &'static str
             return Err("stack_alloc_size: VirtualProtect guard page failed");
         }
         let base_addr = base as usize;
-        return Ok(Stack { lo: base_addr + ps, hi: base_addr + total });
+        Ok(Stack { lo: base_addr + ps, hi: base_addr + total })
     }
 }
 

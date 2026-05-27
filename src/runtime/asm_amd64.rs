@@ -70,7 +70,6 @@ use super::g::{
 /// - `rcx` = buf (*mut Gobuf, first arg)
 ///
 /// Common: `rax` = scratch (target pc), `rbp` / `rsp` restored from Gobuf.
-
 // System V AMD64 ABI (Linux, macOS): first argument in rdi.
 #[cfg(not(windows))]
 #[unsafe(naked)]
@@ -127,7 +126,6 @@ unsafe extern "C" fn gogo_asm(buf: *mut Gobuf) -> ! {
 ///
 /// In both ABIs `[rsp]` on entry holds the return address pushed by the
 /// `call mcall_asm` instruction.  Caller SP = `rsp + 8`.
-
 // System V AMD64 ABI (Linux, macOS): args in rdi, rsi, rdx, rcx.
 #[cfg(not(windows))]
 #[unsafe(naked)]
