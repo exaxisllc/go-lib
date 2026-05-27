@@ -47,7 +47,7 @@ use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, Ordering::*};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use super::g::{casgstatus, current_g, set_current_g, G, GDEAD, GPREEMPTED, GRUNNABLE, GRUNNING, STACK_GUARD};
+use super::g::{casgstatus, current_g, readgstatus, set_current_g, G, GDEAD, GPREEMPTED, GRUNNABLE, GRUNNING, STACK_GUARD};
 use super::m::{current_m, M};
 use super::p::{GlobalRunQueue, P, PIDLE, PRUNNING};
 use super::stack::{grow_stack_if_needed, stack_alloc};
@@ -495,6 +495,19 @@ unsafe extern "C" fn sigurg_handler(
 ) {
     let gp = current_g();
     if !gp.is_null() && unsafe { (*gp).preempt } {
+        // Only redirect if the goroutine is actually GRUNNING.
+        //
+        // SIGURG can arrive while gp is in GWAITING (gopark transition window),
+        // GSYSCALL (inside entersyscall), or GPREEMPTED.  Calling
+        // redirect_to_async_preempt in those states injects the trampoline into
+        // the wrong execution context, causing preemptm to call
+        // casgstatus(gp, GRUNNING, GPREEMPTED) on a G that is not GRUNNING
+        // which spins forever.
+        //
+        // Mirrors Go's wantAsyncPreempt() which gates on readgstatus == _Grunning.
+        if unsafe { readgstatus(gp) } != GRUNNING {
+            return; // not at an async-safe preemption point — ignore
+        }
         // Redirect goroutine to the preempt trampoline.
         unsafe { redirect_to_async_preempt(gp, ctx) };
         return;
@@ -577,6 +590,16 @@ unsafe fn redirect_to_async_preempt(gp: *mut G, ctx: *mut libc::c_void) {
 pub(crate) unsafe extern "C" fn async_preempt2() {
     let gp = current_g();
     if gp.is_null() {
+        return;
+    }
+
+    // Defensive second check: the goroutine must still be GRUNNING when we
+    // reach here.  sigurg_handler already gates on readgstatus == GRUNNING,
+    // but a narrow race can occur on multi-core systems between the signal
+    // check and the trampoline executing.  Bailing here prevents preemptm
+    // from calling casgstatus(gp, GRUNNING, GPREEMPTED) on a non-GRUNNING G
+    // which would spin forever in the CAS retry loop.
+    if unsafe { readgstatus(gp) } != GRUNNING {
         return;
     }
 
