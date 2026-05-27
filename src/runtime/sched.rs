@@ -11,7 +11,7 @@
 //! trampoline calls `goexit0` back on g0, which cleans up the G and re-enters
 //! `schedule`.
 //!
-//! ## v2.0 additions
+//! ## v0.2.0 additions
 //!
 //! ### Stack-growth checkpoint (`execute`)
 //! Before every `gogo`, `execute` calls [`stack::grow_stack_if_needed`] to
@@ -1135,7 +1135,7 @@ pub fn gomaxprocs() -> usize {
 /// **Decreasing** — updates the counter so `gomaxprocs()` returns the new
 /// value; excess Ps remain in `allp` but their Ms will not be recruited for
 /// new goroutines until GOMAXPROCS is increased again.  Work-stealing
-/// continues across the full `allp` slice for v1.1.
+/// continues across the full `allp` slice for v0.2.0.
 ///
 /// Has no effect before the scheduler is initialised (before `run()`).
 pub fn set_gomaxprocs(n: usize) -> usize {

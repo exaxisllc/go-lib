@@ -9,10 +9,10 @@ sub-tasks, and any inter-step prerequisites.
 ## Suggested release sequencing
 
 ```
-v1.1  Steps 1, 2, 6, 7   — pure library / scheduler API, low risk
-v1.2  Step 8 (Option A)   — loom integration, CI hardening
-v2.0  Steps 3, 4, 5       — assembly + kernel APIs, ship together
-v2.1  Step 8 (Option B)   — TSan CI pass post v2.0
+v0.2.0  Steps 1, 2, 6, 7   — pure library / scheduler API, low risk
+v0.2.0  Step 8 (Option A)   — loom integration, CI hardening
+v0.2.0  Steps 3, 4, 5       — assembly + kernel APIs, ship together
+v0.3.1  Step 8 (Option B)   — TSan CI pass post v0.2.0
 ```
 
 Steps 3 → 4 → 5 form a natural dependency chain:
@@ -28,7 +28,7 @@ Steps 3 → 4 → 5 form a natural dependency chain:
 ## Step 1 — `go_lib::sync::Cond`
 
 **Effort:** small  
-**Release:** v1.1
+**Release:** v0.2.0
 
 Port Go's `sync.Cond` as a goroutine-aware condition variable.  Using
 `std::sync::Condvar` directly would block an OS thread (M), starving other
@@ -56,7 +56,7 @@ goroutines sharing that M.
 ## Step 2 — Runtime-adjustable `GOMAXPROCS`
 
 **Effort:** medium  
-**Release:** v1.1
+**Release:** v0.2.0
 
 Allow the number of Ps (and thus the degree of true parallelism) to be changed
 at runtime, matching Go's `runtime.GOMAXPROCS(n)`.
@@ -84,7 +84,7 @@ at runtime, matching Go's `runtime.GOMAXPROCS(n)`.
 ## Step 3 — Goroutine stack growth (`morestack` / `copystack`)
 
 **Effort:** large  
-**Release:** v2.0  
+**Release:** v0.2.0  
 **Prerequisite for:** Step 4
 
 This is the most invasive change.  Every goroutine currently gets a fixed 64 KiB
@@ -145,7 +145,7 @@ that relocates live stack frames.
 ## Step 4 — Async (signal-based) preemption
 
 **Effort:** large  
-**Release:** v2.0  
+**Release:** v0.2.0  
 **Prerequisite:** Step 3
 
 Currently `sysmon` sets `g.preempt = true` but a goroutine is not actually
@@ -190,7 +190,7 @@ injects a signal into the OS thread carrying the goroutine.
 ## Step 5 — Netpoll / async I/O
 
 **Effort:** large  
-**Release:** v2.0  
+**Release:** v0.2.0  
 **Prerequisite:** Step 4 recommended (not strictly required)
 
 Add a `netpoll` subsystem so goroutines can wait on file-descriptor readiness
@@ -238,7 +238,7 @@ network operations.
 ## Step 6 — `panic` / `recover` across goroutine boundaries
 
 **Effort:** medium  
-**Release:** v1.1
+**Release:** v0.2.0
 
 Currently a Rust panic inside a goroutine aborts the process.  This step gives
 each goroutine its own panic boundary and exposes a `recover()`-like API.
@@ -280,7 +280,7 @@ each goroutine its own panic boundary and exposes a `recover()`-like API.
 ## Step 7 — `go_lib::context`
 
 **Effort:** small  
-**Release:** v1.1
+**Release:** v0.2.0
 
 A pure-library port of Go's `context` package.  No scheduler changes required.
 
@@ -330,7 +330,7 @@ A pure-library port of Go's `context` package.  No scheduler changes required.
 ## Step 8 — Race detector
 
 **Effort:** medium  
-**Release:** v1.2 (Option A) / v2.1 (Option B)
+**Release:** v0.2.0 (Option A) / v0.3.1 (Option B)
 
 ### Option A — `loom` integration (near-term, nightly not required)
 
@@ -348,7 +348,7 @@ A pure-library port of Go's `context` package.  No scheduler changes required.
 5. Run `loom` with `LOOM_MAX_PERMUTATIONS=10000` on the channel, WaitGroup, and
    Cond tests.
 
-### Option B — ThreadSanitizer (v2.0, requires nightly)
+### Option B — ThreadSanitizer (v0.2.0, requires nightly)
 
 1. Add a CI matrix entry using the nightly toolchain:
    ```yaml
@@ -359,7 +359,7 @@ A pure-library port of Go's `context` package.  No scheduler changes required.
 3. Annotate known-benign intentional races (e.g., the `g.preempt` flag written
    by sysmon without a lock) with `__tsan_acquire` / `__tsan_release` annotations
    via `libc` bindings, matching how the Go runtime annotates its own races.
-4. Fix any real races TSan surfaces before shipping v2.0.
+4. Fix any real races TSan surfaces before shipping v0.2.0.
 
 ---
 

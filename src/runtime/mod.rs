@@ -4,7 +4,7 @@
 //! Ported from `src/runtime/` in <https://github.com/golang/go>.  Each submodule
 //! maps to the Go source file(s) shown below.
 //!
-//! ## v2.0 additions
+//! ## v0.2.0 additions
 //!
 //! | New module / symbol | Purpose |
 //! |----|-----|

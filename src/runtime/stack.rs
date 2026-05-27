@@ -2,7 +2,7 @@
 //! Goroutine stack allocator and growth machinery — ported from
 //! `runtime/stack.go`, `runtime/signal_unix.go`.
 //!
-//! ## v2.0 — dynamic stack growth
+//! ## v0.2.0 — dynamic stack growth
 //!
 //! Each goroutine starts with an 8 KiB stack (matching Go's `stackMin`).
 //! The guard page (`PROT_NONE`) immediately below `stack.lo` turns overflows
@@ -190,7 +190,7 @@ pub(crate) unsafe fn stack_alloc_size(size: usize) -> Result<Stack, &'static str
             return Err("stack_alloc_size: mprotect guard page failed");
         }
         let base_addr = base as usize;
-        return Ok(Stack { lo: base_addr + ps, hi: base_addr + total });
+        Ok(Stack { lo: base_addr + ps, hi: base_addr + total })
     }
 
     #[cfg(windows)]
@@ -213,7 +213,7 @@ pub(crate) unsafe fn stack_alloc_size(size: usize) -> Result<Stack, &'static str
             return Err("stack_alloc_size: VirtualProtect guard page failed");
         }
         let base_addr = base as usize;
-        return Ok(Stack { lo: base_addr + ps, hi: base_addr + total });
+        Ok(Stack { lo: base_addr + ps, hi: base_addr + total })
     }
 }
 

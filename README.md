@@ -69,12 +69,12 @@ No `async`, no Tokio, no executor. Every goroutine starts with an 8 KiB stack th
 | Work-stealing across Ps | ✅ |
 | `GOMAXPROCS` env var + runtime adjustment | ✅ |
 | Goroutine panic handler (process does not abort) | ✅ |
-| Dynamic goroutine stack growth (8 KiB → 1 GiB) | ✅ v2.0 |
-| Async preemption via `SIGURG` | ✅ v2.0 |
-| Netpoll — `epoll`/`kqueue`/IOCP I/O integration | ✅ v2.0 |
-| `net::TcpListener` / `net::TcpStream` | ✅ v2.0 |
-| Loom concurrency model checker integration | ✅ v1.2 |
-| CI — standard + loom jobs on every push/PR | ✅ v1.2 |
+| Dynamic goroutine stack growth (8 KiB → 1 GiB) | ✅ v0.2.0 |
+| Async preemption via `SIGURG` | ✅ v0.2.0 |
+| Netpoll — `epoll`/`kqueue`/IOCP I/O integration | ✅ v0.3.0 |
+| `net::TcpListener` / `net::TcpStream` | ✅ v0.2.0 |
+| Loom concurrency model checker integration | ✅ v0.2.0 |
+| CI — standard + loom jobs on every push/PR | ✅ v0.2.0 |
 
 ---
 
