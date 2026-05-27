@@ -47,7 +47,7 @@ use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, Ordering::*};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use super::g::{casgstatus, current_g, set_current_g, G, GDEAD, GPREEMPTED, GRUNNABLE, GRUNNING, STACK_GUARD};
+use super::g::{casgstatus, current_g, readgstatus, set_current_g, G, GDEAD, GPREEMPTED, GRUNNABLE, GRUNNING, STACK_GUARD};
 use super::m::{current_m, M};
 use super::p::{GlobalRunQueue, P, PIDLE, PRUNNING};
 use super::stack::{grow_stack_if_needed, stack_alloc};
@@ -486,6 +486,38 @@ pub(crate) unsafe fn install_sigurg_handler() {
     *PREV_SIGURG.lock().unwrap() = Some(old);
 }
 
+/// Extract the interrupted stack pointer from a signal `ucontext_t`.
+///
+/// Used by `sigurg_handler` to verify the signal arrived while the goroutine
+/// was executing on its own stack rather than on g0's stack (e.g. inside the
+/// `mcall_asm` SP-switch window).
+///
+/// Returns 0 on platforms where we don't have a definition — the caller
+/// treats 0 as "out of bounds", so preemption is conservatively skipped.
+#[cfg(not(windows))]
+#[inline]
+fn ucontext_sp(ctx: *mut libc::c_void) -> usize {
+    let uc = ctx as *mut libc::ucontext_t;
+    unsafe {
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        return (*uc).uc_mcontext.gregs[libc::REG_RSP as usize] as usize;
+
+        #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+        return (*uc).uc_mcontext.sp as usize;
+
+        #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+        return (*(*uc).uc_mcontext).__ss.__rsp as usize;
+
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        return (*(*uc).uc_mcontext).__ss.__sp as usize;
+
+        // Fallback: unknown platform.  Return 0 so the caller skips
+        // preemption rather than potentially corrupting a foreign stack.
+        #[allow(unreachable_code)]
+        0_usize
+    }
+}
+
 /// SIGURG handler: redirect a preemptable goroutine to `async_preempt_trampoline`.
 #[cfg(not(windows))]
 unsafe extern "C" fn sigurg_handler(
@@ -495,6 +527,40 @@ unsafe extern "C" fn sigurg_handler(
 ) {
     let gp = current_g();
     if !gp.is_null() && unsafe { (*gp).preempt } {
+        // Guard 1: goroutine must be GRUNNING.
+        //
+        // SIGURG can arrive while gp is in GWAITING (gopark transition window),
+        // GSYSCALL (inside entersyscall), or GPREEMPTED.  Redirecting in those
+        // states causes preemptm to call casgstatus(gp, GRUNNING, GPREEMPTED)
+        // on a non-GRUNNING G, which spins the CAS loop forever.
+        //
+        // Mirrors Go's wantAsyncPreempt() which gates on readgstatus == _Grunning.
+        if unsafe { readgstatus(gp) } != GRUNNING {
+            return; // not at an async-safe preemption point — ignore
+        }
+
+        // Guard 2: interrupted SP must be within the goroutine's own stack.
+        //
+        // `mcall_asm` first saves the goroutine's registers to g.sched and
+        // then switches SP to g0's stack — but the G status stays GRUNNING
+        // until the mcall target (park_fn / gosched_m) calls casgstatus.
+        // There is therefore a window after the SP switch where Guard 1 passes
+        // but the CPU is actually executing on g0's stack.  Redirecting in that
+        // window makes async_preempt_trampoline write its register-save frame
+        // onto g0's stack instead of the goroutine's stack, corrupting both
+        // stacks and eventually causing a hang or memory corruption.
+        //
+        // Checking that the interrupted SP is within [gp.stack.lo, gp.stack.hi]
+        // closes that window: if we are on g0's stack the SP is outside those
+        // bounds and we skip preemption.
+        //
+        // This mirrors Go's sigctxt.inUserCode() / stackBounds checks.
+        let sp      = ucontext_sp(ctx);
+        let (lo, hi) = unsafe { ((*gp).stack.lo, (*gp).stack.hi) };
+        if sp < lo || sp > hi {
+            return; // not on goroutine's stack — skip preemption
+        }
+
         // Redirect goroutine to the preempt trampoline.
         unsafe { redirect_to_async_preempt(gp, ctx) };
         return;
@@ -577,6 +643,16 @@ unsafe fn redirect_to_async_preempt(gp: *mut G, ctx: *mut libc::c_void) {
 pub(crate) unsafe extern "C" fn async_preempt2() {
     let gp = current_g();
     if gp.is_null() {
+        return;
+    }
+
+    // Defensive second check: the goroutine must still be GRUNNING when we
+    // reach here.  sigurg_handler already gates on readgstatus == GRUNNING,
+    // but a narrow race can occur on multi-core systems between the signal
+    // check and the trampoline executing.  Bailing here prevents preemptm
+    // from calling casgstatus(gp, GRUNNING, GPREEMPTED) on a non-GRUNNING G
+    // which would spin forever in the CAS retry loop.
+    if unsafe { readgstatus(gp) } != GRUNNING {
         return;
     }
 
