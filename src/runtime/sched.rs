@@ -795,10 +795,15 @@ unsafe fn veh_write(h: *mut u8, s: &[u8]) {
     }
 }
 
-/// Open (or create) the VEH crash file and return its HANDLE.
+/// Open (or create-and-append to) the VEH crash file and return its HANDLE.
 ///
 /// Path: `.\go-lib-crash-veh.txt` (relative to the working directory —
 /// in CI this lands in `D:\a\go-lib\go-lib\` next to the binary).
+///
+/// Opening with `FILE_APPEND_DATA` causes every `WriteFile` call to append
+/// to the end of the file regardless of the current file pointer, so both
+/// the VEH-install marker and a subsequent crash dump accumulate in the
+/// same file without overwriting each other.
 ///
 /// Returns `INVALID_HANDLE_VALUE` on failure so callers can skip file writes.
 #[cfg(windows)]
@@ -812,16 +817,19 @@ unsafe fn veh_open_crash_file() -> *mut u8 {
         b'h' as u16, b'.' as u16, b't' as u16, b'x' as u16, b't' as u16,
         0u16, // NUL terminator
     ];
-    const GENERIC_WRITE:       u32 = 0x4000_0000;
-    const FILE_SHARE_READ:     u32 = 0x0000_0001;
-    const OPEN_ALWAYS:         u32 = 4; // create if not exist, open if exists
-    const FILE_APPEND_DATA:    u32 = 0x0000_0004;
+    // FILE_APPEND_DATA (0x4) alone — every WriteFile goes to the end of file.
+    // Using only FILE_APPEND_DATA (not GENERIC_WRITE) prevents accidental
+    // truncation and allows multiple opens (install marker + crash dump) to
+    // accumulate in the same file.
+    const FILE_APPEND_DATA:     u32 = 0x0000_0004;
+    const FILE_SHARE_READ:      u32 = 0x0000_0001;
+    const OPEN_ALWAYS:          u32 = 4; // create if absent, open if present
     const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
 
     unsafe {
         win_veh_sys::CreateFileW(
             PATH.as_ptr(),
-            GENERIC_WRITE | FILE_APPEND_DATA,
+            FILE_APPEND_DATA,
             FILE_SHARE_READ,
             core::ptr::null_mut(),
             OPEN_ALWAYS,
