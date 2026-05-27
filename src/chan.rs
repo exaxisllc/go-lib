@@ -718,7 +718,17 @@ mod tests {
                 }
             });
 
-            for _ in 0..500 { crate::gosched(); }
+            // A wall-clock deadline is robust across CI runner speeds and
+            // build profiles (debug, coverage/nightly) where frame sizes and
+            // instrumentation overhead can make goroutines run much slower.
+            let expected = N * (N - 1) / 2;
+            let deadline =
+                std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while sum2.load(Ordering::Acquire) != expected
+                && std::time::Instant::now() < deadline
+            {
+                crate::gosched();
+            }
         });
 
         assert_eq!(sum.load(Ordering::Acquire), N * (N - 1) / 2);
