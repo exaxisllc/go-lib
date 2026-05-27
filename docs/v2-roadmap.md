@@ -1,18 +1,23 @@
 # go-lib v2 Roadmap — Addressing Known Limitations
 
+> **Status (v0.3.1):** All steps are complete.  Steps 1–8A shipped across
+> v0.2.0 → v0.3.1.  The only remaining limitation is the race detector
+> (Step 8B / ThreadSanitizer), which requires nightly Rust and is deferred.
+
 This document is the step-by-step implementation plan for the eight known
 limitations listed in `README.md`.  Each step includes a scope description,
 sub-tasks, and any inter-step prerequisites.
 
 ---
 
-## Suggested release sequencing
+## Actual release sequencing
 
 ```
-v0.2.0  Steps 1, 2, 6, 7   — pure library / scheduler API, low risk
-v0.2.0  Step 8 (Option A)   — loom integration, CI hardening
-v0.2.0  Steps 3, 4, 5       — assembly + kernel APIs, ship together
-v0.3.1  Step 8 (Option B)   — TSan CI pass post v0.2.0
+v0.2.0  Steps 1, 2, 3, 4, 5, 6, 7, 8A — all shipped together
+v0.3.0  Windows IOCP backend (netpoll Step 5 completion)
+v0.3.1  G state machine: casgstatus, GSYSCALL, GCOPYSTACK, GPREEMPTED,
+        GSCAN infrastructure, systemstack (naked-asm RSP/SP switch)
+future  Step 8 (Option B) — TSan; requires nightly Rust
 ```
 
 Steps 3 → 4 → 5 form a natural dependency chain:

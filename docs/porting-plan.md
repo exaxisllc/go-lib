@@ -24,16 +24,24 @@ and the contended path is made scheduler-safe via `entersyscall`/`exitsyscall`
 | `runtime.Gosched()` | `gosched()` — cooperative yield |
 | `context.Context` | deferred (v2) |
 
-## Skipped (deferred)
+## Skipped in v1 (now implemented)
 
-- **Stack growth** (`copystack`, `morestack`) — v1 uses fixed 64 KiB `mmap`'d stacks with a guard page.
-- **Async preemption** — signal-based preemption (`preemptone`, `signalM`) is deferred; v1 is cooperative only (`gosched()`).
+> **Note:** All items below were deferred in the initial v1 port but have since
+> been implemented.  See `docs/v2-roadmap.md` for the implementation steps.
+
+- **Stack growth** (`copystack`) — ✅ v0.2.0: 64 KiB initial stack; SIGSEGV
+  guard-page detection; `copystack` grows to 1 GiB.  Bracketed with
+  `casgstatus(GRUNNING→GCOPYSTACK→GRUNNING)` in v0.3.1.
+- **Async preemption** — ✅ v0.2.0: `SIGURG`-based preemption; `preemptm`
+  transitions through `GPREEMPTED` (Go 1.14+ protocol) in v0.3.1.
 - **GC / write barriers / finalizers** — irrelevant; Rust owns memory.
-- **Netpoll** — deferred.
-- **`defer` / `recover` / `panic`** — deferred.
-- **`context.Context`** — deferred (v2).
-- **`sync.Cond`** — deferred.
-- **`GOMAXPROCS` at runtime** — fixed at startup in v1.
+- **Netpoll** — ✅ v0.2.0 (Linux `epoll`, macOS `kqueue`); v0.3.0 (Windows IOCP).
+- **`defer` / `recover` / `panic`** — ✅ v0.2.0: goroutine panics caught via
+  `catch_unwind`; custom handler via `set_panic_handler`.
+- **`context.Context`** — ✅ v0.2.0: `context::background`, `with_cancel`,
+  `with_deadline`, `with_timeout`.
+- **`sync.Cond`** — ✅ v0.2.0: `sync::Cond` goroutine-aware condition variable.
+- **`GOMAXPROCS` at runtime** — ✅ v0.2.0: `set_gomaxprocs` / `gomaxprocs`.
 
 ---
 
@@ -382,16 +390,18 @@ Put under `examples/` so they double as documentation.
 
 ### Step 20 — Known deferred items (document, don't implement)
 
-Record clearly in crate docs:
+> **Status:** All items below were deferred at v1 and have since been
+> implemented (v0.2.0 – v0.3.1).  Remaining limitation: no GC / race detector.
 
-- Stack growth (`morestack` / `copystack`) — all goroutines have a fixed 64 KiB stack.
-- Async preemption — long CPU-bound loops must call `gosched()`.
-- `defer` / `recover` / `panic` across goroutine boundaries.
-- `context.Context` / cancellation.
-- Netpoll / I/O integration.
-- `GOMAXPROCS` adjustment at runtime.
-- Race detector.
-- `sync.Cond`.
+- ~~Stack growth (`morestack` / `copystack`)~~ — ✅ implemented v0.2.0.
+- ~~Async preemption — long CPU-bound loops must call `gosched()`~~ — ✅ v0.2.0.
+- ~~`defer` / `recover` / `panic` across goroutine boundaries~~ — ✅ v0.2.0.
+- ~~`context.Context` / cancellation~~ — ✅ v0.2.0.
+- ~~Netpoll / I/O integration~~ — ✅ v0.2.0 (Unix) / v0.3.0 (Windows IOCP).
+- ~~`GOMAXPROCS` adjustment at runtime~~ — ✅ v0.2.0.
+- ~~`sync.Cond`~~ — ✅ v0.2.0.
+- **Race detector** — still deferred.  Use `cargo test --cfg loom` for
+  systematic concurrency testing within loom's boundary.
 
 ---
 
