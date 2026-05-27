@@ -14,7 +14,7 @@
 //! ## Public surface
 //! - `go!` / `select!` macros — spawn goroutines, multiplex channel ops
 //! - [`chan`] — buffered and unbuffered channels
-//! - [`net`] — goroutine-aware `TcpListener` / `TcpStream` *(v2.0)*
+//! - [`net`] — goroutine-aware `TcpListener` / `TcpStream` *(v0.2.0)*
 //! - [`sync::WaitGroup`] — wait for a collection of goroutines
 //! - [`sync::Cond`] — goroutine-aware condition variable
 //! - [`sync::Mutex`] / [`sync::RwLock`] — re-exports of `std::sync`
@@ -26,7 +26,7 @@
 //! See [`runtime`] for the scheduler (G/M/P, parking, work stealing, sysmon,
 //! stack growth, async preemption, netpoll).
 //!
-//! ## v2.0 — new in this release
+//! ## v0.2.0 — new in this release
 //!
 //! - **Dynamic stack growth** (Step 3): goroutines start with an 8 KiB stack
 //!   and grow automatically up to 1 GiB via SIGSEGV guard-page detection and

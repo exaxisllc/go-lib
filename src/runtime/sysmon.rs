@@ -6,7 +6,7 @@
 //! 1. **Netpoll** — calls [`netpoll::netpoll_wait(0)`][super::netpoll::netpoll_wait]
 //!    (non-blocking) and issues [`goready`][super::park::goready] for every
 //!    goroutine whose I/O fd became ready (Unix) or whose overlapped operation
-//!    completed (Windows IOCP).  *(v2.0 — Step 5)*
+//!    completed (Windows IOCP).  *(v0.2.0 — Step 5)*
 //!
 //! 2. **Async preemption** — for every P in `PRUNNING` whose `schedtick` has
 //!    not advanced for more than `FORCE_PREEMPT_NS` (10 ms), `preemptone`:
@@ -15,7 +15,7 @@
 //!      the exact OS thread running that goroutine.
 //!      The SIGURG handler in `sched.rs` redirects the goroutine to
 //!      `async_preempt_trampoline`, producing a non-cooperative yield.
-//!      *(v2.0 — Step 4; replaces the v1 cooperative-hint-only approach)*
+//!      *(v0.2.0 — Step 4; replaces the v1 cooperative-hint-only approach)*
 //!
 //! 3. **Syscall retake** — if a P has been stuck in `PSYSCALL` for more than
 //!    `FORCE_RETAKE_NS` (20 µs), CAS its status to `PIDLE` and hand it off via

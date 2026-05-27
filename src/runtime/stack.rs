@@ -2,7 +2,7 @@
 //! Goroutine stack allocator and growth machinery — ported from
 //! `runtime/stack.go`, `runtime/signal_unix.go`.
 //!
-//! ## v2.0 — dynamic stack growth
+//! ## v0.2.0 — dynamic stack growth
 //!
 //! Each goroutine starts with an 8 KiB stack (matching Go's `stackMin`).
 //! The guard page (`PROT_NONE`) immediately below `stack.lo` turns overflows

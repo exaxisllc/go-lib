@@ -20,7 +20,7 @@
 //! blocks until `wakeup` sets it; `wakeup` before `sleep` means `sleep`
 //! returns immediately.
 //!
-//! ## v2.0 additions
+//! ## v0.2.0 additions
 //!
 //! ### `pthread_id` — async preemption target (Step 4)
 //! Each M now stores its OS thread ID (`pthread_id: libc::pthread_t`), set by

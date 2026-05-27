@@ -138,7 +138,7 @@ jobs:
       - name: Test project and generate coverage report
         run: cargo llvm-cov --remap-path-prefix --show-missing-lines --branch --doctests --lcov --output-path lcov.info
       - name: Publish coverage summary to job summary
-        uses: livewing/lcov-job-summary@v1.1.0
+        uses: livewing/lcov-job-summary@v0.2.0
         with:
           lcov: lcov.info
       - name: Fail build if coverage below 80%
