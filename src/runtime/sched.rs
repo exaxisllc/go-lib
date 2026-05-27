@@ -1455,7 +1455,17 @@ unsafe fn spawn_m(id: i64, p: *mut P) {
 
 /// Initialise the scheduler and run `f` as the first goroutine.
 ///
-/// Blocks the calling thread until `f` returns.
+/// Blocks the calling thread until `f` returns (or panics).
+///
+/// # Panic safety
+///
+/// `f` is executed inside `goroutine_entry`'s `catch_unwind`.  If it panics,
+/// the panic is caught and routed to the `set_panic_handler` callback; the
+/// calling thread must still be unparked so `run` can return.  We use a
+/// drop-guard (`UnparkOnDrop`) rather than an explicit `caller.unpark()` call
+/// so the unpark happens during Rust's unwind of `wrapper`, *before*
+/// `catch_unwind` catches the payload — guaranteeing `park` is always released
+/// even when the goroutine panics.
 ///
 /// Ported from the Go runtime bootstrap (`runtime·rt0_go` → `main.main`).
 pub(crate) fn run_impl<F: FnOnce() + Send + 'static>(f: F) {
@@ -1465,16 +1475,22 @@ pub(crate) fn run_impl<F: FnOnce() + Send + 'static>(f: F) {
 
     schedinit(nprocs);
 
-    // Wrap `f` so it unparks the calling thread when it finishes.
+    // Drop guard: unparks the calling thread whether `f` returns or panics.
+    struct UnparkOnDrop(std::thread::Thread);
+    impl Drop for UnparkOnDrop {
+        fn drop(&mut self) { self.0.unpark(); }
+    }
+
     let caller = std::thread::current();
     let wrapper = move || {
+        // `_guard` is dropped when `wrapper` exits — normally or via unwind.
+        let _guard = UnparkOnDrop(caller);
         f();
-        caller.unpark();
     };
 
     spawn_goroutine(wrapper);
 
-    // Block until the goroutine calls caller.unpark().
+    // Block until the goroutine's drop-guard fires caller.unpark().
     std::thread::park();
 }
 

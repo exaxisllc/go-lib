@@ -45,6 +45,8 @@ jobs:
         # --nocapture: print test output immediately so crash context is
         # visible in the job log even when the process exits abnormally
         # (e.g. STATUS_ACCESS_VIOLATION on Windows).
+        # timeout-minutes: guard against a run_impl park() hang on slow runners.
+        timeout-minutes: 10
         run: cargo test -- --nocapture
 
       - name: Print Windows VEH crash file (if present)

@@ -252,7 +252,7 @@ fn done_channel_cancels_goroutine() {
         }
         done_tx.send(());
 
-        // Give the worker time to observe done.
+        // Give the worker time to observe done and exit its loop.
         for _ in 0..50 { go_lib::gosched(); }
     });
 
@@ -402,8 +402,13 @@ fn with_syscall_unblocks_scheduler() {
             std::thread::sleep(Duration::from_millis(5));
         });
 
-        // After exiting the syscall, yield and check.
-        for _ in 0..100 { go_lib::gosched(); }
+        // After exiting the syscall, yield until the spawned goroutine is
+        // observed.  Use a wall-clock deadline so a slow macOS CI runner
+        // does not cause a panic that deadlocks run_impl.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while other_ran.load(Ordering::Acquire) != 1 && Instant::now() < deadline {
+            go_lib::gosched();
+        }
         assert_eq!(
             other_ran.load(Ordering::Acquire),
             1,
