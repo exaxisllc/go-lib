@@ -26,9 +26,19 @@
 //! See [`runtime`] for the scheduler (G/M/P, parking, work stealing, sysmon,
 //! stack growth, async preemption, netpoll).
 //!
+//! ## v0.3.1 — new in this release
+//!
+//! - **G state machine**: `casgstatus` centralises all goroutine status
+//!   transitions.  `GSYSCALL`, `GCOPYSTACK`, `GPREEMPTED`, and `GSCAN` are
+//!   now wired into `entersyscall`/`exitsyscall`, `copystack`, and `preemptm`
+//!   respectively, matching Go 1.14+ semantics.
+//! - **`systemstack`**: runs a closure on the M's g0 (system) stack via a
+//!   naked-assembly RSP/SP switch.  Implemented for both AMD64 (SysV + Windows
+//!   x64) and AArch64 (AAPCS64).
+//!
 //! ## v0.2.0 — new in this release
 //!
-//! - **Dynamic stack growth** (Step 3): goroutines start with an 8 KiB stack
+//! - **Dynamic stack growth** (Step 3): goroutines start with a 64 KiB stack
 //!   and grow automatically up to 1 GiB via SIGSEGV guard-page detection and
 //!   `copystack` (conservative pointer adjustment).
 //! - **Async preemption** (Step 4): sysmon sends `SIGURG` to the M thread whose

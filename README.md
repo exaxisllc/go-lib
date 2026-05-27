@@ -22,7 +22,7 @@ go_lib::run(|| {
 });
 ```
 
-No `async`, no Tokio, no executor. Every goroutine starts with an 8 KiB stack that grows automatically on demand. The runtime is a work-stealing M:N scheduler ported verbatim from [`src/runtime/`](https://github.com/golang/go/tree/master/src/runtime) in the Go GitHub repository.
+No `async`, no Tokio, no executor. Every goroutine starts with a 64 KiB stack that grows automatically on demand (up to 1 GiB). The runtime is a work-stealing M:N scheduler ported verbatim from [`src/runtime/`](https://github.com/golang/go/tree/master/src/runtime) in the Go GitHub repository.
 
 ---
 
@@ -75,6 +75,8 @@ No `async`, no Tokio, no executor. Every goroutine starts with an 8 KiB stack th
 | `net::TcpListener` / `net::TcpStream` | ✅ v0.2.0 |
 | Loom concurrency model checker integration | ✅ v0.2.0 |
 | CI — standard + loom jobs on every push/PR | ✅ v0.2.0 |
+| G state machine — `casgstatus`, `GSYSCALL`, `GCOPYSTACK`, `GPREEMPTED`, `GSCAN` | ✅ v0.3.1 |
+| `systemstack` — run closure on M's g0 stack (naked-asm RSP/SP switch) | ✅ v0.3.1 |
 
 ---
 
@@ -598,7 +600,7 @@ impl<T: Send + 'static> BoundedQueue<T> {
 cargo test
 ```
 
-Runs 98 unit tests, 12 integration tests, and 18 doc tests.  All tests use
+Runs 99 unit tests, 12 integration tests, and 18 doc tests.  All tests use
 `std::sync` primitives and the real go-lib scheduler.
 
 ### Loom concurrency model checker
@@ -676,7 +678,8 @@ Each M-thread (M::start → schedule → findrunnable → execute → goexit0 �
 Stack growth (Step 3):
     goroutine touches guard page → SIGSEGV
     sigsegv_handler              identify guard-page fault
-    newstack(gp)                 double stack, copystack (conservative scan)
+    newstack(gp)                 double stack; copystack brackets copy with
+                                 casgstatus(GRUNNING→GCOPYSTACK→GRUNNING)
     update_sp_in_context(ucontext, delta)   redirect faulting instruction
 
 Async preemption (Step 4):
@@ -690,7 +693,9 @@ Async preemption (Step 4):
       save all GPRs + XMM/FP regs → goroutine stack
       call async_preempt2()
     async_preempt2()
-      mcall(preemptm) → schedule()   [G parks; resumes later via gogo]
+      mcall(preemptm):
+        casgstatus(GRUNNING→GPREEMPTED→GRUNNABLE)   [two-step Go 1.14+ protocol]
+        schedule()   [G re-queued; resumes later via gogo]
       (returns after gogo re-schedules this G)
     async_preempt_trampoline (resumed)
       restore all regs; ret → original interrupted PC
@@ -720,8 +725,8 @@ Netpoll (Step 5):
 | `runtime::syscall` | `runtime/proc.go` | entersyscall, exitsyscall, handoffp |
 | `runtime::sysmon` | `runtime/proc.go` | sysmon, retake, async preemption via `pthread_kill(SIGURG)` |
 | `runtime::time` | `runtime/time.go` | 4-ary min-heap timer, goroutine_sleep |
-| `runtime::asm_amd64` | `runtime/asm_amd64.s`, `runtime/preempt_amd64.s` | gogo, mcall, async_preempt_trampoline (AMD64) |
-| `runtime::asm_arm64` | `runtime/asm_arm64.s`, `runtime/preempt_arm64.s` | gogo, mcall, async_preempt_trampoline (AArch64) |
+| `runtime::asm_amd64` | `runtime/asm_amd64.s`, `runtime/preempt_amd64.s` | gogo, mcall, systemstack, async_preempt_trampoline (AMD64) |
+| `runtime::asm_arm64` | `runtime/asm_arm64.s`, `runtime/preempt_arm64.s` | gogo, mcall, systemstack, async_preempt_trampoline (AArch64) |
 | `net` | `net/tcpsock.go`, `net/fd_*.go` | TcpListener, TcpStream — goroutine-aware non-blocking TCP |
 | `chan` | `runtime/chan.go` | hchan, chansend, chanrecv, closechan |
 | `select` | `runtime/select.go` | selectgo, type-erased vtable |
