@@ -230,14 +230,18 @@ pub(crate) unsafe fn gogo(g: *mut G) -> ! {
         // that SEH can find exception handlers while the goroutine runs.
         #[cfg(windows)]
         {
-            let stack = (*g).stack;
+            // Read the fields directly — Stack doesn't implement Copy, and
+            // moving out of a raw-pointer dereference requires Copy or
+            // ptr::read.  The two usize fields are trivially readable.
+            let stack_lo = (*g).stack.lo;
+            let stack_hi = (*g).stack.hi;
             // GS:[0x08] = StackBase (exclusive high address of the stack).
             // GS:[0x10] = StackLimit (current lowest committed stack address).
             std::arch::asm!(
                 "mov qword ptr gs:[0x08], {hi}",
                 "mov qword ptr gs:[0x10], {lo}",
-                lo = in(reg) stack.lo,
-                hi = in(reg) stack.hi,
+                lo = in(reg) stack_lo,
+                hi = in(reg) stack_hi,
                 options(nostack, preserves_flags),
             );
         }
