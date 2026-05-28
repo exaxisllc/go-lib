@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use go_lib::{
     chan::chan,
     go,
+    scope,
     select,
     sync::WaitGroup,
 };
@@ -418,9 +419,44 @@ fn with_syscall_unblocks_scheduler() {
 }
 
 // ---------------------------------------------------------------------------
-// 13. run return value — result propagates to caller
+// 13. scope — parallel reduction with safe short-lived borrows
 // ---------------------------------------------------------------------------
 
+#[test]
+fn scope_parallel_reduction() {
+    // `data` is inside `run` so the closure is 'static; scope then lets
+    // goroutines borrow halves of it without Arc or channels.
+    let sum = go_lib::run(|| {
+        let data: Vec<i64> = (1..=100).collect();
+        scope(|s| {
+            let mid = data.len() / 2;
+            let h1 = s.spawn(|| data[..mid].iter().sum::<i64>());
+            let h2 = s.spawn(|| data[mid..].iter().sum::<i64>());
+            h1.join().unwrap() + h2.join().unwrap()
+        })
+    });
+
+    assert_eq!(sum, 5050); // 1 + 2 + … + 100
+}
+
+// ---------------------------------------------------------------------------
+// 14. scope panic — panicking goroutine surfaces as Err from join
+// ---------------------------------------------------------------------------
+
+#[test]
+fn scope_goroutine_panic_surfaces_via_join() {
+    go_lib::run(|| {
+        let result = scope(|s| {
+            let h = s.spawn(|| -> i32 { panic!("intentional scope panic") });
+            h.join() // should be Err, not a process abort
+        });
+        assert!(result.is_err(), "expected Err from panicking goroutine");
+    });
+}
+
+// ---------------------------------------------------------------------------
+// 15. run return value — result propagates to caller
+// ---------------------------------------------------------------------------
 #[test]
 fn run_returns_value() {
     // Scalar return: the sum computed inside the scheduler reaches the caller.

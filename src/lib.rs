@@ -15,6 +15,7 @@
 //! - `go!` / `select!` macros — spawn goroutines, multiplex channel ops
 //! - [`chan`] — buffered and unbuffered channels
 //! - [`net`] — goroutine-aware `TcpListener` / `TcpStream` *(v0.2.0)*
+//! - [`scope`] / [`scope::Scope`] — scoped goroutines with safe short-lived borrows
 //! - [`sync::WaitGroup`] — wait for a collection of goroutines
 //! - [`sync::Cond`] — goroutine-aware condition variable
 //! - [`sync::Mutex`] / [`sync::RwLock`] — re-exports of `std::sync`
@@ -25,6 +26,22 @@
 //! ## Internals
 //! See [`runtime`] for the scheduler (G/M/P, parking, work stealing, sysmon,
 //! stack growth, async preemption, netpoll).
+//!
+//! ## v0.3.2 — new in this release
+//!
+//! - **`scope` / `ScopedJoinHandle`**: scoped goroutines with safe short-lived
+//!   borrows, mirroring `std::thread::scope`.  Goroutines spawned inside a
+//!   `scope` closure can borrow data from the enclosing stack frame; the
+//!   scheduler guarantees every spawned goroutine finishes before `scope`
+//!   returns.  `ScopedJoinHandle::join()` returns `std::thread::Result<R>` so
+//!   goroutine panics surface as `Err` rather than aborting the process.
+//! - **Channel double-free fix**: the blocking-receive resume path in
+//!   `chanrecv` used `ptr::read` followed by `Box::from_raw` on the same
+//!   allocation, which double-dropped the inner value and caused use-after-free
+//!   when the moved-out value was later inspected (e.g. a panic payload passed
+//!   through a scoped join handle).  Fixed by casting the `Box` to
+//!   `ManuallyDrop<Option<T>>` before dropping, so only the heap allocation is
+//!   freed without re-running the destructor.
 //!
 //! ## v0.3.1 — new in this release
 //!
@@ -107,6 +124,7 @@ pub mod net;
 #[path = "net_windows.rs"]
 pub mod net;
 pub mod runtime;
+pub mod scope;
 pub mod select;
 pub mod sync;
 
@@ -159,6 +177,33 @@ where
     R: Send + 'static,
 {
     runtime::sched::run_impl(f)
+}
+
+/// Spawn short-lived goroutines that can borrow data from the calling scope.
+///
+/// A thin re-export of [`scope::scope`] — see that module for full
+/// documentation, examples, and the lifetime-safety argument.
+///
+/// # Quick example
+///
+/// ```no_run
+/// go_lib::run(|| {
+///     let data = vec![1_i64, 2, 3, 4, 5];
+///
+///     let sum = go_lib::scope(|s| {
+///         let h1 = s.spawn(|| data[..3].iter().sum::<i64>());
+///         let h2 = s.spawn(|| data[3..].iter().sum::<i64>());
+///         h1.join().unwrap() + h2.join().unwrap()
+///     });
+///
+///     assert_eq!(sum, 15);
+/// });
+/// ```
+pub fn scope<'env, F, R>(f: F) -> R
+where
+    F: for<'scope> FnOnce(&'scope scope::Scope<'scope, 'env>) -> R,
+{
+    scope::scope(f)
 }
 
 /// Yield the CPU, giving other goroutines a chance to run.

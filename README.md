@@ -33,6 +33,7 @@ No `async`, no Tokio, no executor. Every goroutine starts with a 64 KiB stack th
 - [API reference](#api-reference)
   - [Entry point](#entry-point)
   - [Goroutines](#goroutines)
+  - [scope — safe short-lived borrows](#scope--safe-short-lived-borrows)
   - [Channels](#channels)
   - [select!](#select)
   - [WaitGroup](#waitgroup)
@@ -77,6 +78,7 @@ No `async`, no Tokio, no executor. Every goroutine starts with a 64 KiB stack th
 | CI — standard + loom jobs on every push/PR | ✅ v0.2.0 |
 | G state machine — `casgstatus`, `GSYSCALL`, `GCOPYSTACK`, `GPREEMPTED`, `GSCAN` | ✅ v0.3.1 |
 | `systemstack` — run closure on M's g0 stack (naked-asm RSP/SP switch) | ✅ v0.3.1 |
+| `scope` — scoped goroutines with safe short-lived borrows | ✅ v0.3.2 |
 
 ---
 
@@ -124,9 +126,10 @@ cargo run --example hello
 cargo run --example pipeline
 cargo run --example select_fanin
 cargo run --example cond
+cargo run --example scope           # scoped goroutines, safe borrows
 cargo run --example main_exitcode   # main() -> ExitCode
 cargo run --example main_result     # main() -> Result<(), E>
-cargo run --example attr_run       # all three #[go_lib::run] patterns
+cargo run --example attr_run        # all three #[go_lib::run] patterns
 ```
 
 ---
@@ -200,6 +203,55 @@ go_lib::run(|| {
     });
 });
 ```
+
+---
+
+### scope — safe short-lived borrows
+
+```rust
+go_lib::scope(|s| {
+    let h1 = s.spawn(|| /* closure that may borrow from outer scope */);
+    let h2 = s.spawn(|| /* … */);
+    h1.join().unwrap() + h2.join().unwrap()
+})
+```
+
+Scoped goroutines work exactly like `std::thread::scope`: goroutines spawned inside the closure can borrow data from the enclosing stack frame because `scope` guarantees all spawned goroutines complete before it returns.  No `Arc`, no channels, and no `.clone()` are needed for read-only shared data.
+
+```rust
+go_lib::run(|| {
+    // `data` lives on the goroutine's stack.  Both goroutines borrow slices
+    // of it directly — no Arc required.  `scope` enforces the lifetime at
+    // compile time; go_lib::run requires a 'static closure, so data that needs
+    // to be shared lives inside run (or is moved in).
+    let data = vec![1_i64, 2, 3, 4, 5, 6, 7, 8];
+
+    let sum = go_lib::scope(|s| {
+        let mid = data.len() / 2;
+        let h1 = s.spawn(|| data[..mid].iter().sum::<i64>());
+        let h2 = s.spawn(|| data[mid..].iter().sum::<i64>());
+        h1.join().unwrap() + h2.join().unwrap()
+    });
+
+    assert_eq!(sum, 36);
+});
+```
+
+`s.spawn(f)` returns a `ScopedJoinHandle<'scope, R>`:
+
+| Method | Description |
+|---|---|
+| `h.join()` | Block until the goroutine finishes; returns `std::thread::Result<R>` — `Ok(R)` on success, `Err(payload)` if the goroutine panicked |
+
+The `Err` payload from a panicking goroutine is the same `Box<dyn Any + Send>` you would receive from `std::panic::catch_unwind`.  Dropping a `ScopedJoinHandle` without calling `join` is safe — the goroutine still runs to completion; its result is simply discarded.
+
+**When to prefer `scope` over `go!` + channel:**
+
+| Pattern | Use when |
+|---|---|
+| `scope` | Goroutines are short-lived helpers that read (or write exclusively to) local data |
+| `go!` + channel | Long-running goroutines, or when results need to be streamed/merged as they arrive |
+| `WaitGroup` | Fire-and-forget goroutines that do side effects but produce no return value |
 
 ---
 
@@ -686,36 +738,66 @@ impl<T: Send + 'static> BoundedQueue<T> {
 }
 ```
 
+### scope — parallel reduction with safe borrows
+
+```rust
+// examples/scope.rs
+fn main() {
+    let sum = go_lib::run(|| {
+        // `data` lives on the goroutine's stack.  Spawned goroutines borrow
+        // chunks of it — no Arc or Clone needed.
+        let data: Vec<i64> = (1..=100).collect();
+
+        go_lib::scope(|s| {
+            let chunks: Vec<&[i64]> = data.chunks(data.len() / 4 + 1).collect();
+
+            let handles: Vec<_> = chunks
+                .into_iter()
+                .map(|chunk| s.spawn(move || chunk.iter().sum::<i64>()))
+                .collect();
+
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("chunk goroutine panicked"))
+                .sum::<i64>()
+        })
+    });
+
+    println!("sum 1..=100 = {sum}");  // 5050
+    assert_eq!(sum, 5050);
+}
+```
+
+The goroutines borrow slices of `data` directly from the enclosing goroutine's stack frame — no `Arc` or channel needed.
+
+---
+
 ### main\_exitcode — `main() -> ExitCode`
 
-`go_lib::run` returns the closure's value, so `main` can map it directly to a
-process exit code without any shared state:
+`go_lib::scope` runs the tasks concurrently and collects their `(id, bool)` results through join handles — no `Arc`, `WaitGroup`, or channel required:
 
 ```rust
 // examples/main_exitcode.rs
 use std::process::ExitCode;
-use go_lib::{chan::chan, go, sync::WaitGroup};
-use std::sync::Arc;
 
 fn main() -> ExitCode {
     let all_passed = go_lib::run(|| {
         const N: usize = 5;
-        let (tx, rx) = chan::<(usize, bool)>(N);
-        let wg = Arc::new(WaitGroup::new());
 
-        for id in 0..N {
-            let (tx, wg2) = (tx.clone(), Arc::clone(&wg));
-            wg.add(1);
-            go!(move || { tx.send((id, run_task(id))); wg2.done(); });
-        }
+        let results = go_lib::scope(|s| {
+            let handles: Vec<_> = (0..N)
+                .map(|id| s.spawn(move || (id, run_task(id))))
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("task goroutine panicked"))
+                .collect::<Vec<_>>()
+        });
 
-        wg.wait();
         let mut failures = 0_usize;
-        for _ in 0..N {
-            if let Some((id, ok)) = rx.recv() {
-                println!("  task {id}: {}", if ok { "ok" } else { "FAIL" });
-                if !ok { failures += 1; }
-            }
+        for (id, ok) in results {
+            println!("  task {id}: {}", if ok { "ok" } else { "FAIL" });
+            if !ok { failures += 1; }
         }
         println!("{}/{N} tasks passed", N - failures);
         failures == 0   // ← return value of run()
@@ -739,26 +821,28 @@ Exit code: `1`
 
 The closure can return `Result`; `main` returns it verbatim.  Rust's
 `Termination` trait prints the error and sets exit code `1` on `Err`.
+`go_lib::scope` lets each goroutine borrow its `&str` directly — no channel needed:
 
 ```rust
 // examples/main_result.rs
 use std::num::ParseIntError;
-use go_lib::{chan::chan, go};
 
 fn main() -> Result<(), ParseIntError> {
     go_lib::run(|| -> Result<(), ParseIntError> {
         let inputs = ["3", "1", "4", "1", "5", "9"];
-        let (tx, rx) = chan::<Result<i64, ParseIntError>>(inputs.len());
 
-        for s in inputs {
-            let tx = tx.clone();
-            go!(move || tx.send(s.parse::<i64>()));
-        }
+        // Parse concurrently; goroutines borrow `inputs` directly.
+        let sum: i64 = go_lib::scope(|scope| -> Result<i64, ParseIntError> {
+            let handles: Vec<_> = inputs
+                .iter()
+                .map(|s| scope.spawn(move || s.parse::<i64>()))
+                .collect();
+            // h.join().unwrap() strips the panic wrapper; ? propagates ParseIntError.
+            handles
+                .into_iter()
+                .try_fold(0_i64, |acc, h| Ok(acc + h.join().unwrap()?))
+        })?;
 
-        let mut sum = 0_i64;
-        for _ in 0..inputs.len() {
-            sum += rx.recv().unwrap()?;   // ? propagates parse errors
-        }
         println!("sum = {sum}");   // sum = 23
         Ok(())
     })
@@ -782,7 +866,7 @@ print `Error: invalid digit found in string` and exit with code `1`.
 cargo test
 ```
 
-Runs 99 unit tests, 13 integration tests, and 19 doc tests.  All tests use
+Runs 106 unit tests, 15 integration tests, and 23 doc tests.  All tests use
 `std::sync` primitives and the real go-lib scheduler.
 
 ### Loom concurrency model checker
@@ -912,6 +996,7 @@ Netpoll (Step 5):
 | `net` | `net/tcpsock.go`, `net/fd_*.go` | TcpListener, TcpStream — goroutine-aware non-blocking TCP |
 | `chan` | `runtime/chan.go` | hchan, chansend, chanrecv, closechan |
 | `select` | `runtime/select.go` | selectgo, type-erased vtable |
+| `scope` | *(new — mirrors `std::thread::scope`)* | Scoped goroutines; safe short-lived borrows; `ScopedJoinHandle` |
 | `sync::waitgroup` | `sync/waitgroup.go` | WaitGroup |
 | `sync::cond` | `sync/cond.go` | Cond — goroutine-aware condition variable |
 | `context` | `context/context.go` | background, with_cancel, with_deadline, with_timeout |
@@ -937,6 +1022,7 @@ Netpoll (Step 5):
 | `runtime.Gosched()` | `go_lib::gosched()` |
 | `time.Sleep(d)` | `go_lib::sleep(d)` |
 | `runtime.GOMAXPROCS(n)` | `go_lib::set_gomaxprocs(n)` |
+| `errgroup.Group` / `golang.org/x/sync/errgroup` | `go_lib::scope` (with `h.join().unwrap()?`) |
 
 ---
 
