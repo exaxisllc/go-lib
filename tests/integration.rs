@@ -416,3 +416,30 @@ fn with_syscall_unblocks_scheduler() {
         );
     });
 }
+
+// ---------------------------------------------------------------------------
+// 13. run return value — result propagates to caller
+// ---------------------------------------------------------------------------
+
+#[test]
+fn run_returns_value() {
+    // Scalar return: the sum computed inside the scheduler reaches the caller.
+    let sum = go_lib::run(|| {
+        let (tx, rx) = chan::<i32>(4);
+        for i in 1..=4 {
+            let t = tx.clone();
+            go!(move || { t.send(i); });
+        }
+        (0..4).filter_map(|_| rx.recv()).sum::<i32>()
+    });
+    assert_eq!(sum, 10);
+
+    // Move-capture: parameters reach the goroutine via closure capture.
+    let base = 7_i32;
+    let doubled = go_lib::run(move || base * 2);
+    assert_eq!(doubled, 14);
+
+    // String return: heap-allocated value crosses the goroutine boundary.
+    let s: String = go_lib::run(|| "hello from goroutine".to_string());
+    assert_eq!(s, "hello from goroutine");
+}
