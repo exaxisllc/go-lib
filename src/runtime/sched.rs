@@ -1529,9 +1529,20 @@ unsafe fn spawn_m(id: i64, p: *mut P) {
 // run_impl — public entry point (exposed as go_lib::run)
 // ---------------------------------------------------------------------------
 
-/// Initialise the scheduler and run `f` as the first goroutine.
+/// Initialise the scheduler and run `f` as the first goroutine, returning
+/// whatever `f` returns.
 ///
 /// Blocks the calling thread until `f` returns (or panics).
+///
+/// # Return value
+///
+/// The value returned by `f` is shuttled back to the calling thread via an
+/// `Arc<Mutex<Option<R>>>` slot.  The slot is filled *before* the drop-guard
+/// fires, so the calling thread always sees the value as soon as `park()`
+/// returns.
+///
+/// If `f` panics before producing a return value the slot stays `None` and
+/// this function panics with a clear message.
 ///
 /// # Panic safety
 ///
@@ -1544,7 +1555,11 @@ unsafe fn spawn_m(id: i64, p: *mut P) {
 /// even when the goroutine panics.
 ///
 /// Ported from the Go runtime bootstrap (`runtime·rt0_go` → `main.main`).
-pub(crate) fn run_impl<F: FnOnce() + Send + 'static>(f: F) {
+pub(crate) fn run_impl<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
     let nprocs = std::thread::available_parallelism()
         .map(|n| n.get() as i32)
         .unwrap_or(1);
@@ -1557,17 +1572,30 @@ pub(crate) fn run_impl<F: FnOnce() + Send + 'static>(f: F) {
         fn drop(&mut self) { self.0.unpark(); }
     }
 
+    // Slot used to shuttle the return value from the goroutine to the caller.
+    let slot: Arc<Mutex<Option<R>>> = Arc::new(Mutex::new(None));
+    let slot2 = Arc::clone(&slot);
+
     let caller = std::thread::current();
     let wrapper = move || {
-        // `_guard` is dropped when `wrapper` exits — normally or via unwind.
+        // `_guard` is the *last* local to drop, so it unparks the caller only
+        // after `result` has been stored.  Drop order: `result` (moved into
+        // the slot) disappears first, then `_guard` fires.
         let _guard = UnparkOnDrop(caller);
-        f();
+        let result  = f();
+        *slot2.lock().unwrap() = Some(result);
+        // _guard drops here → caller.unpark()
     };
 
     spawn_goroutine(wrapper);
 
     // Block until the goroutine's drop-guard fires caller.unpark().
     std::thread::park();
+
+    slot.lock()
+        .unwrap()
+        .take()
+        .expect("go_lib::run: first goroutine panicked without returning a value")
 }
 
 // ---------------------------------------------------------------------------

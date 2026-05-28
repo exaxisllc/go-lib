@@ -76,6 +76,21 @@
 // Each `unsafe fn`'s contract is documented in its `# Safety` section instead.
 #![allow(unsafe_op_in_unsafe_fn)]
 
+/// Attribute macro that wraps a function body in [`run`].
+///
+/// ```rust,ignore
+/// #[go_lib::run]
+/// fn main() {
+///     let (tx, rx) = go_lib::chan::chan::<i32>(0);
+///     go_lib::go!(move || tx.send(42));
+///     println!("{}", rx.recv().unwrap());
+/// }
+/// ```
+///
+/// See the [`go_lib_macros::run`][`main`] documentation for the full
+/// expansion rules and return-type support.
+pub use go_lib_macros::run;
+
 pub mod chan;
 pub mod context;
 /// Goroutine-aware TCP networking (Step 5: netpoll integration).
@@ -98,21 +113,52 @@ pub mod sync;
 mod go_macro;
 pub(crate) mod loom_shim;
 
-/// Initialise the go-lib scheduler and run `f` as the first goroutine.
+/// Initialise the go-lib scheduler, run `f` as the first goroutine, and
+/// return whatever `f` returns.
 ///
 /// Blocks the calling thread until `f` returns.  The scheduler threads
 /// (one per logical CPU) continue running in the background after `run`
 /// returns; they park themselves when there is no more work.
 ///
-/// # Example
+/// # Parameters
+///
+/// `f` can capture any values it needs from the surrounding scope via a
+/// `move` closure — there is no need to pass parameters directly to `run`:
 ///
 /// ```no_run
-/// go_lib::run(|| {
-///     println!("hello from a goroutine");
-/// });
+/// let base = 10_i32;
+/// let result = go_lib::run(move || base * 2);
+/// assert_eq!(result, 20);
 /// ```
-pub fn run<F: FnOnce() + Send + 'static>(f: F) {
-    runtime::sched::run_impl(f);
+///
+/// # Return values
+///
+/// The closure's return value is propagated back to the caller:
+///
+/// ```no_run
+/// let sum = go_lib::run(|| {
+///     let (tx, rx) = go_lib::chan::chan::<i32>(4);
+///     for i in 1..=4 { let t = tx.clone(); go_lib::__spawn(move || t.send(i)); }
+///     (0..4).filter_map(|_| rx.recv()).sum::<i32>()
+/// });
+/// assert_eq!(sum, 10);
+/// ```
+///
+/// When the closure returns `()` (the default), `run` behaves exactly as
+/// before — the return value can simply be ignored.
+///
+/// # Panics
+///
+/// Panics if `f` panics before producing a return value.  A panicking
+/// goroutine is caught by the scheduler's `catch_unwind`; the panic payload
+/// is forwarded to [`set_panic_handler`] and the calling thread is woken
+/// with an `expect` failure.
+pub fn run<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    runtime::sched::run_impl(f)
 }
 
 /// Yield the CPU, giving other goroutines a chance to run.

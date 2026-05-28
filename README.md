@@ -89,22 +89,30 @@ Add to `Cargo.toml`:
 go-lib = { path = "…" }   # local path until crates.io publication
 ```
 
-Every program entry point is `go_lib::run`:
+Every program entry point wraps its body in `go_lib::run`.
+Use the `#[go_lib::run]` attribute macro to do it automatically:
 
 ```rust
-use go_lib::{chan::chan, go, select};
+use go_lib::{chan::chan, go};
 
+#[go_lib::run]
+fn main() {
+    let (tx, rx) = chan::<i32>(0); // unbuffered
+
+    go!(move || tx.send(42));
+
+    if let Some(n) = rx.recv() {
+        println!("received {n}");
+    }
+}
+```
+
+Or call `go_lib::run` explicitly when you need more control:
+
+```rust
 fn main() {
     go_lib::run(|| {
-        let (tx, rx) = chan::<i32>(0); // unbuffered
-
-        go!(move || {
-            tx.send(42);
-        });
-
-        if let Some(n) = rx.recv() {
-            println!("received {n}");
-        }
+        // body
     });
 }
 ```
@@ -116,6 +124,9 @@ cargo run --example hello
 cargo run --example pipeline
 cargo run --example select_fanin
 cargo run --example cond
+cargo run --example main_exitcode   # main() -> ExitCode
+cargo run --example main_result     # main() -> Result<(), E>
+cargo run --example attr_run       # all three #[go_lib::run] patterns
 ```
 
 ---
@@ -124,11 +135,52 @@ cargo run --example cond
 
 ### Entry point
 
+There are two equivalent ways to start the scheduler.
+
+#### Attribute macro (recommended)
+
 ```rust
-pub fn run<F: FnOnce() + Send + 'static>(f: F)
+#[go_lib::run]
+fn main() { … }
+
+#[go_lib::run]
+fn main() -> ExitCode { … }
+
+#[go_lib::run]
+fn main() -> Result<(), MyError> { … }
 ```
 
-Initialises the scheduler (one M-thread per logical CPU, or the value of the `GOMAXPROCS` environment variable), runs `f` as the first goroutine, and blocks until `f` returns. The scheduler threads remain alive in the background; subsequent calls to `run` reuse them.
+The macro expands the function body into `go_lib::run(move || [-> ReturnType] { … })`.
+It works on any function, not only `main`, and captures parameters via `move`.
+
+An `async` function is rejected at compile time with a clear error message.
+
+#### Direct call
+
+```rust
+pub fn run<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+```
+
+Initialises the scheduler (one M-thread per logical CPU, or the value of the `GOMAXPROCS` environment variable), runs `f` as the first goroutine, and blocks until `f` returns — propagating `f`'s return value directly to the caller. The scheduler threads remain alive in the background; subsequent calls to `run` reuse them.
+
+**Parameters** are passed via `move` closures:
+
+```rust
+let threshold = 42_i32;
+go_lib::run(move || { /* threshold is in scope */ });
+```
+
+**Return values** propagate back to the caller:
+
+```rust
+let n: i32      = go_lib::run(|| compute_answer());
+let ok: bool    = go_lib::run(|| all_tasks_pass());
+```
+
+If the first goroutine panics before returning, `run` re-panics on the calling thread with a clear message.
 
 ---
 
@@ -456,6 +508,50 @@ go_lib::run(|| {
 
 ## Examples
 
+### attr\_main — `#[go_lib::run]` attribute
+
+The attribute macro is the most concise entry point.  It rewrites the
+function body in-place, so the three `main` signatures work without any
+boilerplate:
+
+```rust
+// examples/attr_run.rs  (illustrative — see the real file for the full driver)
+
+// 1. Plain — no return value
+#[go_lib::run]
+fn main() {
+    let (tx, rx) = chan::<&str>(0);
+    go!(move || tx.send("hello from #[go_lib::run]"));
+    println!("{}", rx.recv().unwrap());
+}
+
+// 2. main() -> ExitCode
+#[go_lib::run]
+fn main() -> ExitCode {
+    let ok = run_all_tasks();
+    if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+}
+
+// 3. main() -> Result<(), E>   (? works inside the closure)
+#[go_lib::run]
+fn main() -> Result<(), ParseIntError> {
+    let (tx, rx) = chan::<Result<i64, _>>(4);
+    for s in ["1","2","3","4"] {
+        let tx = tx.clone();
+        go!(move || tx.send(s.parse::<i64>()));
+    }
+    let mut sum = 0i64;
+    for _ in 0..4 { sum += rx.recv().unwrap()?; }
+    println!("sum = {sum}");
+    Ok(())
+}
+```
+
+The macro expands each of these into `go_lib::run(move || [-> R] { … })` —
+identical to writing it by hand, but without the wrapping ceremony.
+
+---
+
 ### hello — goroutines and channels
 
 ```rust
@@ -590,6 +686,92 @@ impl<T: Send + 'static> BoundedQueue<T> {
 }
 ```
 
+### main\_exitcode — `main() -> ExitCode`
+
+`go_lib::run` returns the closure's value, so `main` can map it directly to a
+process exit code without any shared state:
+
+```rust
+// examples/main_exitcode.rs
+use std::process::ExitCode;
+use go_lib::{chan::chan, go, sync::WaitGroup};
+use std::sync::Arc;
+
+fn main() -> ExitCode {
+    let all_passed = go_lib::run(|| {
+        const N: usize = 5;
+        let (tx, rx) = chan::<(usize, bool)>(N);
+        let wg = Arc::new(WaitGroup::new());
+
+        for id in 0..N {
+            let (tx, wg2) = (tx.clone(), Arc::clone(&wg));
+            wg.add(1);
+            go!(move || { tx.send((id, run_task(id))); wg2.done(); });
+        }
+
+        wg.wait();
+        let mut failures = 0_usize;
+        for _ in 0..N {
+            if let Some((id, ok)) = rx.recv() {
+                println!("  task {id}: {}", if ok { "ok" } else { "FAIL" });
+                if !ok { failures += 1; }
+            }
+        }
+        println!("{}/{N} tasks passed", N - failures);
+        failures == 0   // ← return value of run()
+    });
+
+    if all_passed { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+}
+```
+
+```
+  task 0: ok
+  task 1: FAIL
+  task 2: ok
+  task 3: FAIL
+  task 4: ok
+3/5 tasks passed
+```
+Exit code: `1`
+
+### main\_result — `main() -> Result<(), E>`
+
+The closure can return `Result`; `main` returns it verbatim.  Rust's
+`Termination` trait prints the error and sets exit code `1` on `Err`.
+
+```rust
+// examples/main_result.rs
+use std::num::ParseIntError;
+use go_lib::{chan::chan, go};
+
+fn main() -> Result<(), ParseIntError> {
+    go_lib::run(|| -> Result<(), ParseIntError> {
+        let inputs = ["3", "1", "4", "1", "5", "9"];
+        let (tx, rx) = chan::<Result<i64, ParseIntError>>(inputs.len());
+
+        for s in inputs {
+            let tx = tx.clone();
+            go!(move || tx.send(s.parse::<i64>()));
+        }
+
+        let mut sum = 0_i64;
+        for _ in 0..inputs.len() {
+            sum += rx.recv().unwrap()?;   // ? propagates parse errors
+        }
+        println!("sum = {sum}");   // sum = 23
+        Ok(())
+    })
+}
+```
+
+```
+sum = 23
+```
+
+If one of the strings were not a valid integer (e.g. `"abc"`), `main` would
+print `Error: invalid digit found in string` and exit with code `1`.
+
 ---
 
 ## Testing & CI
@@ -600,7 +782,7 @@ impl<T: Send + 'static> BoundedQueue<T> {
 cargo test
 ```
 
-Runs 99 unit tests, 12 integration tests, and 18 doc tests.  All tests use
+Runs 99 unit tests, 13 integration tests, and 19 doc tests.  All tests use
 `std::sync` primitives and the real go-lib scheduler.
 
 ### Loom concurrency model checker
