@@ -212,11 +212,36 @@ unsafe extern "C" fn mcall_asm(
 /// the switch sees the correct current goroutine.  The caller must have
 /// initialised `g.sched.sp` and `g.sched.pc` before calling.
 ///
+/// On Windows, the TEB `StackBase` / `StackLimit` fields are updated to
+/// reflect the goroutine's custom stack bounds before the RSP switch.
+/// Windows' exception dispatcher (`RtlDispatchException`) validates that
+/// the faulting RSP is inside `[TEB.StackLimit, TEB.StackBase)` before
+/// walking frame-based handlers.  Without this update, any `catch_unwind`
+/// inside a goroutine is silently bypassed and the process terminates with
+/// `0xe06d7363` (STATUS_CPP_EH_EXCEPTION).
+///
 /// Ported from the `execute` → `gogo` path in `runtime/proc.go` +
 /// `runtime/asm_amd64.s`.
 pub(crate) unsafe fn gogo(g: *mut G) -> ! {
     unsafe {
         set_current_g(g);
+
+        // Windows only: tell the OS about the goroutine's stack region so
+        // that SEH can find exception handlers while the goroutine runs.
+        #[cfg(windows)]
+        {
+            let stack = (*g).stack;
+            // GS:[0x08] = StackBase (exclusive high address of the stack).
+            // GS:[0x10] = StackLimit (current lowest committed stack address).
+            std::arch::asm!(
+                "mov qword ptr gs:[0x08], {hi}",
+                "mov qword ptr gs:[0x10], {lo}",
+                lo = in(reg) stack.lo,
+                hi = in(reg) stack.hi,
+                options(nostack, preserves_flags),
+            );
+        }
+
         gogo_asm(addr_of_mut!((*g).sched))
     }
 }
