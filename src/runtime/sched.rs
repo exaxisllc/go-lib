@@ -1447,6 +1447,28 @@ pub(crate) fn schedinit(nprocs: i32) {
     }
     assert!(nprocs >= 1, "schedinit: nprocs must be ≥ 1");
 
+    // Install a panic hook that suppresses panics originating from goroutine
+    // threads.  Without this, Rust's test framework (libtest) marks the
+    // current test as failed the moment any goroutine panics — even when the
+    // panic is intentional (e.g. a scoped goroutine whose caller retrieves
+    // the payload via `ScopedJoinHandle::join`).
+    //
+    // Goroutine panics are caught by `goroutine_entry`'s `catch_unwind` which
+    // always runs on the same OS thread as the goroutine (no cross-thread
+    // unwind), so landing-pad lookup is always correct.  Forwarding them to
+    // an external hook first would trigger a spurious test failure before
+    // `catch_unwind` has had a chance to route the payload to the caller.
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // `current_g()` reads a thread-local: non-null on a goroutine M-thread,
+        // null on g0 / the main thread / non-scheduler threads.
+        if current_g().is_null() {
+            prev_hook(info);
+        }
+        // Goroutine thread: suppress — `goroutine_entry`'s catch_unwind will
+        // catch the panic and route it to the appropriate handler.
+    }));
+
     // Allow the GOMAXPROCS environment variable to override the caller's value.
     let nprocs = std::env::var("GOMAXPROCS")
         .ok()
