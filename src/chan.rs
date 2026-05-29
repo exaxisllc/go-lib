@@ -393,13 +393,20 @@ pub(crate) unsafe fn chanrecv<T: Send + 'static>(
             debug_assert!(!(*s2).elem.is_null(), "chanrecv: success but elem is null");
             let ep = (*s2).elem as *mut Option<T>;
             (*s2).elem = ptr::null_mut();
-            // ptr::read moves the Option<T> out without running its destructor on ep.
+            // ptr::read bitwise-copies the Option<T> out of *ep.  The allocation
+            // at `ep` still holds the original bytes, but ownership of T has been
+            // transferred to `val` — running Option<T>'s destructor on *ep would
+            // double-drop T.  Cast to ManuallyDrop<Option<T>> to free the Box
+            // allocation without triggering Option<T>::drop().
             let val = ptr::read(ep).expect("chanrecv: elem was None on success");
-            if boxed { let _ = Box::from_raw(ep); }
+            if boxed {
+                let _ = Box::from_raw(ep as *mut std::mem::ManuallyDrop<Option<T>>);
+            }
             Some(val)
         } else {
             if !(*s2).elem.is_null() {
-                // Channel was closed — slot is None; just free the allocation.
+                // Channel was closed — the slot contains None (T was never written).
+                // Dropping None does not touch any T; no ManuallyDrop needed.
                 let ep = (*s2).elem as *mut Option<T>;
                 (*s2).elem = ptr::null_mut();
                 if boxed { let _ = Box::from_raw(ep); }

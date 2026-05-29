@@ -54,6 +54,8 @@ use super::g::{
     GOBUF_BP_OFFSET, GOBUF_G_OFFSET,
     GOBUF_PC_OFFSET, GOBUF_SP_OFFSET,
 };
+#[cfg(windows)]
+use super::g::{G_STACK_HI_OFFSET, G_STACK_LO_OFFSET};
 
 // ---------------------------------------------------------------------------
 // gogo — restore saved state and jump
@@ -184,6 +186,26 @@ unsafe extern "C" fn mcall_asm(
         "mov rsp, [r8 + {sp}]",            // rsp = g0.sp (= g0.stack.hi — top of allocation)
         "mov rbp, [r8 + {bp}]",            // rbp = g0.bp
 
+        // ── restore TEB stack bounds to g0's stack ────────────────────────
+        // `gogo()` sets TEB to the goroutine's stack bounds before every
+        // context switch.  Now that we're on g0's stack, we must update the
+        // TEB to g0's bounds before any code runs on g0.  Without this,
+        // Windows sees RSP outside [StackLimit, StackBase) and either raises
+        // a spurious stack-overflow or attempts to auto-grow into unmapped
+        // memory (STATUS_ACCESS_VIOLATION, fault-type write).
+        //
+        // G.stack.lo / G.stack.hi are at byte offsets G_STACK_LO_OFFSET (0)
+        // and G_STACK_HI_OFFSET (8) because G is #[repr(C)] with `stack:
+        // Stack` as its first field.  g0_gobuf.g (GOBUF_G_OFFSET = 16) is
+        // the back-pointer to g0's G struct, set by G::new().
+        //
+        // r10 / r11 are caller-saved on Windows x64 — safe to clobber here.
+        "mov r10, [r8 + {g}]",             // r10 = G0* (g0_gobuf.g)
+        "mov r11, [r10 + {stack_lo}]",     // r11 = g0.stack.lo (new StackLimit)
+        "mov r10, [r10 + {stack_hi}]",     // r10 = g0.stack.hi (new StackBase)
+        "mov qword ptr gs:[0x10], r11",    // TEB.StackLimit = g0.stack.lo
+        "mov qword ptr gs:[0x08], r10",    // TEB.StackBase  = g0.stack.hi
+
         // ── call fn_ptr(g) on g0's stack ─────────────────────────────────
         // Microsoft x64 ABI requires the *caller* to allocate 32 bytes of
         // "home space" (shadow space) before any CALL.  Without it the callee
@@ -195,10 +217,12 @@ unsafe extern "C" fn mcall_asm(
         "call r9",
         "ud2",
 
-        pc = const GOBUF_PC_OFFSET,
-        sp = const GOBUF_SP_OFFSET,
-        bp = const GOBUF_BP_OFFSET,
-        g  = const GOBUF_G_OFFSET,
+        pc       = const GOBUF_PC_OFFSET,
+        sp       = const GOBUF_SP_OFFSET,
+        bp       = const GOBUF_BP_OFFSET,
+        g        = const GOBUF_G_OFFSET,
+        stack_lo = const G_STACK_LO_OFFSET,
+        stack_hi = const G_STACK_HI_OFFSET,
     )
 }
 
@@ -212,11 +236,40 @@ unsafe extern "C" fn mcall_asm(
 /// the switch sees the correct current goroutine.  The caller must have
 /// initialised `g.sched.sp` and `g.sched.pc` before calling.
 ///
+/// On Windows, the TEB `StackBase` / `StackLimit` fields are updated to
+/// reflect the goroutine's custom stack bounds before the RSP switch.
+/// Windows' exception dispatcher (`RtlDispatchException`) validates that
+/// the faulting RSP is inside `[TEB.StackLimit, TEB.StackBase)` before
+/// walking frame-based handlers.  Without this update, any `catch_unwind`
+/// inside a goroutine is silently bypassed and the process terminates with
+/// `0xe06d7363` (STATUS_CPP_EH_EXCEPTION).
+///
 /// Ported from the `execute` → `gogo` path in `runtime/proc.go` +
 /// `runtime/asm_amd64.s`.
 pub(crate) unsafe fn gogo(g: *mut G) -> ! {
     unsafe {
         set_current_g(g);
+
+        // Windows only: tell the OS about the goroutine's stack region so
+        // that SEH can find exception handlers while the goroutine runs.
+        #[cfg(windows)]
+        {
+            // Read the fields directly — Stack doesn't implement Copy, and
+            // moving out of a raw-pointer dereference requires Copy or
+            // ptr::read.  The two usize fields are trivially readable.
+            let stack_lo = (*g).stack.lo;
+            let stack_hi = (*g).stack.hi;
+            // GS:[0x08] = StackBase (exclusive high address of the stack).
+            // GS:[0x10] = StackLimit (current lowest committed stack address).
+            std::arch::asm!(
+                "mov qword ptr gs:[0x08], {hi}",
+                "mov qword ptr gs:[0x10], {lo}",
+                lo = in(reg) stack_lo,
+                hi = in(reg) stack_hi,
+                options(nostack, preserves_flags),
+            );
+        }
+
         gogo_asm(addr_of_mut!((*g).sched))
     }
 }
