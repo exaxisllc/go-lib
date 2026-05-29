@@ -52,7 +52,7 @@ use super::m::{current_m, M};
 use super::p::{GlobalRunQueue, P, PIDLE, PRUNNING};
 use super::stack::{grow_stack_if_needed, stack_alloc};
 #[cfg(not(windows))]
-use super::stack::install_sigsegv_handler;
+use super::stack::{install_sigsegv_handler, try_grow_stack_from_signal};
 use super::sysmon::start_sysmon;
 use super::time::start_timer_thread;
 
@@ -723,16 +723,32 @@ pub(crate) unsafe fn install_sigbus_handler() {
     *PREV_SIGBUS.lock().unwrap() = Some(old);
 }
 
-/// SIGBUS handler: print crash context (registers + backtrace) then abort.
+/// SIGBUS handler: grow goroutine stack on guard-page fault, or print diagnostics
+/// and abort for all other bus errors.
 ///
-/// Not async-signal-safe in the strictest sense, but we are aborting anyway;
-/// the goal is to emit useful diagnostics before the process exits.
+/// On macOS, `mprotect(PROT_NONE)` guard-page violations raise `SIGBUS` rather
+/// than `SIGSEGV` (Linux convention).  We therefore check for a goroutine
+/// guard-page fault first and, if found, grow the stack exactly as the SIGSEGV
+/// handler does.  Any other SIGBUS (misaligned access, hardware error, etc.)
+/// falls through to the diagnostic print + abort path.
+///
+/// Not async-signal-safe in the diagnostic path, but we are aborting anyway;
+/// the goal is to emit useful output before the process exits.
 #[cfg(not(windows))]
 unsafe extern "C" fn sigbus_handler(
     _sig:  libc::c_int,
-    _info: *mut libc::siginfo_t,
+    info:  *mut libc::siginfo_t,
     ctx:   *mut libc::c_void,
 ) {
+    // ── Guard-page fault? Grow the goroutine stack and retry. ────────────────
+    if !info.is_null() {
+        let fault_addr = unsafe { (*info).si_addr() } as usize;
+        if unsafe { try_grow_stack_from_signal(fault_addr, ctx) } {
+            return; // SP updated; OS will retry the faulting instruction
+        }
+    }
+
+    // ── Not a stack fault — print diagnostics and abort. ─────────────────────
     // Use write() directly for the first line — it is async-signal-safe.
     let msg = b"[go-lib SIGBUS] crash detected\n";
     unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len()) };
@@ -1643,6 +1659,7 @@ mod tests {
     fn global_run_queue_round_trip() {
         use crate::runtime::g::{Stack, G};
         use crate::runtime::p::GlobalRunQueue;
+        use crate::runtime::stack::GOROUTINE_STACK_BYTES;
 
         // Use a STANDALONE queue, not `sched().global_run_q`.
         // The live global queue is shared with background M-threads that call
@@ -1651,7 +1668,7 @@ mod tests {
         let q = GlobalRunQueue::new();
 
         let lo    = 0x200000usize;
-        let g1    = G::new(Stack { lo, hi: lo + 65536 }, 99);
+        let g1    = G::new(Stack { lo, hi: lo + GOROUTINE_STACK_BYTES }, 99);
         let g1_ptr = Box::into_raw(g1);
 
         unsafe {
