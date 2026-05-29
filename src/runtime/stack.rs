@@ -102,9 +102,27 @@ pub(crate) const STACK_MAX: usize = 1024 * 1024 * 1024;
 
 /// Initial stack size for every new goroutine.
 ///
-/// **Linux / macOS (all profiles) — 8 KiB**
-/// Matches Go's `stackMin`.  The SIGBUS/SIGSEGV growth handler grows the stack
-/// on demand when the guard page is touched.
+/// **Linux release — 8 KiB**
+/// Matches Go's `stackMin`.  The SIGSEGV growth handler grows the stack on
+/// demand when the guard page is touched.
+///
+/// **Linux debug — 16 KiB**
+/// Coverage and sanitiser builds produce deeper frames; 16 KiB avoids
+/// unnecessary growth-path invocations.
+///
+/// **macOS release — 8 KiB**
+/// Same semantics as Linux release; guard-page faults raise SIGBUS on macOS.
+///
+/// **macOS debug — 64 KiB**
+/// macOS-latest CI runs on Apple Silicon (AArch64) where the 16 KiB page
+/// makes each goroutine's memory footprint (stack + guard) at least 24 KiB.
+/// AArch64 debug frames are also larger than x86-64 due to mandatory callee-
+/// saved register spills (x19–x28, FP, LR = 10 × 8 B per frame minimum).
+/// 64 KiB ensures goroutines from high-concurrency tests (e.g.
+/// `many_goroutines` with 5 000 goroutines) do not overflow, which would
+/// trigger the AArch64 growth path and risk deadlock in the SIGBUS handler's
+/// diagnostic code.  This matches the original default from before this
+/// branch.
 ///
 /// **Windows debug — 64 KiB**
 /// Windows Structured Exception Handling pushes `EXCEPTION_RECORD` onto the
@@ -116,11 +134,11 @@ pub(crate) const STACK_MAX: usize = 1024 * 1024 * 1024;
 /// **Windows release — 8 KiB**
 /// Tight but workable; the proactive growth check in `grow_stack_if_needed`
 /// doubles the stack before the guard page is hit.
-#[cfg(all(windows, debug_assertions))]
+#[cfg(any(all(windows, debug_assertions), all(target_os = "macos", debug_assertions)))]
 pub(crate) const GOROUTINE_STACK_BYTES: usize = 64 * 1024;
-#[cfg(all(target_os = "macos", debug_assertions))]
-pub(crate) const GOROUTINE_STACK_BYTES: usize = 32 * 1024;
-#[cfg(not(any(all(windows, debug_assertions), all(target_os = "macos", debug_assertions))))]
+#[cfg(all(debug_assertions, not(any(windows, target_os = "macos"))))]
+pub(crate) const GOROUTINE_STACK_BYTES: usize = 16 * 1024;
+#[cfg(not(debug_assertions))]
 pub(crate) const GOROUTINE_STACK_BYTES: usize = 8 * 1024;
 
 /// Stack size for each M's g0 (the scheduler stack).
