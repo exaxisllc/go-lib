@@ -599,7 +599,7 @@ unsafe fn redirect_to_async_preempt(gp: *mut G, ctx: *mut libc::c_void) {
         *(new_rsp as *mut usize) = rip;
         (*uc).uc_mcontext.gregs[libc::REG_RSP as usize] = new_rsp as libc::greg_t;
         (*uc).uc_mcontext.gregs[libc::REG_RIP as usize] =
-            async_preempt_trampoline as usize as libc::greg_t;
+            async_preempt_trampoline as *const () as usize as libc::greg_t;
     }
 
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]

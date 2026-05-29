@@ -762,8 +762,10 @@ mod tests {
                 let end = start+N;
                 let tx_clone = tx.clone();
                 let wg_clone = Arc::clone(&wg);
+                // add(1) must happen before spawn_goroutine so that wg.wait()
+                // cannot return before all producers have registered themselves.
+                wg_clone.add(1);
                 spawn_goroutine(move || {
-                    wg_clone.add(1);
                     for i in start..end { tx_clone.send(i); }
                     wg_clone.done()
                 });
