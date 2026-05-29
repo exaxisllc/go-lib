@@ -22,7 +22,7 @@ go_lib::run(|| {
 });
 ```
 
-No `async`, no Tokio, no executor. Every goroutine starts with an 8 KiB stack (matching Go's `stackMin`; 32 KiB on macOS debug builds, 64 KiB on Windows debug builds) that grows automatically on demand (up to 1 GiB). The runtime is a work-stealing M:N scheduler ported verbatim from [`src/runtime/`](https://github.com/golang/go/tree/master/src/runtime) in the Go GitHub repository.
+No `async`, no Tokio, no executor. Every goroutine starts with an 8 KiB stack in release builds (matching Go's `stackMin`; 16 KiB on Linux debug, 32 KiB on macOS debug, 64 KiB on Windows debug) that grows automatically on demand (up to 1 GiB). The runtime is a work-stealing M:N scheduler ported verbatim from [`src/runtime/`](https://github.com/golang/go/tree/master/src/runtime) in the Go GitHub repository.
 
 ---
 
