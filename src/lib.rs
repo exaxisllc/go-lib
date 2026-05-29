@@ -27,7 +27,7 @@
 //! See [`runtime`] for the scheduler (G/M/P, parking, work stealing, sysmon,
 //! stack growth, async preemption, netpoll).
 //!
-//! ## v0.3.2 — new in this release
+//! ## v0.4.0 — new in this release
 //!
 //! - **`scope` / `ScopedJoinHandle`**: scoped goroutines with safe short-lived
 //!   borrows, mirroring `std::thread::scope`.  Goroutines spawned inside a

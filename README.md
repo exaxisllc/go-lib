@@ -78,7 +78,7 @@ No `async`, no Tokio, no executor. Every goroutine starts with a 64 KiB stack th
 | CI — standard + loom jobs on every push/PR | ✅ v0.2.0 |
 | G state machine — `casgstatus`, `GSYSCALL`, `GCOPYSTACK`, `GPREEMPTED`, `GSCAN` | ✅ v0.3.1 |
 | `systemstack` — run closure on M's g0 stack (naked-asm RSP/SP switch) | ✅ v0.3.1 |
-| `scope` — scoped goroutines with safe short-lived borrows | ✅ v0.3.2 |
+| `scope` — scoped goroutines with safe short-lived borrows | ✅ v0.4.0 |
 
 ---
 
