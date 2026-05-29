@@ -127,6 +127,7 @@ cargo run --example pipeline
 cargo run --example select_fanin
 cargo run --example cond
 cargo run --example scope           # scoped goroutines, safe borrows
+cargo run --example scope_channel   # scope + channel producer/consumer
 cargo run --example main_exitcode   # main() -> ExitCode
 cargo run --example main_result     # main() -> Result<(), E>
 cargo run --example attr_run        # all three #[go_lib::run] patterns
@@ -245,11 +246,44 @@ go_lib::run(|| {
 
 The `Err` payload from a panicking goroutine is the same `Box<dyn Any + Send>` you would receive from `std::panic::catch_unwind`.  Dropping a `ScopedJoinHandle` without calling `join` is safe — the goroutine still runs to completion; its result is simply discarded.
 
+Channels work normally inside `s.go()` closures.  The scope lifetime guarantee means both goroutines finish before `scope` returns — no `Arc` or `WaitGroup` needed.  Call `tx.close()` after the last send so the consumer's `while let Some` loop terminates:
+
+```rust
+go_lib::run(|| {
+    let (tx, rx) = go_lib::chan::chan::<i32>(0); // unbuffered
+
+    let sum = go_lib::scope(|s| {
+        // Producer: send 0..10 then close to signal end-of-stream.
+        s.go(move || {
+            for i in 0..10 {
+                tx.send(i);
+            }
+            tx.close();
+        });
+
+        // Consumer: drain until the channel is closed and empty.
+        s.go(move || {
+            let mut total = 0_i32;
+            while let Some(v) = rx.recv() {
+                total += v;
+            }
+            total
+        })
+        .join()
+        .expect("consumer panicked")
+    });
+    // scope() returns here — both goroutines have finished.
+
+    assert_eq!(sum, 45); // 0 + 1 + … + 9
+});
+```
+
 **When to prefer `scope` over `go!` + channel:**
 
 | Pattern | Use when |
 |---|---|
 | `scope` | Goroutines are short-lived helpers that read (or write exclusively to) local data |
+| `scope` + channel | Paired producer/consumer with a bounded lifetime and a single collected result |
 | `go!` + channel | Long-running goroutines, or when results need to be streamed/merged as they arrive |
 | `WaitGroup` | Fire-and-forget goroutines that do side effects but produce no return value |
 
@@ -769,6 +803,46 @@ fn main() {
 ```
 
 The goroutines borrow slices of `data` directly from the enclosing goroutine's stack frame — no `Arc` or channel needed.
+
+---
+
+### scope\_channel — producer/consumer inside a scope
+
+When goroutines need to stream values between each other, channels work normally inside `s.go()` closures.  Calling `tx.close()` after the last send signals the consumer that the stream is finished — the same semantics as `close(ch)` in Go.
+
+```rust
+// examples/scope_channel.rs
+fn main() {
+    let sum = go_lib::run(|| {
+        let (tx, rx) = go_lib::chan::chan::<i32>(0); // unbuffered
+
+        go_lib::scope(|s| {
+            // Producer: send 0..10, then close so the consumer terminates.
+            s.go(move || {
+                for i in 0..10 {
+                    tx.send(i);
+                }
+                tx.close();
+            });
+
+            // Consumer: drain until the channel is closed and empty.
+            s.go(move || {
+                let mut total = 0_i32;
+                while let Some(v) = rx.recv() {
+                    total += v;
+                }
+                total
+            })
+            .join()
+            .expect("consumer goroutine panicked")
+        })
+        // scope() blocks here until both goroutines have finished.
+    });
+
+    println!("sum 0..10 = {sum}");
+    assert_eq!(sum, 45); // 0 + 1 + … + 9 = 45
+}
+```
 
 ---
 
