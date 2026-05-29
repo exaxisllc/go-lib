@@ -191,8 +191,8 @@ where
 ///     let data = vec![1_i64, 2, 3, 4, 5];
 ///
 ///     let sum = go_lib::scope(|s| {
-///         let h1 = s.spawn(|| data[..3].iter().sum::<i64>());
-///         let h2 = s.spawn(|| data[3..].iter().sum::<i64>());
+///         let h1 = s.go(|| data[..3].iter().sum::<i64>());
+///         let h2 = s.go(|| data[3..].iter().sum::<i64>());
 ///         h1.join().unwrap() + h2.join().unwrap()
 ///     });
 ///

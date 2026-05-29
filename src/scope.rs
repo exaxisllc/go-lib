@@ -17,7 +17,7 @@
 //!   exactly as long as the closure passed to [`scope`] runs.
 //! - The bound `'env: 'scope` ensures that borrowed data outlives the scope.
 //!
-//! Inside [`Scope::spawn`] the closure's `'scope` lifetime is erased to
+//! Inside [`Scope::go`] the closure's `'scope` lifetime is erased to
 //! `'static` (via `transmute`) so it can be handed to the scheduler.  This is
 //! sound because [`scope`] blocks (via `WaitGroup::wait`) until every spawned
 //! goroutine has called `wg.done()`, which happens only after the closure
@@ -48,8 +48,8 @@
 //!     let data = vec![1_i64, 2, 3, 4, 5];
 //!
 //!     let sum = go_lib::scope(|s| {
-//!         let h1 = s.spawn(|| data[..3].iter().sum::<i64>());
-//!         let h2 = s.spawn(|| data[3..].iter().sum::<i64>());
+//!         let h1 = s.go(|| data[..3].iter().sum::<i64>());
+//!         let h2 = s.go(|| data[3..].iter().sum::<i64>());
 //!         h1.join().unwrap() + h2.join().unwrap()
 //!     });
 //!
@@ -79,7 +79,7 @@ struct ScopeData {
 /// A scope for spawning goroutines with bounded lifetimes.
 ///
 /// Obtained by calling [`scope`].  Every goroutine spawned via
-/// [`Scope::spawn`] is guaranteed to finish before [`scope`] returns, which
+/// [`Scope::go`] is guaranteed to finish before [`scope`] returns, which
 /// allows closures to borrow data with lifetime `'env` without requiring
 /// `'static`.
 ///
@@ -139,7 +139,7 @@ impl<'scope, R: Send + 'static> ScopedJoinHandle<'scope, R> {
 }
 
 // ---------------------------------------------------------------------------
-// Scope::spawn
+// Scope::go
 // ---------------------------------------------------------------------------
 
 impl<'scope, 'env: 'scope> Scope<'scope, 'env> {
@@ -151,7 +151,7 @@ impl<'scope, 'env: 'scope> Scope<'scope, 'env> {
     /// Returns a [`ScopedJoinHandle`] for optional early joining.  If you do
     /// not need the return value, simply drop the handle; the goroutine still
     /// runs to completion before the surrounding [`scope`] returns.
-    pub fn spawn<F, R>(&'scope self, f: F) -> ScopedJoinHandle<'scope, R>
+    pub fn go<F, R>(&'scope self, f: F) -> ScopedJoinHandle<'scope, R>
     where
         F: FnOnce() -> R + Send + 'scope,
         R: Send + 'static,
@@ -164,6 +164,8 @@ impl<'scope, 'env: 'scope> Scope<'scope, 'env> {
         let (tx, rx) = crate::chan::chan::<std::thread::Result<R>>(1);
 
         // Erase `'scope` → `'static` so `spawn_goroutine` accepts the closure.
+        // (The public method is named `go`; `spawn_goroutine` is the internal
+        // scheduler primitive and keeps its own name.)
         //
         // SAFETY: `scope` calls `data.wg.wait()` before it returns, which
         // parks until every goroutine has called `data.wg.done()`.  That
@@ -202,7 +204,7 @@ impl<'scope, 'env: 'scope> Scope<'scope, 'env> {
 ///
 /// `scope` is the goroutine equivalent of [`std::thread::scope`].  The
 /// closure receives a [`&Scope`][Scope] handle; goroutines spawned via
-/// [`Scope::spawn`] may borrow any data that is alive in the caller's
+/// [`Scope::go`] may borrow any data that is alive in the caller's
 /// environment (`'env`).  All spawned goroutines are guaranteed to finish
 /// before `scope` returns.
 ///
@@ -236,8 +238,8 @@ impl<'scope, 'env: 'scope> Scope<'scope, 'env> {
 ///     let data = vec![1_i64, 2, 3, 4, 5];
 ///
 ///     let sum = go_lib::scope(|s| {
-///         let h1 = s.spawn(|| data[..3].iter().sum::<i64>());
-///         let h2 = s.spawn(|| data[3..].iter().sum::<i64>());
+///         let h1 = s.go(|| data[..3].iter().sum::<i64>());
+///         let h2 = s.go(|| data[3..].iter().sum::<i64>());
 ///         h1.join().unwrap() + h2.join().unwrap()
 ///     });
 ///
@@ -255,7 +257,7 @@ impl<'scope, 'env: 'scope> Scope<'scope, 'env> {
 ///
 ///     go_lib::scope(|s| {
 ///         for _ in 0..8 {
-///             s.spawn(|| { counter.fetch_add(1, Ordering::Relaxed); });
+///             s.go(|| { counter.fetch_add(1, Ordering::Relaxed); });
 ///         }
 ///         // scope blocks here until all 8 goroutines have finished
 ///     });
@@ -318,8 +320,8 @@ mod tests {
             let data = [1_i64, 2, 3, 4, 5];
 
             let sum = scope(|s| {
-                let h1 = s.spawn(|| data[..3].iter().sum::<i64>());
-                let h2 = s.spawn(|| data[3..].iter().sum::<i64>());
+                let h1 = s.go(|| data[..3].iter().sum::<i64>());
+                let h2 = s.go(|| data[3..].iter().sum::<i64>());
                 h1.join().unwrap() + h2.join().unwrap()
             });
 
@@ -337,7 +339,7 @@ mod tests {
 
             scope(|s| {
                 for _ in 0..8 {
-                    s.spawn(|| { counter.fetch_add(1, Ordering::Relaxed); });
+                    s.go(|| { counter.fetch_add(1, Ordering::Relaxed); });
                 }
                 // All handles dropped here; scope will wait for all goroutines.
             });
@@ -352,7 +354,7 @@ mod tests {
     fn goroutine_panic_via_join() {
         run_impl(|| {
             let result = scope(|s| {
-                let h = s.spawn(|| -> i32 { panic!("scoped panic") });
+                let h = s.go(|| -> i32 { panic!("scoped panic") });
                 // join() returns Result — no resume_unwind across scheduling boundaries
                 h.join()
             });
@@ -372,7 +374,7 @@ mod tests {
         run_impl(|| {
             // Should not propagate — the handle is dropped without join().
             scope(|s| {
-                let _h = s.spawn(|| -> i32 { panic!("silent panic") });
+                let _h = s.go(|| -> i32 { panic!("silent panic") });
                 // _h dropped here
             });
             // scope returns normally
@@ -386,12 +388,12 @@ mod tests {
             let outer = [10_i64, 20, 30];
 
             let total = scope(|s_outer| {
-                let h = s_outer.spawn(|| {
+                let h = s_outer.go(|| {
                     // Inner scope borrows both `outer` and its own locals.
                     let inner = [1_i64, 2, 3];
                     scope(|s_inner| {
-                        let h1 = s_inner.spawn(|| inner.iter().sum::<i64>());
-                        let h2 = s_inner.spawn(|| outer.iter().sum::<i64>());
+                        let h1 = s_inner.go(|| inner.iter().sum::<i64>());
+                        let h2 = s_inner.go(|| outer.iter().sum::<i64>());
                         h1.join().unwrap() + h2.join().unwrap()
                     })
                 });
@@ -410,7 +412,7 @@ mod tests {
             let finished = AtomicI32::new(0);
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 scope(|s| {
-                    s.spawn(|| { finished.fetch_add(1, Ordering::Relaxed); });
+                    s.go(|| { finished.fetch_add(1, Ordering::Relaxed); });
                     panic!("outer panic");
                     #[allow(unreachable_code)]
                     42_i32

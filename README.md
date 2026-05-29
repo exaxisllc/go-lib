@@ -210,8 +210,8 @@ go_lib::run(|| {
 
 ```rust
 go_lib::scope(|s| {
-    let h1 = s.spawn(|| /* closure that may borrow from outer scope */);
-    let h2 = s.spawn(|| /* … */);
+    let h1 = s.go(|| /* closure that may borrow from outer scope */);
+    let h2 = s.go(|| /* … */);
     h1.join().unwrap() + h2.join().unwrap()
 })
 ```
@@ -228,8 +228,8 @@ go_lib::run(|| {
 
     let sum = go_lib::scope(|s| {
         let mid = data.len() / 2;
-        let h1 = s.spawn(|| data[..mid].iter().sum::<i64>());
-        let h2 = s.spawn(|| data[mid..].iter().sum::<i64>());
+        let h1 = s.go(|| data[..mid].iter().sum::<i64>());
+        let h2 = s.go(|| data[mid..].iter().sum::<i64>());
         h1.join().unwrap() + h2.join().unwrap()
     });
 
@@ -237,7 +237,7 @@ go_lib::run(|| {
 });
 ```
 
-`s.spawn(f)` returns a `ScopedJoinHandle<'scope, R>`:
+`s.go(f)` returns a `ScopedJoinHandle<'scope, R>`:
 
 | Method | Description |
 |---|---|
@@ -753,7 +753,7 @@ fn main() {
 
             let handles: Vec<_> = chunks
                 .into_iter()
-                .map(|chunk| s.spawn(move || chunk.iter().sum::<i64>()))
+                .map(|chunk| s.go(move || chunk.iter().sum::<i64>()))
                 .collect();
 
             handles
@@ -786,7 +786,7 @@ fn main() -> ExitCode {
 
         let results = go_lib::scope(|s| {
             let handles: Vec<_> = (0..N)
-                .map(|id| s.spawn(move || (id, run_task(id))))
+                .map(|id| s.go(move || (id, run_task(id))))
                 .collect();
             handles
                 .into_iter()
@@ -835,7 +835,7 @@ fn main() -> Result<(), ParseIntError> {
         let sum: i64 = go_lib::scope(|scope| -> Result<i64, ParseIntError> {
             let handles: Vec<_> = inputs
                 .iter()
-                .map(|s| scope.spawn(move || s.parse::<i64>()))
+                .map(|s| scope.go(move || s.parse::<i64>()))
                 .collect();
             // h.join().unwrap() strips the panic wrapper; ? propagates ParseIntError.
             handles

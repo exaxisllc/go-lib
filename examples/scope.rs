@@ -28,7 +28,7 @@ fn main() {
 
             let handles: Vec<_> = chunks
                 .into_iter()
-                .map(|chunk| s.spawn(move || chunk.iter().sum::<i64>()))
+                .map(|chunk| s.go(move || chunk.iter().sum::<i64>()))
                 .collect();
 
             handles

@@ -25,7 +25,7 @@ fn main() -> Result<(), ParseIntError> {
         let sum: i64 = go_lib::scope(|scope| -> Result<i64, ParseIntError> {
             let handles: Vec<_> = inputs
                 .iter()
-                .map(|s| scope.spawn(move || s.parse::<i64>()))
+                .map(|s| scope.go(move || s.parse::<i64>()))
                 .collect();
 
             // Fold results: h.join().unwrap() strips the panic wrapper;

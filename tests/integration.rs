@@ -430,8 +430,8 @@ fn scope_parallel_reduction() {
         let data: Vec<i64> = (1..=100).collect();
         scope(|s| {
             let mid = data.len() / 2;
-            let h1 = s.spawn(|| data[..mid].iter().sum::<i64>());
-            let h2 = s.spawn(|| data[mid..].iter().sum::<i64>());
+            let h1 = s.go(|| data[..mid].iter().sum::<i64>());
+            let h2 = s.go(|| data[mid..].iter().sum::<i64>());
             h1.join().unwrap() + h2.join().unwrap()
         })
     });
@@ -447,7 +447,7 @@ fn scope_parallel_reduction() {
 fn scope_goroutine_panic_surfaces_via_join() {
     go_lib::run(|| {
         let result = scope(|s| {
-            let h = s.spawn(|| -> i32 { panic!("intentional scope panic") });
+            let h = s.go(|| -> i32 { panic!("intentional scope panic") });
             h.join() // should be Err, not a process abort
         });
         assert!(result.is_err(), "expected Err from panicking goroutine");

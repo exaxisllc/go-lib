@@ -24,7 +24,7 @@ fn main() -> ExitCode {
         // Spawn N tasks concurrently; collect (id, ok) from each join handle.
         let results = go_lib::scope(|s| {
             let handles: Vec<_> = (0..N)
-                .map(|id| s.spawn(move || (id, run_task(id))))
+                .map(|id| s.go(move || (id, run_task(id))))
                 .collect();
             handles
                 .into_iter()
