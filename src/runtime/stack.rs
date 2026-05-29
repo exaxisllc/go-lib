@@ -102,25 +102,37 @@ pub(crate) const STACK_MAX: usize = 1024 * 1024 * 1024;
 
 /// Initial stack size for every new goroutine.
 ///
-/// **Linux / macOS (all profiles) — 8 KiB**
-/// Matches Go's `stackMin`.  The SIGBUS/SIGSEGV growth handler grows the stack
-/// on demand when the guard page is touched.
+/// ## Platform table
 ///
-/// **Windows debug — 64 KiB**
-/// Windows Structured Exception Handling pushes `EXCEPTION_RECORD` onto the
-/// *current* goroutine stack before the VEH fires.  If the stack is already
-/// exhausted the write faults silently and the process terminates before the
-/// handler runs.  Debug frames are also 3–5× larger.  64 KiB provides the
-/// required headroom.
+/// | Platform | Profile | Size | Notes |
+/// |---|---|---|---|
+/// | Linux / other Unix | release | 8 KiB | Matches Go's `stackMin` |
+/// | Linux / other Unix | debug | 16 KiB | Avoids signal-growth hazard under coverage/sanitiser builds |
+/// | macOS | release | 8 KiB | Same as Linux release |
+/// | macOS | debug | 32 KiB | SIGBUS growth path + deep `panic!` frames need extra room |
+/// | Windows | release | 8 KiB | Proactive growth handles overflow |
+/// | Windows | debug | 64 KiB | SEH/VEH + 3–5× larger frames require full headroom |
 ///
-/// **Windows release — 8 KiB**
-/// Tight but workable; the proactive growth check in `grow_stack_if_needed`
-/// doubles the stack before the guard page is hit.
+/// ## Why debug builds need larger stacks
+///
+/// The signal-based growth path (`SIGSEGV` on Linux, `SIGBUS` on macOS) has a
+/// known instruction-retry hazard: the faulting `push`/`sub` instruction has
+/// already decremented RSP before the signal fires.  When the handler returns
+/// and the OS retries the *same* instruction, RSP is decremented a second time,
+/// corrupting the caller's frame.  The correct fix requires either compiler-
+/// generated `morestack` checks (like Go's runtime) or instruction-level
+/// emulation in the signal handler; both are future work.
+///
+/// In the meantime, the larger initial sizes ensure that goroutines in debug and
+/// coverage builds do not reach the guard page in the first place.  In release
+/// builds, frame sizes are 3–5× smaller and the growth path is rarely needed.
 #[cfg(all(windows, debug_assertions))]
 pub(crate) const GOROUTINE_STACK_BYTES: usize = 64 * 1024;
 #[cfg(all(target_os = "macos", debug_assertions))]
 pub(crate) const GOROUTINE_STACK_BYTES: usize = 32 * 1024;
-#[cfg(not(any(all(windows, debug_assertions), all(target_os = "macos", debug_assertions))))]
+#[cfg(all(debug_assertions, not(any(windows, target_os = "macos"))))]
+pub(crate) const GOROUTINE_STACK_BYTES: usize = 16 * 1024;
+#[cfg(not(debug_assertions))]
 pub(crate) const GOROUTINE_STACK_BYTES: usize = 8 * 1024;
 
 /// Stack size for each M's g0 (the scheduler stack).
@@ -430,6 +442,35 @@ unsafe fn copystack(gp: *mut G, old_stack: &Stack, new_stack: &Stack) -> isize {
 // Windows does not have POSIX signals; guard-page faults are handled instead
 // by the proactive `grow_stack_if_needed` checkpoint in the scheduler.
 
+// ---------------------------------------------------------------------------
+// Async-signal-safe diagnostic helpers
+// ---------------------------------------------------------------------------
+
+/// Write a byte slice to stderr using the `write(2)` syscall.
+/// Async-signal-safe: no heap allocation, no Rust I/O locks.
+#[cfg(not(windows))]
+#[inline]
+unsafe fn sig_write(msg: &[u8]) {
+    unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len()) };
+}
+
+/// Write `prefix` followed by `val` as `0xXXXXXXXXXXXXXXXX\n` to stderr.
+/// Async-signal-safe: uses only stack-allocated storage.
+#[cfg(not(windows))]
+unsafe fn sig_write_hex(prefix: &[u8], val: usize) {
+    unsafe { sig_write(prefix) };
+    const HEX: &[u8] = b"0123456789abcdef";
+    // "0x" + 16 hex digits + "\n" = 19 bytes
+    let mut buf = [b'0'; 19];
+    buf[0] = b'0';
+    buf[1] = b'x';
+    for i in 0..16usize {
+        buf[17 - i] = HEX[(val >> (i * 4)) & 0xf];
+    }
+    buf[18] = b'\n';
+    unsafe { sig_write(&buf) };
+}
+
 /// Previous SIGSEGV handler (chained if fault is not a stack overflow).
 #[cfg(not(windows))]
 static PREV_SIGSEGV: Mutex<Option<libc::sigaction>> = Mutex::new(None);
@@ -478,6 +519,7 @@ pub(crate) unsafe fn install_sigsegv_handler() {
 /// stack.lo`), which is always correct: copying a few extra dead bytes is safe,
 /// but missing live frames is not.
 ///
+<<<<<<< HEAD
 /// ## Why we adjust all general-purpose registers
 ///
 /// A function that overflows the guard page may compute a stack address via a
@@ -492,6 +534,17 @@ pub(crate) unsafe fn install_sigsegv_handler() {
 /// whose values fall in `[old_lo − page_size, old_hi)` — the usable old stack
 /// plus the guard page — by `delta`, relocating every potentially stale stack
 /// reference to the equivalent location in the new, larger stack.
+=======
+/// ## Why we adjust FP and callee-saved registers
+///
+/// `update_sp_in_context` adjusts not just SP but also the frame pointer
+/// (x29 / RBP) and callee-saved registers (x19–x28 on AArch64) in the
+/// interrupted `ucontext_t`.  Those registers hold the caller's frame pointer
+/// and local variables that point into the old stack.  If left unadjusted they
+/// would cause a second fault (use-after-`munmap`) the moment any `ret`
+/// instruction restores a saved FP from the new stack, because the restored
+/// value still refers to the freed old mapping.
+>>>>>>> fd7d5d7 (fix: use 16 KiB initial stack on Linux debug to fix coverage CI failure)
 ///
 /// Returns `true` if the fault was a goroutine stack overflow and has been
 /// handled (caller should return from the signal handler); `false` if the fault
@@ -502,16 +555,35 @@ pub(crate) unsafe fn try_grow_stack_from_signal(
     ctx:        *mut libc::c_void,
 ) -> bool {
     let gp = current_g();
-    if gp.is_null() { return false; }
+    if gp.is_null() {
+        unsafe { sig_write(b"[stack-growth] gp null\n") };
+        return false;
+    }
 
     let stack_lo = unsafe { (*gp).stack.lo };
     let stack_hi = unsafe { (*gp).stack.hi };
     let guard_lo = stack_lo - page_size();
     let guard_hi = stack_lo;
+<<<<<<< HEAD
+=======
+
+    unsafe {
+        sig_write(b"[stack-growth] SIGBUS/SIGSEGV: guard-page check\n");
+        sig_write_hex(b"  fault_addr = ", fault_addr);
+        sig_write_hex(b"  guard_lo   = ", guard_lo);
+        sig_write_hex(b"  guard_hi   = ", guard_hi);
+        sig_write_hex(b"  stack.lo   = ", stack_lo);
+        sig_write_hex(b"  stack.hi   = ", stack_hi);
+        sig_write_hex(b"  sched.sp   = ", (*gp).sched.sp);
+    }
+>>>>>>> fd7d5d7 (fix: use 16 KiB initial stack on Linux debug to fix coverage CI failure)
 
     if fault_addr < guard_lo || fault_addr >= guard_hi {
-        return false; // not a goroutine stack overflow
+        unsafe { sig_write(b"[stack-growth] not a guard-page fault, skipping\n") };
+        return false;
     }
+
+    unsafe { sig_write(b"[stack-growth] guard-page fault confirmed, growing stack\n") };
 
     // Force copystack to copy the full old stack (see doc comment above).
     unsafe { (*gp).sched.sp = 0 };
@@ -520,10 +592,26 @@ pub(crate) unsafe fn try_grow_stack_from_signal(
     let old_lo = stack_lo;
     let old_hi = stack_hi;
 
+<<<<<<< HEAD
     // Grow the stack; adjust all GPRs that hold old-stack references so that
     // the OS-retried faulting instruction succeeds on the new stack.
     let delta = unsafe { newstack(gp) };
     unsafe { update_sp_in_context(ctx, old_lo, old_hi, delta) };
+=======
+    // Grow the stack; adjust SP *and* frame pointer + callee-saved registers
+    // in the signal context so the faulting instruction retries successfully.
+    let delta = unsafe { newstack(gp) };
+
+    unsafe {
+        sig_write_hex(b"[stack-growth] delta      = ", delta as usize);
+        sig_write_hex(b"[stack-growth] new stack.lo = ", (*gp).stack.lo);
+        sig_write_hex(b"[stack-growth] new stack.hi = ", (*gp).stack.hi);
+    }
+
+    unsafe { update_sp_in_context(ctx, old_lo, old_hi, delta) };
+
+    unsafe { sig_write(b"[stack-growth] stack growth complete\n") };
+>>>>>>> fd7d5d7 (fix: use 16 KiB initial stack on Linux debug to fix coverage CI failure)
     true
 }
 
@@ -556,6 +644,7 @@ unsafe extern "C" fn sigsegv_handler(
     }
 }
 
+<<<<<<< HEAD
 /// Return the number of bytes that SP was **pre-decremented** by the faulting
 /// AArch64 instruction at `pc`, or 0 if the instruction does not pre-decrement.
 ///
@@ -615,6 +704,17 @@ unsafe fn sp_predecrement_at_pc(pc: usize) -> usize {
 ///    handles the `lea rdi, [rbp−N]` pattern while avoiding false-positive
 ///    adjustments of heap pointers that could coincide with the usable-stack
 ///    address range when many goroutines are active.
+=======
+/// Update the interrupted register state saved in the signal `ucontext_t` after
+/// a goroutine stack has been grown.
+///
+/// Always adjusts SP by `delta`.  Also conditionally adjusts the frame pointer
+/// (x29 / RBP) and callee-saved registers (x19–x28 on AArch64) when their
+/// current values fall within `[old_lo, old_hi)` — i.e., they point into the
+/// old stack that has just been freed.  Without this, the first `ret` that
+/// restores a saved FP from the new (copied) stack will load the old address,
+/// triggering a second fault on the now-unmapped pages.
+>>>>>>> fd7d5d7 (fix: use 16 KiB initial stack on Linux debug to fix coverage CI failure)
 ///
 /// Platform-specific: Linux x86-64, Linux AArch64, macOS x86-64, macOS AArch64.
 #[cfg(not(windows))]
@@ -624,6 +724,7 @@ unsafe fn update_sp_in_context(
     old_hi: usize,
     delta:  isize,
 ) {
+<<<<<<< HEAD
     // old_guard_lo: start of the old guard page (PROT_NONE region).
     // No valid heap allocation can point into [old_guard_lo, old_lo).
     let old_guard_lo = old_lo.saturating_sub(page_size());
@@ -633,10 +734,22 @@ unsafe fn update_sp_in_context(
     fn adj(val: u64, lo: usize, hi: usize, delta: isize) -> u64 {
         let v = val as usize;
         if v >= lo && v < hi { (v as isize + delta) as u64 } else { val }
+=======
+    /// Adjust `val` by `delta` iff it falls within `[old_lo, old_hi)`.
+    #[inline(always)]
+    fn adj(val: u64, old_lo: usize, old_hi: usize, delta: isize) -> u64 {
+        let v = val as usize;
+        if v >= old_lo && v < old_hi {
+            (v as isize + delta) as u64
+        } else {
+            val
+        }
+>>>>>>> fd7d5d7 (fix: use 16 KiB initial stack on Linux debug to fix coverage CI failure)
     }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     unsafe {
+<<<<<<< HEAD
         use libc::{REG_RAX,REG_RBX,REG_RCX,REG_RDX,REG_RSI,REG_RDI,
                    REG_RBP,REG_RSP,REG_R8,REG_R9,REG_R10,REG_R11,
                    REG_R12,REG_R13,REG_R14,REG_R15};
@@ -652,10 +765,21 @@ unsafe fn update_sp_in_context(
             let v = mc.gregs[reg as usize] as u64;
             mc.gregs[reg as usize] = adj(v, old_guard_lo, old_lo, delta) as libc::greg_t;
         }
+=======
+        let uc  = ctx as *mut libc::ucontext_t;
+        let mc  = &mut (*uc).uc_mcontext;
+        // SP always points into the old stack at fault time.
+        let rsp = mc.gregs[libc::REG_RSP as usize] as isize;
+        mc.gregs[libc::REG_RSP as usize] = (rsp + delta) as libc::greg_t;
+        // Adjust RBP (frame pointer) if it points into the old stack.
+        let rbp = mc.gregs[libc::REG_RBP as usize] as u64;
+        mc.gregs[libc::REG_RBP as usize] = adj(rbp, old_lo, old_hi, delta) as libc::greg_t;
+>>>>>>> fd7d5d7 (fix: use 16 KiB initial stack on Linux debug to fix coverage CI failure)
     }
 
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
     unsafe {
+<<<<<<< HEAD
         let mc = &mut (*(ctx as *mut libc::ucontext_t)).uc_mcontext;
         // SP and FP (x29): full range.
         mc.sp       = adj(mc.sp,       old_guard_lo, old_hi, delta);
@@ -673,10 +797,24 @@ unsafe fn update_sp_in_context(
         // Undo the pre-decrement so the retry instruction lands correctly.
         let correction = sp_predecrement_at_pc(mc.pc as usize) as u64;
         if correction != 0 { mc.sp += correction; }
+=======
+        let uc = ctx as *mut libc::ucontext_t;
+        let mc = &mut (*uc).uc_mcontext;
+        // SP always points into the old stack at fault time.
+        let sp = mc.sp as isize;
+        mc.sp = (sp + delta) as u64;
+        // x29 (frame pointer) — almost always points into the old stack.
+        mc.regs[29] = adj(mc.regs[29], old_lo, old_hi, delta);
+        // Callee-saved x19–x28 may hold references to old-stack locals.
+        for i in 19..=28usize {
+            mc.regs[i] = adj(mc.regs[i], old_lo, old_hi, delta);
+        }
+>>>>>>> fd7d5d7 (fix: use 16 KiB initial stack on Linux debug to fix coverage CI failure)
     }
 
     #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
     unsafe {
+<<<<<<< HEAD
         let ss = &mut (*(*  (ctx as *mut libc::ucontext_t)).uc_mcontext).__ss;
         // SP, FP, callee-saved: full range.  Skip __rip (code pointer).
         ss.__rsp = adj(ss.__rsp, old_guard_lo, old_hi, delta);
@@ -698,10 +836,20 @@ unsafe fn update_sp_in_context(
         ss.__r11 = adj(ss.__r11, old_guard_lo, old_lo, delta);
         // Note: x86-64 `push rXX` that page-faults does NOT commit the RSP
         // decrement (the push is atomic).  No SP correction is needed.
+=======
+        let uc = ctx as *mut libc::ucontext_t;
+        // uc_mcontext is *mut __darwin_mcontext64; __ss is __darwin_x86_thread_state64_t.
+        let ss = &mut (*(*uc).uc_mcontext).__ss;
+        // SP always points into the old stack at fault time.
+        ss.__rsp = (ss.__rsp as isize + delta) as u64;
+        // Adjust RBP (frame pointer) if it points into the old stack.
+        ss.__rbp = adj(ss.__rbp, old_lo, old_hi, delta);
+>>>>>>> fd7d5d7 (fix: use 16 KiB initial stack on Linux debug to fix coverage CI failure)
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     unsafe {
+<<<<<<< HEAD
         let ss = &mut (*(*(ctx as *mut libc::ucontext_t)).uc_mcontext).__ss;
         // SP and FP (__fp = x29): full range.
         ss.__sp = adj(ss.__sp, old_guard_lo, old_hi, delta);
@@ -717,6 +865,18 @@ unsafe fn update_sp_in_context(
         // AArch64 pre-indexed stores commit SP before the data-abort.
         let correction = sp_predecrement_at_pc(ss.__pc as usize) as u64;
         if correction != 0 { ss.__sp += correction; }
+=======
+        let uc = ctx as *mut libc::ucontext_t;
+        let ss = &mut (*(*uc).uc_mcontext).__ss;
+        // SP always points into the old stack at fault time.
+        ss.__sp = (ss.__sp as isize + delta) as u64;
+        // x29 (frame pointer, __fp) — almost always points into the old stack.
+        ss.__fp = adj(ss.__fp, old_lo, old_hi, delta);
+        // Callee-saved x19–x28 (__x[19..=28]) may hold old-stack references.
+        for i in 19..=28usize {
+            ss.__x[i] = adj(ss.__x[i], old_lo, old_hi, delta);
+        }
+>>>>>>> fd7d5d7 (fix: use 16 KiB initial stack on Linux debug to fix coverage CI failure)
     }
 }
 
