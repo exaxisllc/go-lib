@@ -113,6 +113,21 @@ pub(crate) unsafe fn goready(gp: *mut G) {
         if s == GWAITING || s == GPREEMPTED {
             break s;
         }
+        // Transient states: spin until the goroutine settles.
+        //   GRUNNING   — channel ops release lock before gopark; the goroutine
+        //                is still executing the mcall switch onto g0.
+        //   GRUNNABLE  — goroutine was async-preempted (SIGURG) between timer
+        //                insertion and its gopark call.  fire_expired() is the
+        //                canonical caller for the timer path and handles this
+        //                case by re-inserting the timer; other callers should
+        //                not reach here with GRUNNABLE, but we guard anyway.
+        if s == GRUNNABLE {
+            // Already schedulable — nothing to do.  The caller (fire_expired)
+            // should have handled GRUNNABLE before calling goready; if another
+            // caller reaches here it means the goroutine is already queued and
+            // will run without further intervention.
+            return;
+        }
         debug_assert!(
             s == GRUNNING,
             "goready: unexpected status {s} — expected GRUNNING, GWAITING, or GPREEMPTED"

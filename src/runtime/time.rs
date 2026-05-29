@@ -135,9 +135,27 @@ fn timer_thread_body() {
 }
 
 /// Pop every expired entry from the heap and call `goready` on its G.
+///
+/// # Race: GRUNNABLE goroutine
+///
+/// A goroutine can be asynchronously preempted (via SIGURG on Unix) between
+/// the moment it inserts its timer entry and the moment it calls `gopark`.
+/// In that window the goroutine transitions `GRUNNING → GRUNNABLE` while the
+/// timer entry is already in the heap.  When the timer fires the goroutine
+/// is in `GRUNNABLE` rather than `GWAITING`.
+///
+/// Calling `goready` on a `GRUNNABLE` goroutine would assert-fail and kill the
+/// timer thread (all subsequent `sleep` calls would hang).  Instead we re-insert
+/// a near-immediate timer so the goroutine is woken once it does reach `GWAITING`
+/// via its in-flight `gopark` call.  The retry delay (5 ms) is intentionally
+/// larger than the typical preemption-to-resume latency so the goroutine is
+/// almost certainly in `GWAITING` by the time the re-inserted timer fires.
 fn fire_expired() {
+    use super::g::{readgstatus, GWAITING};
+
     let now = mono_ns();
-    let mut to_wake: Vec<*mut G> = Vec::new();
+    let mut to_wake:  Vec<*mut G> = Vec::new();
+    let mut to_retry: Vec<*mut G> = Vec::new();
 
     {
         let mut heap = TIMER_HEAP.lock().unwrap();
@@ -152,7 +170,25 @@ fn fire_expired() {
     }
 
     for gp in to_wake {
-        unsafe { goready(gp) };
+        // Check the goroutine's status before calling goready.  If the
+        // goroutine is still GRUNNABLE (preempted mid-sleep before gopark),
+        // re-insert a near-immediate timer rather than spinning or asserting.
+        let s = unsafe { readgstatus(gp) };
+        if s == GWAITING {
+            unsafe { goready(gp) };
+        } else {
+            // Goroutine is not yet parked.  Schedule a retry 5 ms from now;
+            // by then the goroutine will have called gopark and be GWAITING.
+            to_retry.push(gp);
+        }
+    }
+
+    if !to_retry.is_empty() {
+        let retry_when = mono_ns().saturating_add(5_000_000); // +5 ms
+        let mut heap = TIMER_HEAP.lock().unwrap();
+        for gp in to_retry {
+            heap.push(TimerEntry { when: retry_when, gp });
+        }
     }
 }
 
@@ -262,25 +298,23 @@ mod tests {
     #[test]
     fn sleep_short_duration() {
         use crate::runtime::sched::spawn_goroutine;
-        let done = Arc::new(AtomicI32::new(0));
-        let done2 = Arc::clone(&done);
+        use crate::sync::WaitGroup;
 
-        run_impl(move || {
+        run_impl(|| {
+            // WaitGroup parks the main goroutine via gopark, releasing M+P so
+            // the sleeper goroutine can be scheduled.  Using std::thread::sleep
+            // in the polling loop would hold the M without releasing its P,
+            // potentially starving the sleeper under concurrent test load.
+            let wg  = Arc::new(WaitGroup::new());
+            let wg2 = Arc::clone(&wg);
+            wg.add(1);
+
             spawn_goroutine(move || {
                 unsafe { sleep(Duration::from_millis(5)) };
-                done2.store(1, Ordering::Relaxed);
+                wg2.done();
             });
 
-            // Spin-yield for up to 200 ms waiting for the sleeper to finish.
-            let deadline = Instant::now() + Duration::from_millis(200);
-            loop {
-                if done.load(Ordering::Acquire) == 1 { break; }
-                if Instant::now() >= deadline {
-                    panic!("sleep did not complete within 200 ms");
-                }
-                crate::gosched();
-                std::thread::sleep(Duration::from_millis(1));
-            }
+            wg.wait();
         });
     }
 
@@ -288,29 +322,34 @@ mod tests {
     #[test]
     fn concurrent_sleepers() {
         use crate::runtime::sched::spawn_goroutine;
+        use crate::sync::WaitGroup;
+
         const N: i32 = 4;
         let awoke = Arc::new(AtomicI32::new(0));
         let awoke2 = Arc::clone(&awoke);
 
         run_impl(move || {
+            // WaitGroup parks the main goroutine (releases M+P) while the N
+            // sleeper goroutines run.  Polling with std::thread::sleep would
+            // hold the M's P, leaving no idle P for the timer-woken goroutines
+            // under concurrent test pressure, causing an indefinite hang on
+            // macOS where scheduler-tick preemption is SIGURG-based.
+            let wg = Arc::new(WaitGroup::new());
+
             for _ in 0..N {
                 let awoke3 = Arc::clone(&awoke2);
+                let wg2   = Arc::clone(&wg);
+                wg.add(1);
                 spawn_goroutine(move || {
                     unsafe { sleep(Duration::from_millis(10)) };
                     awoke3.fetch_add(1, Ordering::Relaxed);
+                    wg2.done();
                 });
             }
 
-            let deadline = Instant::now() + Duration::from_millis(500);
-            loop {
-                if awoke2.load(Ordering::Acquire) == N { break; }
-                if Instant::now() >= deadline {
-                    panic!("not all sleepers woke within 500 ms");
-                }
-                crate::gosched();
-                std::thread::sleep(Duration::from_millis(5));
-            }
+            wg.wait();
         });
+
         assert_eq!(awoke.load(Ordering::Acquire), N);
     }
 }
