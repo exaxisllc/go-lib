@@ -455,7 +455,43 @@ fn scope_goroutine_panic_surfaces_via_join() {
 }
 
 // ---------------------------------------------------------------------------
-// 15. run return value — result propagates to caller
+// 15. scope + channel — producer closes channel; consumer drains to None
+// ---------------------------------------------------------------------------
+
+#[test]
+fn scope_channel_producer_consumer() {
+    // A scoped producer/consumer pair: the producer closes tx after its last
+    // send so the consumer's `while let Some` loop terminates.  `scope`
+    // guarantees both goroutines finish before it returns — no Arc or
+    // WaitGroup needed to coordinate the outer code.
+    let sum = go_lib::run(|| {
+        let (tx, rx) = chan::<i32>(0); // unbuffered
+
+        scope(|s| {
+            s.go(move || {
+                for i in 0..10 {
+                    tx.send(i);
+                }
+                tx.close(); // signals receiver: no more values
+            });
+
+            s.go(move || {
+                let mut total = 0_i32;
+                while let Some(v) = rx.recv() {
+                    total += v;
+                }
+                total
+            })
+            .join()
+            .expect("consumer goroutine panicked")
+        })
+    });
+
+    assert_eq!(sum, 45); // 0 + 1 + … + 9 = 45
+}
+
+// ---------------------------------------------------------------------------
+// 16. run return value — result propagates to caller
 // ---------------------------------------------------------------------------
 #[test]
 fn run_returns_value() {
