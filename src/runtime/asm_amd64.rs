@@ -54,6 +54,8 @@ use super::g::{
     GOBUF_BP_OFFSET, GOBUF_G_OFFSET,
     GOBUF_PC_OFFSET, GOBUF_SP_OFFSET,
 };
+#[cfg(windows)]
+use super::g::{G_STACK_HI_OFFSET, G_STACK_LO_OFFSET};
 
 // ---------------------------------------------------------------------------
 // gogo — restore saved state and jump
@@ -184,6 +186,26 @@ unsafe extern "C" fn mcall_asm(
         "mov rsp, [r8 + {sp}]",            // rsp = g0.sp (= g0.stack.hi — top of allocation)
         "mov rbp, [r8 + {bp}]",            // rbp = g0.bp
 
+        // ── restore TEB stack bounds to g0's stack ────────────────────────
+        // `gogo()` sets TEB to the goroutine's stack bounds before every
+        // context switch.  Now that we're on g0's stack, we must update the
+        // TEB to g0's bounds before any code runs on g0.  Without this,
+        // Windows sees RSP outside [StackLimit, StackBase) and either raises
+        // a spurious stack-overflow or attempts to auto-grow into unmapped
+        // memory (STATUS_ACCESS_VIOLATION, fault-type write).
+        //
+        // G.stack.lo / G.stack.hi are at byte offsets G_STACK_LO_OFFSET (0)
+        // and G_STACK_HI_OFFSET (8) because G is #[repr(C)] with `stack:
+        // Stack` as its first field.  g0_gobuf.g (GOBUF_G_OFFSET = 16) is
+        // the back-pointer to g0's G struct, set by G::new().
+        //
+        // r10 / r11 are caller-saved on Windows x64 — safe to clobber here.
+        "mov r10, [r8 + {g}]",             // r10 = G0* (g0_gobuf.g)
+        "mov r11, [r10 + {stack_lo}]",     // r11 = g0.stack.lo (new StackLimit)
+        "mov r10, [r10 + {stack_hi}]",     // r10 = g0.stack.hi (new StackBase)
+        "mov qword ptr gs:[0x10], r11",    // TEB.StackLimit = g0.stack.lo
+        "mov qword ptr gs:[0x08], r10",    // TEB.StackBase  = g0.stack.hi
+
         // ── call fn_ptr(g) on g0's stack ─────────────────────────────────
         // Microsoft x64 ABI requires the *caller* to allocate 32 bytes of
         // "home space" (shadow space) before any CALL.  Without it the callee
@@ -195,10 +217,12 @@ unsafe extern "C" fn mcall_asm(
         "call r9",
         "ud2",
 
-        pc = const GOBUF_PC_OFFSET,
-        sp = const GOBUF_SP_OFFSET,
-        bp = const GOBUF_BP_OFFSET,
-        g  = const GOBUF_G_OFFSET,
+        pc       = const GOBUF_PC_OFFSET,
+        sp       = const GOBUF_SP_OFFSET,
+        bp       = const GOBUF_BP_OFFSET,
+        g        = const GOBUF_G_OFFSET,
+        stack_lo = const G_STACK_LO_OFFSET,
+        stack_hi = const G_STACK_HI_OFFSET,
     )
 }
 

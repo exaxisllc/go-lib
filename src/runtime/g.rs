@@ -194,9 +194,35 @@ impl WaitReason {
 /// stable `*mut G` raw pointers across thread migrations.  The goroutine's
 /// execution stack is a separate `mmap`'d region tracked by `G.stack`; the
 /// `G` struct itself lives on the Rust heap.
+/// Byte offset of `G.stack.lo` within the G struct.  Used by Windows
+/// `mcall_asm` to restore TEB StackLimit after switching to g0.
+/// `#[repr(C)]` on G guarantees this equals 0.
+// Used in `#[cfg(windows)]` inline asm — suppressed on non-Windows.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) const G_STACK_LO_OFFSET: usize = 0;
+
+/// Byte offset of `G.stack.hi` within the G struct.  Used by Windows
+/// `mcall_asm` to restore TEB StackBase after switching to g0.
+/// `#[repr(C)]` on G guarantees this equals `size_of::<usize>()` = 8.
+// Used in `#[cfg(windows)]` inline asm — suppressed on non-Windows.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) const G_STACK_HI_OFFSET: usize = 8;
+
+// Compile-time verification that the G stack field offsets are correct.
+const _: () = {
+    use std::mem::offset_of;
+    assert!(offset_of!(G, stack) == G_STACK_LO_OFFSET,
+        "G.stack must be the first field (offset 0) for asm access");
+    // Stack.lo is at Stack+0, Stack is at G+0, so G.stack.lo = G+0.
+    // Stack.hi is at Stack+8, so G.stack.hi = G+8 = G_STACK_HI_OFFSET.
+};
+
+#[repr(C)]
 pub(crate) struct G {
-    // Stack parameters at the top of the struct to match Go's layout in case
-    // `#[repr(C)]` is needed for assembly access in step 3.
+    // Stack parameters at the top of the struct — `#[repr(C)]` ensures
+    // `stack.lo` and `stack.hi` are at known offsets (0 and 8) so that
+    // Windows `mcall_asm` can read them via hardcoded byte offsets to
+    // restore TEB StackBase/StackLimit during context switches.
     /// Bounds of the goroutine's execution stack.  Live region: `[lo, hi)`.
     pub stack:       Stack,
     /// Stack pointer limit used in the cooperative preemption check.
