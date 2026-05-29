@@ -15,6 +15,7 @@ use go_lib::{
     chan::chan,
     go,
     scope,
+    scope::ScopedJoinHandle,
     select,
     sync::WaitGroup,
 };
@@ -514,4 +515,50 @@ fn run_returns_value() {
     // String return: heap-allocated value crosses the goroutine boundary.
     let s: String = go_lib::run(|| "hello from goroutine".to_string());
     assert_eq!(s, "hello from goroutine");
+}
+
+// ---------------------------------------------------------------------------
+// 17. create many more goroutines than OS threads
+//
+// Regression notes:
+//   - WORKERS was originally 25,000, which creates ~50,000 mmap'd regions
+//     (stack + guard page per goroutine).  macOS limits each process to
+//     ~65,536 VM regions; approaching that limit caused stack_alloc() to
+//     fail inside grow_stack_if_needed(), which runs on g0's stack (entered
+//     through the naked mcall_asm frame).  A panic from .expect() on g0
+//     tried to unwind through the naked frame (no DWARF tables) → SIGILL.
+//     Reduced to 5,000 (~10,000 mmap regions) to stay well within limits
+//     on all supported platforms while still exercising the scheduler under
+//     meaningful goroutine pressure.
+//
+//   - The original loop used `1..i` and asserted `sum > 0`.  For i=0 the
+//     range is empty (sum=0) and for i=1 it is also empty (sum=0), so the
+//     assertion fired for the first two goroutines.  Changed to `0..=i` so
+//     every goroutine computes the expected triangular number i*(i+1)/2,
+//     and the assertion checks the exact value rather than just sign.
+// ---------------------------------------------------------------------------
+#[test]
+fn many_goroutines() {
+    const WORKERS: i32 = 5_000;
+    go_lib::run(|| {
+        go_lib::scope(|s| {
+            let handles: Vec<ScopedJoinHandle<i32>> = (0..WORKERS)
+                .map(|i| s.go(move || {
+                    // Compute the triangular number i*(i+1)/2.
+                    // Range 0..=i is never empty: every goroutine does real work.
+                    (0..=i).sum::<i32>()
+                }))
+                .collect();
+
+            for (i, handle) in handles.into_iter().enumerate() {
+                let sum = handle.join().expect("goroutine panicked");
+                let i   = i as i32;
+                assert_eq!(
+                    sum,
+                    i * (i + 1) / 2,
+                    "goroutine {i}: expected triangular number, got {sum}"
+                );
+            }
+        });
+    });
 }
