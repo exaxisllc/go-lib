@@ -713,6 +713,7 @@ mod tests {
 mod loom_tests {
     use super::*;
     use crate::runtime::g::{Stack, G};
+    use crate::runtime::stack::GOROUTINE_STACK_BYTES;
     use loom::sync::Arc;
 
     // Wrapper so the raw G pointer can cross a loom::thread boundary.
