@@ -5,6 +5,8 @@
 //! ## v0.2.0 — dynamic stack growth
 //!
 //! Each goroutine starts with an 8 KiB stack (matching Go's `stackMin`).
+//! Platform-specific overrides apply for debug builds — see
+//! [`GOROUTINE_STACK_BYTES`] for the full table.
 //! The guard page (`PROT_NONE`) immediately below `stack.lo` turns overflows
 //! into a `SIGSEGV` that the runtime intercepts.
 //!
@@ -100,23 +102,41 @@ pub(crate) const STACK_MAX: usize = 1024 * 1024 * 1024;
 
 /// Initial stack size for every new goroutine.
 ///
-/// Go uses 8 KiB (`stackMin`) and relies on explicit `morestack` checks
-/// (inserted by the compiler at every function entry) to grow the stack
-/// before exhaustion.  We use guard-page detection instead, which works well
-/// on Unix where the SIGSEGV handler is delivered on an alternate signal stack
-/// (`SA_ONSTACK`).  On Windows, however, exception dispatch pushes the
-/// EXCEPTION_RECORD onto the *current* stack: if the goroutine's stack is
-/// already exhausted the exception frame cannot be written, the VEH is never
-/// reached, and Windows terminates the process silently.
+/// **Linux — 8 KiB (all build profiles)**
+/// Matches Go's `stackMin`.  Guard-page faults raise `SIGSEGV` delivered on
+/// a separate alt-stack (`SA_ONSTACK`), so the runtime can safely grow the
+/// goroutine stack even when the current stack is fully exhausted.
 ///
-/// Additionally, debug builds on Windows generate 3–5× larger stack frames
-/// than release builds or Unix equivalents, so the goroutine-entry call chain
-/// (`goroutine_entry` → user closure → `with_syscall` → Winsock → `gopark`)
-/// can exceed 8 KiB before the guard page fires.
+/// **macOS release — 8 KiB**
+/// Same semantics as Linux release; the SIGSEGV alt-stack handler grows the
+/// stack on guard-page faults.
 ///
-/// 64 KiB provides comfortable headroom across all platforms and build
-/// profiles while remaining negligible per-goroutine overhead in practice.
+/// **macOS debug — 32 KiB**
+/// Debug builds produce 3–5× larger stack frames than release builds.
+/// Rust's `panic!` + `catch_unwind` machinery uses particularly deep frames
+/// in debug mode; a goroutine that panics can exhaust 16 KiB before the
+/// first scheduling point.  Additionally, on macOS `mprotect(PROT_NONE)`
+/// guard-page violations raise `SIGBUS` (not `SIGSEGV`) — the SIGBUS-based
+/// stack-growth path is correct in principle but requires a dedicated fix for
+/// debug-mode frame depths.  32 KiB avoids the overflow entirely and is
+/// still 2× smaller than the previous 64 KiB default.
+///
+/// **Windows release — 8 KiB**
+/// Tight but workable for ordinary goroutines; the proactive growth check in
+/// `grow_stack_if_needed` doubles the stack before the guard page is hit.
+///
+/// **Windows debug — 64 KiB**
+/// Windows Structured Exception Handling (SEH/VEH) pushes `EXCEPTION_RECORD`
+/// onto the *current* goroutine stack before the VEH is invoked.  If the
+/// stack is already exhausted the write faults silently and the process
+/// terminates before the handler fires.  Debug frames are also 3–5× larger.
+/// 64 KiB provides the required headroom.
+#[cfg(all(windows, debug_assertions))]
 pub(crate) const GOROUTINE_STACK_BYTES: usize = 64 * 1024;
+#[cfg(all(target_os = "macos", debug_assertions))]
+pub(crate) const GOROUTINE_STACK_BYTES: usize = 32 * 1024;
+#[cfg(not(any(all(windows, debug_assertions), all(target_os = "macos", debug_assertions))))]
+pub(crate) const GOROUTINE_STACK_BYTES: usize = 8 * 1024;
 
 /// Stack size for each M's g0 (the scheduler stack).
 ///
@@ -443,6 +463,55 @@ pub(crate) unsafe fn install_sigsegv_handler() {
     *PREV_SIGSEGV.lock().unwrap() = Some(old);
 }
 
+/// Shared guard-page fault handler — called from both SIGSEGV and SIGBUS handlers.
+///
+/// On Linux, `mprotect(PROT_NONE)` guard-page faults raise `SIGSEGV`.
+/// On macOS, the same access raises `SIGBUS` (permission violation on a mapped
+/// page) rather than `SIGSEGV` (unmapped address).  Both signals use this
+/// identical detection-and-growth path.
+///
+/// ## Why we zero `gp.sched.sp` before copying
+///
+/// `gp.sched.sp` holds the SP that was saved at the goroutine's last
+/// scheduling point (the most recent `mcall` or `gopark`).  While the goroutine
+/// is *running*, any frames pushed since that point are below the saved SP and
+/// are not reflected in `gp.sched.sp`.  `copystack` uses `gp.sched.sp` as the
+/// start of the live region; if it is stale, only the top few bytes of the
+/// stack would be copied and the actual live frames would be lost.
+///
+/// Setting `gp.sched.sp = 0` before calling `newstack` triggers `copystack`'s
+/// "treat entire stack as live" fallback (`saved_sp == 0` → `live_start =
+/// stack.lo`), which is always correct: copying a few extra dead bytes is safe,
+/// but missing live frames is not.
+///
+/// Returns `true` if the fault was a goroutine stack overflow and has been
+/// handled (caller should return from the signal handler); `false` if the fault
+/// is unrelated to a guard page and the caller should chain to its normal path.
+#[cfg(not(windows))]
+pub(crate) unsafe fn try_grow_stack_from_signal(
+    fault_addr: usize,
+    ctx:        *mut libc::c_void,
+) -> bool {
+    let gp = current_g();
+    if gp.is_null() { return false; }
+
+    let guard_lo = unsafe { (*gp).stack.lo } - page_size();
+    let guard_hi = unsafe { (*gp).stack.lo };
+
+    if fault_addr < guard_lo || fault_addr >= guard_hi {
+        return false; // not a goroutine stack overflow
+    }
+
+    // Force copystack to copy the full old stack (see doc comment above).
+    unsafe { (*gp).sched.sp = 0 };
+
+    // Grow the stack and adjust the saved SP in the signal context so the
+    // faulting instruction retries on the new, larger stack.
+    let delta = unsafe { newstack(gp) };
+    unsafe { update_sp_in_context(ctx, delta) };
+    true
+}
+
 /// SIGSEGV handler: detect goroutine guard page faults and grow the stack.
 #[cfg(not(windows))]
 unsafe extern "C" fn sigsegv_handler(
@@ -450,21 +519,9 @@ unsafe extern "C" fn sigsegv_handler(
     info: *mut libc::siginfo_t,
     ctx:  *mut libc::c_void,
 ) {
-    let gp = current_g();
-    if !gp.is_null() {
-        let fault_addr = unsafe { (*info).si_addr() } as usize;
-        let guard_lo   = unsafe { (*gp).stack.lo } - page_size();
-        let guard_hi   = unsafe { (*gp).stack.lo };
-
-        if fault_addr >= guard_lo && fault_addr < guard_hi {
-            // Guard page access = goroutine stack overflow. Grow it.
-            let delta = unsafe { newstack(gp) };
-
-            // Update the interrupted RSP/SP in the platform ucontext_t so the
-            // faulting instruction retries on the new stack.
-            unsafe { update_sp_in_context(ctx, delta) };
-            return; // handler return → OS retries the faulting instruction
-        }
+    let fault_addr = unsafe { (*info).si_addr() } as usize;
+    if unsafe { try_grow_stack_from_signal(fault_addr, ctx) } {
+        return; // handler return → OS retries the faulting instruction
     }
 
     // Not a stack fault — chain to the previous handler.

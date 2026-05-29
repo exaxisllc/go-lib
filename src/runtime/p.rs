@@ -495,11 +495,12 @@ impl P {
 mod tests {
     use super::*;
     use crate::runtime::g::{Stack, G};
+    use crate::runtime::stack::GOROUTINE_STACK_BYTES;
 
     fn make_g(id: u64) -> Box<G> {
         // Use fake but valid stack bounds — not executed, just used as pointers.
         let lo = (id as usize + 1) << 20; // 1 MiB spacing
-        G::new(Stack { lo, hi: lo + 65536 }, id)
+        G::new(Stack { lo, hi: lo + GOROUTINE_STACK_BYTES }, id)
     }
 
     #[test]
@@ -722,7 +723,7 @@ mod loom_tests {
 
     fn make_g(id: u64) -> *mut G {
         let lo = (id as usize + 1) << 20;
-        Box::into_raw(G::new(Stack { lo, hi: lo + 65536 }, id))
+        Box::into_raw(G::new(Stack { lo, hi: lo + GOROUTINE_STACK_BYTES }, id))
     }
 
     /// One thread pushes a single G; the main thread pops.  Loom explores

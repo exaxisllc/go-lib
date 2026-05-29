@@ -167,11 +167,12 @@ pub(crate) unsafe fn goready(gp: *mut G) {
 #[cfg(all(test, not(loom)))]
 mod tests {
     use crate::runtime::g::{Stack, G};
+    use crate::runtime::stack::GOROUTINE_STACK_BYTES;
 
     #[allow(dead_code)] // shared test-helper; used by pending goready/gopark tests
     fn make_g(id: u64) -> Box<G> {
         let lo = (id as usize + 1) << 20;
-        G::new(Stack { lo, hi: lo + 65536 }, id)
+        G::new(Stack { lo, hi: lo + GOROUTINE_STACK_BYTES }, id)
     }
 
     /// `goready` on a parked goroutine must cause it to run.
