@@ -748,27 +748,39 @@ unsafe extern "C" fn sigbus_handler(
         }
     }
 
-    // ── Not a stack fault — print diagnostics and abort. ─────────────────────
-    // Use write() directly for the first line — it is async-signal-safe.
-    let msg = b"[go-lib SIGBUS] crash detected\n";
-    unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len()) };
+    // ── Not a stack fault — print diagnostics (async-signal-safe) and abort. ──
+    //
+    // ALL output uses write(2) directly.  eprintln!, format!, and
+    // Backtrace::force_capture() acquire locks (I/O, symbol resolver, malloc)
+    // that may already be held by another thread, causing an unrecoverable
+    // deadlock inside the signal handler.  write(2) is listed in POSIX as
+    // async-signal-safe and never acquires user-space locks.
+    #[inline(always)]
+    unsafe fn sig_write(msg: &[u8]) {
+        unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len()) };
+    }
+    #[inline(always)]
+    unsafe fn sig_hex(label: &[u8], val: u64) {
+        unsafe { sig_write(label) };
+        const H: &[u8] = b"0123456789abcdef";
+        let mut buf = [b'0'; 19]; // "0x" + 16 hex digits + "\n"
+        buf[0] = b'0'; buf[1] = b'x';
+        for i in 0..16usize { buf[17 - i] = H[((val >> (i * 4)) & 0xf) as usize]; }
+        buf[18] = b'\n';
+        unsafe { sig_write(&buf) };
+    }
 
-    // Print register context from the interrupted ucontext_t.
+    unsafe { sig_write(b"[go-lib SIGBUS] crash (non-stack fault)\n") };
+
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     if !ctx.is_null() {
         unsafe {
             let uc = ctx as *mut libc::ucontext_t;
             let ss = &(*(*uc).uc_mcontext).__ss;
-            eprintln!("[go-lib SIGBUS] PC  = {:#018x}", ss.__pc);
-            eprintln!("[go-lib SIGBUS] LR  = {:#018x}", ss.__lr);
-            eprintln!("[go-lib SIGBUS] SP  = {:#018x}", ss.__sp);
-            eprintln!("[go-lib SIGBUS] FP  = {:#018x}", ss.__fp);
-            // Print non-zero GPRs (x0–x28) for more call-site context.
-            for (i, r) in ss.__x.iter().enumerate() {
-                if *r != 0 {
-                    eprintln!("[go-lib SIGBUS] x{i:02} = {r:#018x}");
-                }
-            }
+            sig_hex(b"[go-lib SIGBUS] PC = ", ss.__pc);
+            sig_hex(b"[go-lib SIGBUS] LR = ", ss.__lr);
+            sig_hex(b"[go-lib SIGBUS] SP = ", ss.__sp);
+            sig_hex(b"[go-lib SIGBUS] FP = ", ss.__fp);
         }
     }
 
@@ -777,14 +789,9 @@ unsafe extern "C" fn sigbus_handler(
         unsafe {
             let uc = ctx as *mut libc::ucontext_t;
             let mc = &(*uc).uc_mcontext;
-            eprintln!("[go-lib SIGBUS] PC  = {:#018x}", mc.pc);
-            eprintln!("[go-lib SIGBUS] SP  = {:#018x}", mc.sp);
-            eprintln!("[go-lib SIGBUS] LR  = {:#018x}", mc.regs[30]);
-            for (i, r) in mc.regs.iter().enumerate() {
-                if *r != 0 {
-                    eprintln!("[go-lib SIGBUS] x{i:02} = {r:#018x}");
-                }
-            }
+            sig_hex(b"[go-lib SIGBUS] PC = ", mc.pc);
+            sig_hex(b"[go-lib SIGBUS] SP = ", mc.sp);
+            sig_hex(b"[go-lib SIGBUS] LR = ", mc.regs[30]);
         }
     }
 
@@ -792,10 +799,8 @@ unsafe extern "C" fn sigbus_handler(
     if !ctx.is_null() {
         unsafe {
             let uc  = ctx as *mut libc::ucontext_t;
-            let rip = (*uc).uc_mcontext.gregs[libc::REG_RIP as usize];
-            let rsp = (*uc).uc_mcontext.gregs[libc::REG_RSP as usize];
-            eprintln!("[go-lib SIGBUS] RIP = {rip:#018x}");
-            eprintln!("[go-lib SIGBUS] RSP = {rsp:#018x}");
+            sig_hex(b"[go-lib SIGBUS] RIP = ", (*uc).uc_mcontext.gregs[libc::REG_RIP as usize] as u64);
+            sig_hex(b"[go-lib SIGBUS] RSP = ", (*uc).uc_mcontext.gregs[libc::REG_RSP as usize] as u64);
         }
     }
 
@@ -804,14 +809,10 @@ unsafe extern "C" fn sigbus_handler(
         unsafe {
             let uc = ctx as *mut libc::ucontext_t;
             let ss = &(*(*uc).uc_mcontext).__ss;
-            eprintln!("[go-lib SIGBUS] RIP = {:#018x}", ss.__rip);
-            eprintln!("[go-lib SIGBUS] RSP = {:#018x}", ss.__rsp);
+            sig_hex(b"[go-lib SIGBUS] RIP = ", ss.__rip);
+            sig_hex(b"[go-lib SIGBUS] RSP = ", ss.__rsp);
         }
     }
-
-    // force_capture() captures regardless of RUST_BACKTRACE.
-    let bt = std::backtrace::Backtrace::force_capture();
-    eprintln!("[go-lib SIGBUS] backtrace:\n{bt}");
 
     unsafe { libc::abort() };
 }
