@@ -187,13 +187,56 @@ impl WaitReason {
 /// A goroutine — the fundamental unit of concurrency.
 ///
 /// Ported from `g` in `runtime/runtime2.go`.  This is a strict subset of
-/// Go's version; GC, defer, panic, stack-growth, and tracer fields are
-/// omitted.
+/// Go's version; GC, defer, panic, and tracer fields are omitted.
 ///
 /// A `G` is always heap-allocated via `G::new` so the scheduler can hold
 /// stable `*mut G` raw pointers across thread migrations.  The goroutine's
 /// execution stack is a separate `mmap`'d region tracked by `G.stack`; the
 /// `G` struct itself lives on the Rust heap.
+///
+/// ## Memory layout (64-bit, `#[repr(C)]`)
+///
+/// ```text
+///  offset  field           size
+///  ──────  ─────────────── ────
+///    0     stack.lo        8 B   ← G_STACK_LO_OFFSET (Windows asm)
+///    8     stack.hi        8 B   ← G_STACK_HI_OFFSET (Windows asm)
+///   16     stackguard0     8 B
+///   24     m               8 B
+///   32     sched (Gobuf)  56 B   7 fields × 8 B
+///   88     atomicstatus    4 B   } packed together — same AtomicU32
+///   92     selectdone      4 B   } alignment, no padding between them
+///   96     goid            8 B
+///  104     schedlink       8 B
+///  112     param           8 B
+///  120     waitreason      1 B   } packed together — same 1-byte alignment
+///  121     preempt         1 B   }
+///  122     [6 B padding]         align struct to 8 B
+///  ──────  ─────────────── ────
+///  128 B   total
+/// ```
+///
+/// This is intentionally smaller than Go's `g` struct (~480 B) because we
+/// omit GC, defer/panic chain, and tracer fields.  Go's published minimum
+/// goroutine overhead includes a 2 KiB stack and roughly 392 B of descriptor
+/// overhead; our descriptor is 128 B.
+///
+/// ## Per-goroutine memory (release builds)
+///
+/// | Platform      | Stack  | OS guard page | G struct | Total   |
+/// |---------------|--------|---------------|----------|---------|
+/// | Linux x86-64  | 2 KiB  | 4 KiB         | 128 B    | ~6.1 KiB |
+/// | Linux AArch64 | 2 KiB  | 4 KiB         | 128 B    | ~6.1 KiB |
+/// | macOS x86-64  | 2 KiB  | 4 KiB         | 128 B    | ~6.1 KiB |
+/// | macOS AArch64 | 2 KiB  | 16 KiB        | 128 B    | ~18 KiB  |
+/// | Windows x86-64| 2 KiB  | 4 KiB (VEH)   | 128 B    | ~6.1 KiB |
+///
+/// The OS guard page accounts for the remaining gap vs. Go's ~2.4 KiB.
+/// Eliminating it would require compiler-generated `morestack` checks in
+/// every Rust function (not feasible without compiler changes); without them
+/// severe stack overflows would silently corrupt adjacent memory rather than
+/// crashing cleanly.
+///
 /// Byte offset of `G.stack.lo` within the G struct.  Used by Windows
 /// `mcall_asm` to restore TEB StackLimit after switching to g0.
 /// `#[repr(C)]` on G guarantees this equals 0.
@@ -208,73 +251,73 @@ pub(crate) const G_STACK_LO_OFFSET: usize = 0;
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) const G_STACK_HI_OFFSET: usize = 8;
 
-// Compile-time verification that the G stack field offsets are correct.
+// Compile-time verification of G struct layout.
 const _: () = {
-    use std::mem::offset_of;
+    use std::mem::{offset_of, size_of};
     assert!(offset_of!(G, stack) == G_STACK_LO_OFFSET,
         "G.stack must be the first field (offset 0) for asm access");
     // Stack.lo is at Stack+0, Stack is at G+0, so G.stack.lo = G+0.
     // Stack.hi is at Stack+8, so G.stack.hi = G+8 = G_STACK_HI_OFFSET.
+
+    // Lock the compact layout (128 bytes on all 64-bit targets).
+    // If this fails you have changed the field list or ordering — update the
+    // layout table in the G doc-comment above.
+    assert!(size_of::<G>() == 128,
+        "G struct size changed — update layout table and this assertion");
 };
 
 #[repr(C)]
 pub(crate) struct G {
-    // Stack parameters at the top of the struct — `#[repr(C)]` ensures
-    // `stack.lo` and `stack.hi` are at known offsets (0 and 8) so that
-    // Windows `mcall_asm` can read them via hardcoded byte offsets to
-    // restore TEB StackBase/StackLimit during context switches.
+    // ── Fixed prefix — offsets are ABI-stable for Windows asm ────────────
+    //
+    // `stack.lo` and `stack.hi` MUST remain at offsets 0 and 8.  Windows
+    // `mcall_asm` reads them via `G_STACK_LO_OFFSET` / `G_STACK_HI_OFFSET`
+    // to restore the TEB StackBase/StackLimit fields on every context switch.
+
     /// Bounds of the goroutine's execution stack.  Live region: `[lo, hi)`.
     pub stack:       Stack,
     /// Stack pointer limit used in the cooperative preemption check.
     /// Normally `stack.lo + STACK_GUARD`.  The scheduler sets this to
     /// `STACK_PREEMPT` to request a yield at the G's next `gosched()` call.
     pub stackguard0: usize,
-
     /// The M this G is currently running on; `null` when not on-CPU.
     pub m:           *mut M,
-
     /// Saved register state while the G is off-CPU.  Written by `mcall`,
-    /// read by `gogo` (see `asm_arm64.rs` / `asm_amd64.rs`, step 3).
+    /// read by `gogo` (see `asm_arm64.rs` / `asm_amd64.rs`).
     pub sched:       Gobuf,
+
+    // ── Scheduler bookkeeping — packed for minimal padding ────────────────
 
     /// Current goroutine status — one of the `G*` constants.  Written
     /// atomically so sysmon can observe status without holding a lock.
     pub atomicstatus: AtomicU32,
+    /// `selectgo` race flag.  Set atomically to 1 by the first M to claim
+    /// the select win; others see the 1 and back off.
+    ///
+    /// Packed immediately after `atomicstatus` (same `u32` alignment) to
+    /// eliminate the 4-byte padding that would be needed before `goid`.
+    pub selectdone:   AtomicU32,
 
     /// Unique monotonically-increasing goroutine identifier.
     pub goid:        u64,
-
     /// Intrusive singly-linked list link used by run queues and wait queues.
     /// `null` when the G is not on any list.
     pub schedlink:   *mut G,
+    /// Generic pointer passed to a waking G by the operation that unblocks
+    /// it.  Channels use this to hand off an element; `selectgo` uses it to
+    /// identify the winning case.
+    pub param:       *mut u8,
 
-    /// Nanosecond timestamp when the G entered `GWAITING`.
-    /// Ported from `g.waitsince`; used by future deadlock detector / tracer.
-    #[allow(dead_code)]
-    pub waitsince:   i64,
+    // ── One-byte fields packed together ───────────────────────────────────
 
     /// Why this G is waiting; meaningful only when
     /// `atomicstatus == GWAITING`.
     pub waitreason:  WaitReason,
-
-    /// Generic pointer passed to a waking G by the operation that unblocks
-    /// it.  Channels use this to hand off an element; `selectgo` uses it to
-    /// identify the winning case; timers set it to a zero-value sentinel.
-    pub param:       *mut u8,
-
     /// Cooperative preemption flag.  The scheduler sets this to request a
     /// yield; the G should call `gosched()` at its next safe point.
     /// Mirrors setting `stackguard0 = STACK_PREEMPT`.
     pub preempt:     bool,
-
-    /// `selectgo` race flag.  Set atomically to 1 by the first M to claim
-    /// the select win; others see the 1 and back off.
-    pub selectdone:  AtomicU32,
-
-    /// Cached timer for `time::sleep`.  `null` when no timer is active.
-    /// Typed `*mut u8` until `runtime::time::Timer` is fully defined (step 17).
-    #[allow(dead_code)]
-    pub timer:       *mut u8,
+    // 6 bytes implicit padding here (repr(C) aligns the struct to 8 bytes).
 }
 
 // SAFETY: The scheduler guarantees at most one M executes a given G at any
@@ -293,19 +336,17 @@ impl G {
     pub(crate) fn new(stack: Stack, goid: u64) -> Box<G> {
         let stackguard0 = stack.lo + STACK_GUARD;
         let mut g = Box::new(G {
-            stackguard0,
             stack,
+            stackguard0,
             m:            std::ptr::null_mut(),
             sched:        Gobuf::default(),
             atomicstatus: AtomicU32::new(GIDLE),
+            selectdone:   AtomicU32::new(0),
             goid,
             schedlink:    std::ptr::null_mut(),
-            waitsince:    0,
-            waitreason:   WaitReason::Zero,
             param:        std::ptr::null_mut(),
+            waitreason:   WaitReason::Zero,
             preempt:      false,
-            selectdone:   AtomicU32::new(0),
-            timer:        std::ptr::null_mut(),
         });
         // Box<G> has a stable heap address — moving the Box moves only the
         // pointer, not the allocation — so this self-referential pointer is
