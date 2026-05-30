@@ -92,6 +92,14 @@ at runtime, matching Go's `runtime.GOMAXPROCS(n)`.
 **Release:** v0.2.0  
 **Prerequisite for:** Step 4
 
+> **Post-shipping update (PR #14):** the initial stack was further reduced
+> from 8 KiB to 2 KiB on release builds, matching Go's `stackMin = 2048`,
+> and the `G` descriptor was compacted from 152 B to 128 B.  Total per-
+> goroutine memory is now ~6.1 KiB on Linux/Windows x86-64 (vs. Go's
+> ~2.4 KiB; the remaining gap is the OS guard page).  See the
+> "Per-goroutine memory overhead" table in `README.md` for the full
+> platform breakdown.
+
 This is the most invasive change.  Every goroutine currently gets a fixed 64 KiB
 `mmap` region.  Stack growth requires emitting stack-check prologues in the
 context-switch assembly, a `morestack` trampoline, and a `copystack` routine

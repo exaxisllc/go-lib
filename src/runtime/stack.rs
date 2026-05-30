@@ -4,11 +4,14 @@
 //!
 //! ## v0.2.0 — dynamic stack growth
 //!
-//! Each goroutine starts with an 8 KiB stack in release builds (matching
-//! Go's `stackMin`).  Debug builds use larger initial sizes to avoid the
-//! signal-growth instruction-retry hazard — see [`GOROUTINE_STACK_BYTES`].
+//! Each goroutine starts with a 2 KiB stack in release builds (matching
+//! Go's `stackMin = 2048`).  Debug builds use larger initial sizes
+//! (Linux 16 KiB, macOS 64 KiB, Windows 64 KiB) to absorb the wider
+//! non-optimised frames produced by debug codegen — see
+//! [`GOROUTINE_STACK_BYTES`] for the full table.
 //! The guard page (`PROT_NONE`) immediately below `stack.lo` turns overflows
-//! into a `SIGSEGV` that the runtime intercepts.
+//! into a `SIGSEGV` (Linux/Windows) or `SIGBUS` (macOS) that the runtime
+//! intercepts and recovers from by growing the stack.
 //!
 //! When the guard page is touched:
 //! 1. `sigsegv_handler` identifies the fault as a goroutine stack overflow.
@@ -35,11 +38,12 @@
 //! ## copystack — conservative pointer adjustment
 //!
 //! Without GC stack maps we scan every pointer-sized word in the live stack
-//! region and adjust those that fall within `[old_lo, old_hi)`.  Return
-//! addresses are in the code segment (a completely different address range)
-//! and are never mistakenly adjusted.  Integer values that coincidentally
-//! equal a stack address are a theoretical false positive but vanishingly
-//! rare for the narrow 8–1024 KiB windows used here.
+//! region and adjust those that fall within `[old_guard_lo, old_hi)` (the
+//! usable old stack plus its guard page).  Return addresses are in the code
+//! segment (a completely different address range) and are never mistakenly
+//! adjusted.  Integer values that coincidentally equal a stack address are
+//! a theoretical false positive but vanishingly rare for the narrow
+//! 2–1024 KiB windows used here.
 
 // Mutex is only needed for the SIGSEGV handler's static on Unix.
 #[cfg(not(windows))]
