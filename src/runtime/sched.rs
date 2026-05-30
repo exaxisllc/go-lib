@@ -15,9 +15,10 @@
 //!
 //! ### Stack-growth checkpoint (`execute`)
 //! Before every `gogo`, `execute` calls [`stack::grow_stack_if_needed`] to
-//! proactively double the stack when the saved SP is within `2 × STACK_GUARD`
-//! of the guard page.  This is a belt-and-suspenders complement to the reactive
-//! SIGSEGV handler in `stack.rs`.
+//! proactively double the stack when the saved SP is within `STACK_GUARD`
+//! (928 B) of the guard page — matching Go's `stackGuard`.  This is a
+//! belt-and-suspenders complement to the reactive SIGSEGV/SIGBUS handler in
+//! `stack.rs`.
 //!
 //! ### Async preemption (SIGURG)
 //! `schedinit` installs a `SIGURG` handler via [`install_sigurg_handler`].

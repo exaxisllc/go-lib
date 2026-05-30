@@ -29,9 +29,11 @@ and the contended path is made scheduler-safe via `entersyscall`/`exitsyscall`
 > **Note:** All items below were deferred in the initial v1 port but have since
 > been implemented.  See `docs/v2-roadmap.md` for the implementation steps.
 
-- **Stack growth** (`copystack`) — ✅ v0.2.0: 64 KiB initial stack; SIGSEGV
-  guard-page detection; `copystack` grows to 1 GiB.  Bracketed with
-  `casgstatus(GRUNNING→GCOPYSTACK→GRUNNING)` in v0.3.1.
+- **Stack growth** (`copystack`) — ✅ v0.2.0: SIGSEGV/SIGBUS guard-page
+  detection; `copystack` grows up to 1 GiB.  Bracketed with
+  `casgstatus(GRUNNING→GCOPYSTACK→GRUNNING)` in v0.3.1.  Initial stack
+  reduced from 64 KiB → 8 KiB → 2 KiB (release) to match Go's `stackMin`;
+  `G` descriptor compacted to 128 B in PR #14.
 - **Async preemption** — ✅ v0.2.0: `SIGURG`-based preemption; `preemptm`
   transitions through `GPREEMPTED` (Go 1.14+ protocol) in v0.3.1.
 - **GC / write barriers / finalizers** — irrelevant; Rust owns memory.

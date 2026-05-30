@@ -22,7 +22,7 @@ go_lib::run(|| {
 });
 ```
 
-No `async`, no Tokio, no executor. Every goroutine starts with an 8 KiB stack in release builds (matching Go's `stackMin`; 16 KiB on Linux debug, 32 KiB on macOS debug, 64 KiB on Windows debug) that grows automatically on demand (up to 1 GiB). The runtime is a work-stealing M:N scheduler ported verbatim from [`src/runtime/`](https://github.com/golang/go/tree/master/src/runtime) in the Go GitHub repository.
+No `async`, no Tokio, no executor. Every goroutine starts with a **2 KiB stack** in release builds (matching Go's `stackMin = 2048`; 16 KiB on Linux debug, 64 KiB on macOS and Windows debug) that grows automatically on demand (up to 1 GiB). The `G` descriptor is **128 B** — total per-goroutine memory is **~6 KiB** on Linux/Windows x86-64, ~18 KiB on macOS AArch64 (16 KiB OS guard page). The runtime is a work-stealing M:N scheduler ported verbatim from [`src/runtime/`](https://github.com/golang/go/tree/master/src/runtime) in the Go GitHub repository.
 
 ---
 
@@ -70,7 +70,7 @@ No `async`, no Tokio, no executor. Every goroutine starts with an 8 KiB stack in
 | Work-stealing across Ps | ✅ |
 | `GOMAXPROCS` env var + runtime adjustment | ✅ |
 | Goroutine panic handler (process does not abort) | ✅ |
-| Dynamic goroutine stack growth (8 KiB → 1 GiB) | ✅ v0.2.0 |
+| Dynamic goroutine stack growth (2 KiB → 1 GiB) | ✅ v0.2.0 |
 | Async preemption via `SIGURG` | ✅ v0.2.0 |
 | Netpoll — `epoll`/`kqueue`/IOCP I/O integration | ✅ v0.3.0 |
 | `net::TcpListener` / `net::TcpStream` | ✅ v0.2.0 |
@@ -983,6 +983,22 @@ push and pull request targeting `main`:
 
 ## Architecture
 
+### Per-goroutine memory overhead
+
+| Platform        | Initial stack | OS guard page | `G` descriptor | Total per goroutine |
+|-----------------|---------------|---------------|----------------|---------------------|
+| Linux x86-64    | 2 KiB         | 4 KiB         | 128 B          | **~6.1 KiB**        |
+| Linux AArch64   | 2 KiB         | 4 KiB         | 128 B          | **~6.1 KiB**        |
+| macOS x86-64    | 2 KiB         | 4 KiB         | 128 B          | **~6.1 KiB**        |
+| macOS AArch64   | 2 KiB         | 16 KiB        | 128 B          | **~18 KiB**         |
+| Windows x86-64  | 2 KiB         | 4 KiB         | 128 B          | **~6.1 KiB**        |
+
+The initial stack matches Go's `stackMin = 2048` and grows on demand (up to 1 GiB) via the SIGSEGV/SIGBUS guard-page handler.  The `G` descriptor is 128 B — smaller than Go's `g` (≈480 B) because GC, defer/panic chain, and tracer fields are omitted.
+
+The remaining gap to Go's ~2.4 KiB minimum (2 KiB stack + 392 B descriptor, no OS guard page) is the OS guard page itself.  Closing it would require compiler-generated `morestack` checks in every Rust function — not feasible without compiler changes; without them, severe stack overflows would silently corrupt adjacent memory rather than crashing cleanly.
+
+Debug builds use larger initial sizes (Linux 16 KiB, macOS 64 KiB, Windows 64 KiB) because non-optimised frames are 3–5× wider and would otherwise trigger the growth handler on every new goroutine.
+
 ```
 go_lib::run(f)
     │
@@ -990,7 +1006,7 @@ go_lib::run(f)
     │                       install SIGSEGV + SIGURG handlers
     │                       start sysmon thread; start timer thread
     │
-    ├─ spawn_goroutine(f)   allocate 8 KiB stack + G; push to global run queue
+    ├─ spawn_goroutine(f)   allocate 2 KiB stack + 128 B G; push to global run queue
     │
     └─ thread::park()       calling thread sleeps until f() returns
 
@@ -1016,11 +1032,19 @@ Each M-thread (M::start → schedule → findrunnable → execute → goexit0 �
       → schedule()               re-enter scheduler loop
 
 Stack growth (Step 3):
-    goroutine touches guard page → SIGSEGV
-    sigsegv_handler              identify guard-page fault
-    newstack(gp)                 double stack; copystack brackets copy with
+    goroutine touches guard page → SIGSEGV (Linux/Windows) or SIGBUS (macOS)
+    sigsegv_handler / sigbus_handler     identify guard-page fault
+    newstack(gp)                 double stack (capped at 1 GiB); copystack
+                                 brackets the copy with
                                  casgstatus(GRUNNING→GCOPYSTACK→GRUNNING)
-    update_sp_in_context(ucontext, delta)   redirect faulting instruction
+                                 and rewrites all pointer-sized words in
+                                 [old_guard_lo, old_hi)
+    update_sp_in_context(ucontext, delta)   rewrite SP + FP + callee-saved
+                                 and argument GPRs so the retried instruction
+                                 lands on the new stack (two-range scheme)
+    grow_stack_if_needed         proactive checkpoint on every gogo: doubles
+                                 the stack when saved SP is within STACK_GUARD
+                                 (928 B) of the guard page
 
 Async preemption (Step 4):
     sysmon: goroutine running > 10 ms
@@ -1059,7 +1083,7 @@ Netpoll (Step 5):
 | `runtime::p` | `runtime/runtime2.go`, `proc.go` | P struct, 256-slot run queue |
 | `runtime::sched` | `runtime/proc.go`, `runtime/preempt.go` | schedule, findrunnable, execute, goexit0, async_preempt2, SIGURG handler, GOMAXPROCS |
 | `runtime::park` | `runtime/proc.go` | gopark, goready |
-| `runtime::stack` | `runtime/stack.go`, `runtime/signal_unix.go` | 8 KiB→1 GiB dynamic stack allocator, newstack, copystack, SIGSEGV handler |
+| `runtime::stack` | `runtime/stack.go`, `runtime/signal_unix.go` | 2 KiB→1 GiB dynamic stack allocator, newstack, copystack, SIGSEGV/SIGBUS handler |
 | `runtime::netpoll` | `runtime/netpoll_epoll.go`, `runtime/netpoll_kqueue.go`, `runtime/netpoll_windows.go` | epoll (Linux) / kqueue (macOS) / IOCP (Windows) |
 | `runtime::sudog` | `runtime/runtime2.go` | Sudog waiter records + per-P pool |
 | `runtime::syscall` | `runtime/proc.go` | entersyscall, exitsyscall, handoffp |

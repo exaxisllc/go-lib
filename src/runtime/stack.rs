@@ -4,11 +4,14 @@
 //!
 //! ## v0.2.0 — dynamic stack growth
 //!
-//! Each goroutine starts with an 8 KiB stack in release builds (matching
-//! Go's `stackMin`).  Debug builds use larger initial sizes to avoid the
-//! signal-growth instruction-retry hazard — see [`GOROUTINE_STACK_BYTES`].
+//! Each goroutine starts with a 2 KiB stack in release builds (matching
+//! Go's `stackMin = 2048`).  Debug builds use larger initial sizes
+//! (Linux 16 KiB, macOS 64 KiB, Windows 64 KiB) to absorb the wider
+//! non-optimised frames produced by debug codegen — see
+//! [`GOROUTINE_STACK_BYTES`] for the full table.
 //! The guard page (`PROT_NONE`) immediately below `stack.lo` turns overflows
-//! into a `SIGSEGV` that the runtime intercepts.
+//! into a `SIGSEGV` (Linux/Windows) or `SIGBUS` (macOS) that the runtime
+//! intercepts and recovers from by growing the stack.
 //!
 //! When the guard page is touched:
 //! 1. `sigsegv_handler` identifies the fault as a goroutine stack overflow.
@@ -35,11 +38,12 @@
 //! ## copystack — conservative pointer adjustment
 //!
 //! Without GC stack maps we scan every pointer-sized word in the live stack
-//! region and adjust those that fall within `[old_lo, old_hi)`.  Return
-//! addresses are in the code segment (a completely different address range)
-//! and are never mistakenly adjusted.  Integer values that coincidentally
-//! equal a stack address are a theoretical false positive but vanishingly
-//! rare for the narrow 8–1024 KiB windows used here.
+//! region and adjust those that fall within `[old_guard_lo, old_hi)` (the
+//! usable old stack plus its guard page).  Return addresses are in the code
+//! segment (a completely different address range) and are never mistakenly
+//! adjusted.  Integer values that coincidentally equal a stack address are
+//! a theoretical false positive but vanishingly rare for the narrow
+//! 2–1024 KiB windows used here.
 
 // Mutex is only needed for the SIGSEGV handler's static on Unix.
 #[cfg(not(windows))]
@@ -93,53 +97,52 @@ mod win32 {
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Minimum goroutine stack size (bytes).  Matches Go's `stackMin = 8 KiB`.
-#[allow(dead_code)] // enforced by stack-alloc assertions; compiler doesn't see the check
-pub(crate) const STACK_MIN: usize = 8 * 1024;
+/// Minimum goroutine stack size (bytes).
+///
+/// Matches Go's `stackMin = 2048`.  The stack grows on demand via the
+/// SIGBUS/SIGSEGV guard-page handler; 2 KiB is the initial allocation.
+/// Debug builds start larger to avoid frequently triggering the growth path
+/// with the deeper frames produced by non-optimised code.
+#[allow(dead_code)] // used in GOROUTINE_STACK_BYTES and documentation
+pub(crate) const STACK_MIN: usize = 2 * 1024;
 
 /// Maximum goroutine stack size (bytes). 1 GiB matches Go's `maxstacksize`.
 pub(crate) const STACK_MAX: usize = 1024 * 1024 * 1024;
 
 /// Initial stack size for every new goroutine.
 ///
-/// **Linux release — 8 KiB**
-/// Matches Go's `stackMin`.  The SIGSEGV growth handler grows the stack on
-/// demand when the guard page is touched.
+/// ## Platform table
 ///
-/// **Linux debug — 16 KiB**
-/// Coverage and sanitiser builds produce deeper frames; 16 KiB avoids
-/// unnecessary growth-path invocations.
+/// | Platform      | Profile | Size  | Notes                                         |
+/// |---------------|---------|-------|-----------------------------------------------|
+/// | Linux release | release | 2 KiB | Matches Go's `stackMin`; grows on demand      |
+/// | Linux AArch64 | release | 2 KiB | Same; page_size = 4 KiB on most kernels       |
+/// | macOS release | release | 2 KiB | Guard-page faults raise SIGBUS, not SIGSEGV   |
+/// | Linux debug   | debug   | 16 KiB| Deeper frames avoid unnecessary growth        |
+/// | macOS debug   | debug   | 64 KiB| AArch64 CI: 16 KiB pages + wider debug frames |
+/// | Windows debug | debug   | 64 KiB| SEH/VEH overhead + 3–5× wider debug frames    |
+/// | Windows release| release| 2 KiB | Proactive growth handles overflow             |
 ///
-/// **macOS release — 8 KiB**
-/// Same semantics as Linux release; guard-page faults raise SIGBUS on macOS.
+/// ## Per-goroutine memory (release builds)
 ///
-/// **macOS debug — 64 KiB**
-/// macOS-latest CI runs on Apple Silicon (AArch64) where the 16 KiB page
-/// makes each goroutine's memory footprint (stack + guard) at least 24 KiB.
-/// AArch64 debug frames are also larger than x86-64 due to mandatory callee-
-/// saved register spills (x19–x28, FP, LR = 10 × 8 B per frame minimum).
-/// 64 KiB ensures goroutines from high-concurrency tests (e.g.
-/// `many_goroutines` with 5 000 goroutines) do not overflow, which would
-/// trigger the AArch64 growth path and risk deadlock in the SIGBUS handler's
-/// diagnostic code.  This matches the original default from before this
-/// branch.
+/// ```text
+/// Platform         Stack   OS guard   G struct   Total
+/// ───────────────  ──────  ─────────  ────────── ──────────
+/// Linux / Win x86  2 KiB   4 KiB      128 B      ~6.1 KiB
+/// macOS x86-64     2 KiB   4 KiB      128 B      ~6.1 KiB
+/// macOS AArch64    2 KiB  16 KiB      128 B      ~18 KiB
+/// ```
 ///
-/// **Windows debug — 64 KiB**
-/// Windows Structured Exception Handling pushes `EXCEPTION_RECORD` onto the
-/// *current* goroutine stack before the VEH fires.  If the stack is already
-/// exhausted the write faults silently and the process terminates before the
-/// handler runs.  Debug frames are also 3–5× larger.  64 KiB provides the
-/// required headroom.
-///
-/// **Windows release — 8 KiB**
-/// Tight but workable; the proactive growth check in `grow_stack_if_needed`
-/// doubles the stack before the guard page is hit.
+/// Go achieves ~2.4 KiB (2 KiB stack + ~392 B descriptor, no OS guard page)
+/// by emitting `morestack` stack-check prologues from the compiler.  Without
+/// that compiler support, eliminating the OS guard page would turn stack
+/// overflows into silent memory corruption rather than a clean crash.
 #[cfg(any(all(windows, debug_assertions), all(target_os = "macos", debug_assertions)))]
 pub(crate) const GOROUTINE_STACK_BYTES: usize = 64 * 1024;
 #[cfg(all(debug_assertions, not(any(windows, target_os = "macos"))))]
 pub(crate) const GOROUTINE_STACK_BYTES: usize = 16 * 1024;
 #[cfg(not(debug_assertions))]
-pub(crate) const GOROUTINE_STACK_BYTES: usize = 8 * 1024;
+pub(crate) const GOROUTINE_STACK_BYTES: usize = STACK_MIN;
 
 /// Stack size for each M's g0 (the scheduler stack).
 ///
@@ -742,12 +745,26 @@ unsafe fn update_sp_in_context(
 // Grow stack at scheduler re-entry (checkpoint growth)
 // ---------------------------------------------------------------------------
 
-/// Check whether `gp`'s saved stack pointer is within STACK_GUARD bytes of
+/// Check whether `gp`'s saved stack pointer is within `STACK_GUARD` bytes of
 /// the guard page, and if so grow the stack proactively before resuming.
 ///
 /// Called from `execute` in `sched.rs` (on g0, before every `gogo` call).
 /// Handles the case where a goroutine exhausts most of its stack across
 /// multiple scheduler quanta and the SIGSEGV handler is about to fire.
+///
+/// ## Threshold — `STACK_GUARD` (not `2 × STACK_GUARD`)
+///
+/// We use `STACK_GUARD` (928 bytes) as the low-water mark, matching Go's
+/// `stackGuard`.  This leaves exactly one guard zone of headroom — enough
+/// for a typical scheduler-call depth — before triggering a doubling.
+/// Using `2 × STACK_GUARD` was excessively conservative: on a 2 KiB initial
+/// stack it left only 192 bytes of effective space (`2048 − 1856 = 192`)
+/// and would force almost every goroutine to grow on its first scheduling
+/// point even when the stack is far from exhausted.
+///
+/// The reactive SIGBUS/SIGSEGV growth handler remains the safety net for the
+/// rare case where a goroutine exhausts the remaining guard zone between two
+/// scheduling points without ever calling `gosched`.
 ///
 /// # Safety
 /// Must be called from g0; `gp` must be about to be resumed via `gogo`.
@@ -756,7 +773,7 @@ pub(crate) unsafe fn grow_stack_if_needed(gp: *mut G) {
     let lo   = unsafe { (*gp).stack.lo };
 
     // sp == 0 means the goroutine has never run yet (initial call).
-    if sp == 0 || sp < lo + STACK_GUARD * 2 {
+    if sp == 0 || sp < lo + STACK_GUARD {
         // Growing here avoids the SIGSEGV race on the very first quantum.
         if sp != 0 {
             // Stack is nearly full; proactively double it.
