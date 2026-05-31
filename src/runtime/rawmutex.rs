@@ -79,19 +79,35 @@ impl RawMutex {
 
 /// Releases a `RawMutex` when dropped.  Use inside functions that acquire a
 /// channel lock so that a panic never leaves the lock permanently held.
-pub(crate) struct LockGuard<'a>(pub &'a RawMutex);
+///
+/// The guard also holds an [`MLockGuard`][crate::runtime::m::MLockGuard] so
+/// that SIGURG-based async preemption is suppressed for as long as the
+/// spinlock is held.  Without this, the scheduler could async-preempt a
+/// goroutine that owns the spinlock; the next goroutine scheduled on the
+/// same M would then spin forever in `RawMutex::lock` waiting for a lock
+/// that can only be released by re-running the preempted holder.  Captured
+/// live via lldb on a hung `many_goroutines` run.
+pub(crate) struct LockGuard<'a> {
+    m:    &'a RawMutex,
+    _mlk: crate::runtime::m::MLockGuard,
+}
 
 impl Drop for LockGuard<'_> {
     fn drop(&mut self) {
         // SAFETY: LockGuard is only constructed after successfully calling lock().
-        unsafe { self.0.unlock() };
+        // Release the spinlock *before* the `_mlk` field is dropped so that
+        // m.locks remains > 0 across the entire critical section.
+        unsafe { self.m.unlock() };
     }
 }
 
 impl<'a> LockGuard<'a> {
     /// Acquire `m` and return a guard that releases it on drop.
     pub(crate) fn new(m: &'a RawMutex) -> Self {
+        // Bump m.locks *before* attempting to acquire so that SIGURG cannot
+        // preempt us while we are spinning or holding the lock.
+        let _mlk = crate::runtime::m::m_lock();
         m.lock();
-        LockGuard(m)
+        LockGuard { m, _mlk }
     }
 }

@@ -1510,7 +1510,16 @@ unsafe extern "C" fn goroutine_entry() {
     // briefly and always released before goroutines block or return).
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (go_fn.0)()));
     if let Err(payload) = result {
-        handle_goroutine_panic(payload);
+        // Wrap `handle_goroutine_panic` in a second `catch_unwind`.  Without
+        // this, any panic from the user-supplied panic handler (or even from
+        // `eprintln!` writing to a broken stderr — common in CI with output
+        // capture) propagates out of `goroutine_entry` — an `extern "C" fn` —
+        // and Rust aborts with the dreaded "thread caused non-unwinding panic.
+        // aborting." (SIGABRT).  That used to abort the whole test process
+        // when a single goroutine's panic-reporting machinery failed.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            handle_goroutine_panic(payload);
+        }));
     }
 
     // Returning here drops through to goexit_trampoline via the pre-wired

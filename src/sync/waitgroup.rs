@@ -100,6 +100,15 @@ impl WaitGroup {
     ///
     /// Panics if the counter drops below zero.
     pub fn add(&self, delta: i64) {
+        // Hold an `m.locks` guard across the std::sync::Mutex critical section.
+        // Without it, SIGURG-based async preemption can fire after
+        // `pthread_mutex_lock` returns but before we drop the MutexGuard: the
+        // preempted goroutine still holds the OS-level pthread mutex, and the
+        // next goroutine scheduled on the same M will self-deadlock trying to
+        // re-acquire it (the default pthread mutex is non-recursive, so a
+        // same-thread re-lock blocks forever in `__psynch_mutexwait`).
+        // Captured live via lldb on a hung `many_goroutines` run.
+        let _lk = crate::runtime::m::m_lock();
         // Collect goroutine waiters to wake (if counter reaches zero).
         let goroutine_waiters: Vec<*mut G> = {
             let mut state = self.state.lock().unwrap();
@@ -150,16 +159,25 @@ impl WaitGroup {
         // (including whoever will call done() to reach count == 0).
         let gp = current_g();
         if !gp.is_null() {
-            let mut state = self.state.lock().unwrap();
-            if state.count == 0 {
-                return; // fast path: already done
+            // Critical section guarded by `m_lock` — see matching comment in
+            // `add()`.  Scope the guard so it is dropped *before* `gopark`:
+            // we must not hold `m.locks` across the yield (other goroutines
+            // scheduled on this M would inherit suppressed preemption until
+            // this goroutine wakes again, which can be milliseconds away).
+            {
+                let _lk = crate::runtime::m::m_lock();
+                let mut state = self.state.lock().unwrap();
+                if state.count == 0 {
+                    return; // fast path: already done
+                }
+                // Register as a waiter *before* releasing the lock so that any
+                // concurrent add() that drives count to zero will see us and
+                // call goready.  goready itself spins until our status reaches
+                // GWAITING, which closes the window between drop(state) and
+                // gopark().
+                state.waiters.push(gp);
+                drop(state);
             }
-            // Register as a waiter *before* releasing the lock so that any
-            // concurrent add() that drives count to zero will see us and call
-            // goready.  goready itself spins until our status reaches GWAITING,
-            // which closes the window between drop(state) and gopark().
-            state.waiters.push(gp);
-            drop(state);
             // Suspend this goroutine.  Execution resumes here after add()
             // calls goready(gp) once the counter reaches zero.
             gopark(WaitReason::Semacquire);
