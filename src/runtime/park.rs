@@ -141,6 +141,12 @@ pub(crate) unsafe fn goready(gp: *mut G) {
     let sc = sched();
     let m  = current_m();
 
+    // Hold an `m.locks` guard across runqput / push_batch + startm.  Without
+    // it, SIGURG can fire midway through these critical sections (each holds
+    // an internal Mutex) and `preemptm` would self-deadlock trying to
+    // re-acquire the same lock.  See `MLockGuard` doc-comment.
+    let _lk = super::m::m_lock();
+
     if !m.is_null() {
         let p = unsafe { (*m).p };
         if !p.is_null() {

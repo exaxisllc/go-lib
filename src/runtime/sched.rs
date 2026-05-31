@@ -258,21 +258,56 @@ pub(crate) unsafe fn findrunnable() -> *mut G {
 /// On return, the M's `p` field has been restored to a runnable P by the
 /// thread that woke it.
 ///
+/// ## Lost-wakeup avoidance
+///
+/// There is a classic lost-wakeup race between `findrunnable`'s queue checks
+/// and `stopm`'s park:
+///
+/// ```text
+///   M:   findrunnable: local empty, global empty → stopm
+///   T:   goready(gp): push gp to global queue
+///   T:   startm(null): pop idle_m — empty (M hasn't added itself yet) → return
+///   M:   stopm: take inner.lock; add self to idle_m; drop lock; park
+///        ← M parks forever; queue has gp but no one will wake M
+/// ```
+///
+/// `T` can be any thread: sysmon's netpoll, the timer thread, another M's
+/// channel send.  Even with `GOMAXPROCS=1` (no other Ms), the timer and
+/// sysmon threads can hit this race.
+///
+/// The fix matches Go's `stopm` / `mPark` pattern: after adding M to the
+/// idle list (still under `inner.lock`), re-check the global queue.  If
+/// work appeared, pop ourselves back out of idle_m, take a P, and return
+/// without parking.  Holding `inner.lock` across the re-check serialises
+/// us with any concurrent `startm`, which also takes `inner.lock` and
+/// pops idle_m there — if work was queued after our park, `startm` is
+/// guaranteed to find us on idle_m.
+///
 /// Ported from `stopm` in `runtime/proc.go`.
 unsafe fn stopm() {
     let m  = current_m();
     let sc = sched();
 
-    // Surrender P under the scheduler lock.
+    // Surrender P under the scheduler lock and atomically re-check for work.
     {
         let mut inner = sc.inner.lock().unwrap();
-        let p = unsafe { (*m).p };
-        if !p.is_null() {
+        let surrendered_p = unsafe { (*m).p };
+
+        // ── Pre-surrender check: any goroutines on M's local P queue? ─────
+        // findrunnable already checked but a concurrent goready may have
+        // pushed (via runqput) between findrunnable and here.  If so, bail
+        // out without surrendering — we'd otherwise orphan the work, since
+        // with GOMAXPROCS=1 there are no other Ms to work-steal it.
+        if !surrendered_p.is_null() && unsafe { (*surrendered_p).runq_size() } > 0 {
+            return; // skip park — goto top of findrunnable, will pop from local
+        }
+
+        if !surrendered_p.is_null() {
             unsafe {
                 (*m).p = ptr::null_mut();
-                (*p).status.store(PIDLE, Release);
-                (*p).link = inner.idle_p;
-                inner.idle_p = p;
+                (*surrendered_p).status.store(PIDLE, Release);
+                (*surrendered_p).link = inner.idle_p;
+                inner.idle_p = surrendered_p;
             }
         }
         // Enqueue M on idle list.
@@ -280,6 +315,34 @@ unsafe fn stopm() {
             (*m).schedlink = inner.idle_m;
             inner.idle_m   = m;
             inner.nmidle  += 1;
+        }
+
+        // ── Re-check global queue (lost-wakeup avoidance) ─────────────────
+        // Still holding `inner.lock`.  If goready raced with our earlier
+        // queue check and pushed work between findrunnable and here, we
+        // would otherwise park forever — startm has nothing to pop because
+        // either (a) the goready ran before we added ourselves to idle_m
+        // (so its startm found idle_m empty) or (b) it's running right now
+        // waiting for inner.lock.  Either way, observing work-on-queue here
+        // means we should not park.
+        if sc.global_run_q.len() > 0 {
+            // Pop ourselves back off idle_m, reclaim a P, and return.
+            unsafe {
+                inner.idle_m  = (*m).schedlink;
+                (*m).schedlink = ptr::null_mut();
+                inner.nmidle -= 1;
+            }
+            // Re-claim an idle P (preferring the one we just surrendered).
+            if !inner.idle_p.is_null() {
+                let p2 = inner.idle_p;
+                unsafe {
+                    inner.idle_p = (*p2).link;
+                    (*p2).link   = ptr::null_mut();
+                    (*p2).status.store(PRUNNING, Release);
+                    (*m).p = p2;
+                }
+            }
+            return;    // skip park — goto top of findrunnable
         }
     } // release lock before blocking
 
@@ -528,6 +591,27 @@ unsafe extern "C" fn sigurg_handler(
 ) {
     let gp = current_g();
     if !gp.is_null() && unsafe { (*gp).preempt } {
+        // Guard 0: M must not be holding any internal scheduler lock.
+        //
+        // `spawn_goroutine`, `goready`, `gosched_m`, etc. take the global run
+        // queue's `Mutex` to enqueue a G.  If SIGURG arrives midway through
+        // that critical section, `redirect_to_async_preempt` would forward
+        // execution to `async_preempt_trampoline → async_preempt2 → mcall →
+        // preemptm`, and `preemptm` would itself call `push_batch`, which
+        // tries to re-acquire the same `Mutex` on the same thread — a hard
+        // self-deadlock (the M parks in `pthread_mutex_firstfit_lock_wait`
+        // waiting for a lock it already owns).
+        //
+        // The fix is the same idea Go uses (`m.locks > 0` ⇒ no async preempt):
+        // any code that takes a non-reentrant scheduler-internal `Mutex`
+        // wraps the critical section in `m_lock()`, which increments
+        // `(*m).locks`.  This guard checks the counter and skips preemption
+        // when it is non-zero.
+        let mp = super::m::current_m();
+        if !mp.is_null() && unsafe { (*mp).locks } > 0 {
+            return; // holding a scheduler-internal lock — skip preemption
+        }
+
         // Guard 1: goroutine must be GRUNNING.
         //
         // SIGURG can arrive while gp is in GWAITING (gopark transition window),
@@ -1442,6 +1526,12 @@ pub(crate) fn spawn_goroutine(f: impl FnOnce() + Send + 'static) {
     // startm are unsafe because they manipulate the scheduler's internal queues
     // without a typed lock; their preconditions (non-null pointer, valid G
     // layout) are satisfied by the new_goroutine constructor above.
+    //
+    // The `_lk` guard increments `(*current_m).locks` for the duration of the
+    // push_batch + startm critical section.  Without this, SIGURG can fire
+    // while we hold the global-queue mutex inside push_batch, redirect to
+    // preemptm, and self-deadlock when preemptm calls push_batch again.
+    let _lk = super::m::m_lock();
     unsafe {
         (*g_ptr).schedlink = ptr::null_mut();
         sched().global_run_q.push_batch(g_ptr, g_ptr, 1);
