@@ -539,7 +539,7 @@ fn run_returns_value() {
 // ---------------------------------------------------------------------------
 #[test]
 fn many_goroutines() {
-    const WORKERS: i32 = 5_000;
+    const WORKERS: i32 = 25_000;
     go_lib::run(|| {
         go_lib::scope(|s| {
             let handles: Vec<ScopedJoinHandle<i32>> = (0..WORKERS)
