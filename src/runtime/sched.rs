@@ -258,21 +258,56 @@ pub(crate) unsafe fn findrunnable() -> *mut G {
 /// On return, the M's `p` field has been restored to a runnable P by the
 /// thread that woke it.
 ///
+/// ## Lost-wakeup avoidance
+///
+/// There is a classic lost-wakeup race between `findrunnable`'s queue checks
+/// and `stopm`'s park:
+///
+/// ```text
+///   M:   findrunnable: local empty, global empty → stopm
+///   T:   goready(gp): push gp to global queue
+///   T:   startm(null): pop idle_m — empty (M hasn't added itself yet) → return
+///   M:   stopm: take inner.lock; add self to idle_m; drop lock; park
+///        ← M parks forever; queue has gp but no one will wake M
+/// ```
+///
+/// `T` can be any thread: sysmon's netpoll, the timer thread, another M's
+/// channel send.  Even with `GOMAXPROCS=1` (no other Ms), the timer and
+/// sysmon threads can hit this race.
+///
+/// The fix matches Go's `stopm` / `mPark` pattern: after adding M to the
+/// idle list (still under `inner.lock`), re-check the global queue.  If
+/// work appeared, pop ourselves back out of idle_m, take a P, and return
+/// without parking.  Holding `inner.lock` across the re-check serialises
+/// us with any concurrent `startm`, which also takes `inner.lock` and
+/// pops idle_m there — if work was queued after our park, `startm` is
+/// guaranteed to find us on idle_m.
+///
 /// Ported from `stopm` in `runtime/proc.go`.
 unsafe fn stopm() {
     let m  = current_m();
     let sc = sched();
 
-    // Surrender P under the scheduler lock.
+    // Surrender P under the scheduler lock and atomically re-check for work.
     {
         let mut inner = sc.inner.lock().unwrap();
-        let p = unsafe { (*m).p };
-        if !p.is_null() {
+        let surrendered_p = unsafe { (*m).p };
+
+        // ── Pre-surrender check: any goroutines on M's local P queue? ─────
+        // findrunnable already checked but a concurrent goready may have
+        // pushed (via runqput) between findrunnable and here.  If so, bail
+        // out without surrendering — we'd otherwise orphan the work, since
+        // with GOMAXPROCS=1 there are no other Ms to work-steal it.
+        if !surrendered_p.is_null() && unsafe { (*surrendered_p).runq_size() } > 0 {
+            return; // skip park — goto top of findrunnable, will pop from local
+        }
+
+        if !surrendered_p.is_null() {
             unsafe {
                 (*m).p = ptr::null_mut();
-                (*p).status.store(PIDLE, Release);
-                (*p).link = inner.idle_p;
-                inner.idle_p = p;
+                (*surrendered_p).status.store(PIDLE, Release);
+                (*surrendered_p).link = inner.idle_p;
+                inner.idle_p = surrendered_p;
             }
         }
         // Enqueue M on idle list.
@@ -280,6 +315,34 @@ unsafe fn stopm() {
             (*m).schedlink = inner.idle_m;
             inner.idle_m   = m;
             inner.nmidle  += 1;
+        }
+
+        // ── Re-check global queue (lost-wakeup avoidance) ─────────────────
+        // Still holding `inner.lock`.  If goready raced with our earlier
+        // queue check and pushed work between findrunnable and here, we
+        // would otherwise park forever — startm has nothing to pop because
+        // either (a) the goready ran before we added ourselves to idle_m
+        // (so its startm found idle_m empty) or (b) it's running right now
+        // waiting for inner.lock.  Either way, observing work-on-queue here
+        // means we should not park.
+        if sc.global_run_q.len() > 0 {
+            // Pop ourselves back off idle_m, reclaim a P, and return.
+            unsafe {
+                inner.idle_m  = (*m).schedlink;
+                (*m).schedlink = ptr::null_mut();
+                inner.nmidle -= 1;
+            }
+            // Re-claim an idle P (preferring the one we just surrendered).
+            if !inner.idle_p.is_null() {
+                let p2 = inner.idle_p;
+                unsafe {
+                    inner.idle_p = (*p2).link;
+                    (*p2).link   = ptr::null_mut();
+                    (*p2).status.store(PRUNNING, Release);
+                    (*m).p = p2;
+                }
+            }
+            return;    // skip park — goto top of findrunnable
         }
     } // release lock before blocking
 
@@ -485,6 +548,14 @@ pub(crate) unsafe fn install_sigurg_handler() {
     assert_eq!(ret, 0, "install_sigurg_handler: sigaction failed");
 
     *PREV_SIGURG.lock().unwrap() = Some(old);
+
+    // Capture a TEXT-segment anchor so `sigurg_handler` can tell our code
+    // apart from foreign (system-library) code.  `goroutine_entry` is in our
+    // binary and never moves; its address acts as a fixed reference point.
+    OUR_TEXT_ANCHOR.store(
+        goroutine_entry as *const () as usize,
+        std::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 /// Extract the interrupted stack pointer from a signal `ucontext_t`.
@@ -519,6 +590,83 @@ fn ucontext_sp(ctx: *mut libc::c_void) -> usize {
     }
 }
 
+/// Extract the interrupted program counter from a signal `ucontext_t`.
+///
+/// Used by `sigurg_handler` to skip async preemption when the goroutine was
+/// interrupted inside a foreign (system-library) function such as
+/// `libsystem_malloc.dylib!free_tiny`.  Preempting there can leave a
+/// non-reentrant lock held (e.g., the tiny-allocator's `os_unfair_lock`);
+/// when the scheduler then runs another goroutine on the same thread, the
+/// next allocation tries to re-acquire that lock and the kernel detects the
+/// recursion and aborts with `EXC_BAD_INSTRUCTION` from
+/// `_os_unfair_lock_recursive_abort`.
+///
+/// Returns 0 on platforms where we don't have a definition — the caller
+/// treats 0 as "out of our text", so preemption is conservatively skipped.
+#[cfg(not(windows))]
+#[inline]
+fn ucontext_pc(ctx: *mut libc::c_void) -> usize {
+    let uc = ctx as *mut libc::ucontext_t;
+    unsafe {
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        return (*uc).uc_mcontext.gregs[libc::REG_RIP as usize] as usize;
+
+        #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+        return (*uc).uc_mcontext.pc as usize;
+
+        #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+        return (*(*uc).uc_mcontext).__ss.__rip as usize;
+
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        return (*(*uc).uc_mcontext).__ss.__pc as usize;
+
+        #[allow(unreachable_code)]
+        0_usize
+    }
+}
+
+/// Bounds of our own binary's executable text segment, captured once at
+/// `schedinit` time.  Used by `sigurg_handler` to decide whether the
+/// interrupted instruction is in our code (safe to preempt) or in a
+/// dynamically-linked system library (unsafe — see `ucontext_pc` doc).
+///
+/// Stored as two ranges: `[lo, hi)` — `lo` is a known function address
+/// (`goroutine_entry`); `hi` is `lo + TEXT_RANGE_BYTES`.  We don't need
+/// an exact match: system libraries on macOS sit at virtual addresses
+/// roughly 256 GiB above the main executable's TEXT segment, so any
+/// liberal bound that contains "our binary + bundled Rust std" but
+/// excludes system libraries works.
+///
+/// 256 MiB is far larger than any plausible Rust binary's TEXT and far
+/// smaller than the gap to system-library VM space.
+#[cfg(not(windows))]
+const TEXT_RANGE_BYTES: usize = 256 * 1024 * 1024;
+
+/// One-time capture of a known address in our binary's TEXT segment.
+/// Initialised by `install_sigurg_handler` to `goroutine_entry as usize`.
+#[cfg(not(windows))]
+static OUR_TEXT_ANCHOR: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Return `true` if `pc` looks like it points into our own binary's TEXT,
+/// `false` if it is in a dynamically-linked library.
+///
+/// Heuristic: `|pc − anchor| < TEXT_RANGE_BYTES` where `anchor` is the
+/// address of `goroutine_entry`.  This works because the linker lays out
+/// all of the main executable's code (Rust std, our crate, the test
+/// harness) contiguously, while macOS's dyld shared cache places system
+/// libraries hundreds of GiB away.
+#[cfg(not(windows))]
+#[inline]
+fn pc_in_our_text(pc: usize) -> bool {
+    let anchor = OUR_TEXT_ANCHOR.load(std::sync::atomic::Ordering::Relaxed);
+    if anchor == 0 {
+        return true; // not yet initialised — fail-open
+    }
+    let diff = if pc > anchor { pc - anchor } else { anchor - pc };
+    diff < TEXT_RANGE_BYTES
+}
+
 /// SIGURG handler: redirect a preemptable goroutine to `async_preempt_trampoline`.
 #[cfg(not(windows))]
 unsafe extern "C" fn sigurg_handler(
@@ -528,6 +676,51 @@ unsafe extern "C" fn sigurg_handler(
 ) {
     let gp = current_g();
     if !gp.is_null() && unsafe { (*gp).preempt } {
+        // Guard 0: M must not be holding any internal scheduler lock.
+        //
+        // `spawn_goroutine`, `goready`, `gosched_m`, etc. take the global run
+        // queue's `Mutex` to enqueue a G.  If SIGURG arrives midway through
+        // that critical section, `redirect_to_async_preempt` would forward
+        // execution to `async_preempt_trampoline → async_preempt2 → mcall →
+        // preemptm`, and `preemptm` would itself call `push_batch`, which
+        // tries to re-acquire the same `Mutex` on the same thread — a hard
+        // self-deadlock (the M parks in `pthread_mutex_firstfit_lock_wait`
+        // waiting for a lock it already owns).
+        //
+        // The fix is the same idea Go uses (`m.locks > 0` ⇒ no async preempt):
+        // any code that takes a non-reentrant scheduler-internal `Mutex`
+        // wraps the critical section in `m_lock()`, which increments
+        // `(*m).locks`.  This guard checks the counter and skips preemption
+        // when it is non-zero.
+        let mp = super::m::current_m();
+        if !mp.is_null() && unsafe { (*mp).locks } > 0 {
+            return; // holding a scheduler-internal lock — skip preemption
+        }
+
+        // Guard 0.5: interrupted PC must be in OUR binary's TEXT segment.
+        //
+        // If we were interrupted inside a dynamically-linked system library
+        // (libsystem_malloc, libpthread, etc.), preempting and switching to
+        // another goroutine on the same thread will eventually re-enter the
+        // same library — which may try to re-acquire a non-reentrant lock
+        // it already holds (e.g., the tiny-allocator's `os_unfair_lock`).
+        // macOS detects the recursion and crashes with
+        // `_os_unfair_lock_recursive_abort` (EXC_BAD_INSTRUCTION / SIGILL).
+        //
+        // Concrete failure observed before this guard:
+        //   Box::drop → dealloc → free_tiny (holds malloc lock)
+        //   ←SIGURG redirects to preemptm → schedule() → another goroutine
+        //   other goroutine: Box::new → free_tiny → os_unfair_lock_lock_slow
+        //     ← recursive owner detected → abort
+        //
+        // Defer preemption to when we naturally exit the library back into
+        // our own code; sysmon will re-set `gp.preempt` and we'll get
+        // another SIGURG attempt soon enough.
+        let pc = ucontext_pc(ctx);
+        if !pc_in_our_text(pc) {
+            return; // interrupted in a system library — defer preemption
+        }
+
         // Guard 1: goroutine must be GRUNNING.
         //
         // SIGURG can arrive while gp is in GWAITING (gopark transition window),
@@ -1442,6 +1635,12 @@ pub(crate) fn spawn_goroutine(f: impl FnOnce() + Send + 'static) {
     // startm are unsafe because they manipulate the scheduler's internal queues
     // without a typed lock; their preconditions (non-null pointer, valid G
     // layout) are satisfied by the new_goroutine constructor above.
+    //
+    // The `_lk` guard increments `(*current_m).locks` for the duration of the
+    // push_batch + startm critical section.  Without this, SIGURG can fire
+    // while we hold the global-queue mutex inside push_batch, redirect to
+    // preemptm, and self-deadlock when preemptm calls push_batch again.
+    let _lk = super::m::m_lock();
     unsafe {
         (*g_ptr).schedlink = ptr::null_mut();
         sched().global_run_q.push_batch(g_ptr, g_ptr, 1);

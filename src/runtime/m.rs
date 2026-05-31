@@ -213,6 +213,26 @@ pub(crate) struct M {
     /// On Windows async preemption via signals is not available; the field
     /// stays `0` and `preemptone` skips the signal delivery.
     pub pthread_id: u64,
+
+    /// Number of scheduler-internal critical sections currently held on this M.
+    ///
+    /// Incremented before entering any code path that takes a non-reentrant
+    /// internal `Mutex` (e.g., the global run queue, the SchedInner lock, the
+    /// sudog cache); decremented immediately after the section exits.  The
+    /// SIGURG async-preemption handler refuses to redirect the goroutine when
+    /// this counter is non-zero — without that guard, SIGURG can fire midway
+    /// through a `push_batch` (which holds the global-queue mutex), then
+    /// `preemptm` (which also calls `push_batch`) would re-acquire the same
+    /// mutex on the same thread → self-deadlock.
+    ///
+    /// Stored as a plain `i32` because it is only ever read/written by the
+    /// owning OS thread (the M's thread) and by the signal handler on that
+    /// same thread.  No cross-thread access; an atomic would be a
+    /// pessimisation.  Volatile via direct field write/read on `*mut M` —
+    /// the field is `Sync + Send` via the M-level unsafe impls.
+    ///
+    /// Ported from `m.locks` in `runtime/runtime2.go`.
+    pub locks: i32,
 }
 
 // SAFETY: The scheduler guarantees that only one thread operates on a given M
@@ -262,6 +282,7 @@ impl M {
             alllink:   std::ptr::null_mut(),
             schedlink: std::ptr::null_mut(),
             pthread_id: 0, // set by M::start() once the OS thread is running
+            locks:     0,
         });
 
         // Transfer g0 ownership to a raw pointer and wire both directions.
@@ -381,6 +402,71 @@ impl Drop for M {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// MLockGuard — RAII guard that increments m.locks for its lifetime
+// ---------------------------------------------------------------------------
+
+/// RAII guard that increments the current M's `locks` counter on construction
+/// and decrements it on drop.  Wrap any scheduler-internal critical section
+/// that holds a non-reentrant Rust `Mutex` (global run queue, SchedInner, the
+/// sudog cache, etc.) in this guard so that an async-preemption SIGURG cannot
+/// fire while we hold the lock — preemption while holding a non-reentrant
+/// mutex causes a self-deadlock when `preemptm` tries to re-acquire it.
+///
+/// Cheap (one load + add/sub per scope) and never atomic — the M's `locks`
+/// counter is only ever touched by the M's own OS thread.
+///
+/// ## Usage
+///
+/// ```ignore
+/// use crate::runtime::m::m_lock;
+/// {
+///     let _guard = m_lock();
+///     sched().global_run_q.push_batch(gp, gp, 1);
+/// }
+/// ```
+///
+/// The guard is dropped at the end of the scope, restoring preemptability.
+pub(crate) struct MLockGuard {
+    m: *mut M,
+    // `*mut M` is already !Send/!Sync, which is exactly what we want — the
+    // guard must never cross OS-thread boundaries because the M's `locks`
+    // counter is per-OS-thread.
+    _not_send: std::marker::PhantomData<*mut ()>,
+}
+
+impl Drop for MLockGuard {
+    #[inline]
+    fn drop(&mut self) {
+        // SAFETY: `m` is the M for the current OS thread (captured at
+        // construction); the guard is `!Send` (via the raw-pointer field
+        // plus the explicit `PhantomData<*mut ()>`), so it cannot have moved
+        // to a different thread.
+        if !self.m.is_null() {
+            unsafe { (*self.m).locks -= 1 };
+        }
+    }
+}
+
+/// Take a guard that increments `current_m().locks` for its lifetime.
+///
+/// Returns a guard whose `Drop` restores the counter.  If the current OS
+/// thread has no associated M (e.g., the main thread before `schedinit`),
+/// the guard is a no-op.
+///
+/// # Safety
+/// Safe to call from any thread.  The returned guard is not `Send`.
+#[inline]
+pub(crate) fn m_lock() -> MLockGuard {
+    let m = current_m();
+    if !m.is_null() {
+        // SAFETY: `m` belongs to the current OS thread; no other thread reads
+        // or writes the `locks` field.  See the field's doc-comment.
+        unsafe { (*m).locks += 1 };
+    }
+    MLockGuard { m, _not_send: std::marker::PhantomData }
 }
 
 // ---------------------------------------------------------------------------
