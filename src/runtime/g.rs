@@ -76,7 +76,36 @@ pub(crate) struct Stack {
 /// the compile-time assertions immediately following this struct will catch
 /// any mismatch.
 ///
+/// ## Callee-saved register storage
+///
+/// `mcall` is called by Rust functions that follow the platform calling
+/// convention.  Those callers expect callee-saved registers (RBX, R12–R15
+/// on System V AMD64; RBX, RBP, RDI, RSI, R12–R15, XMM6–15 on Microsoft x64;
+/// x19–x28 + d8–d15 on AArch64) to be preserved across the call.
+///
+/// `mcall_asm` switches the goroutine off the CPU, runs the scheduler, and
+/// later — possibly long after, on the same or different M — `gogo_asm`
+/// resumes the goroutine at the instruction *immediately after* `call
+/// mcall_asm`.  Between save and restore the scheduler clobbers every
+/// callee-saved register.  We therefore save them to `Gobuf` on the way out
+/// and restore them on the way in.  Without this, a Rust function that
+/// holds a live value in (say) RBX across a `gosched()` or channel-blocking
+/// `recv()` resumes with garbage in RBX — corrupting any subsequent use
+/// (typically: assertion failures, malloc-state corruption, SIGILL, or
+/// SIGSEGV with no obvious cause).
+///
+/// The `regs[..]` array is at the **end** of the struct so the original
+/// `GOBUF_*_OFFSET` constants remain stable — no asm offset needs to change.
+///
 /// Ported from `gobuf` in `runtime/runtime2.go`.
+///
+/// ## AArch64 layout = main-branch identical
+///
+/// The `regs` field below is **only added on x86_64**.  An earlier attempt to
+/// add it for AArch64 too (with matching x19–x28 save/restore in
+/// `asm_arm64.rs`) caused the macOS-latest CI runner to hang in
+/// `many_goroutines` — root cause not pinpointed.  Keeping AArch64 100 %
+/// bit-identical to `main` for now; the x86_64 callee-saved fix proceeds.
 #[repr(C)]
 pub(crate) struct Gobuf {
     /// Saved stack pointer.
@@ -94,7 +123,29 @@ pub(crate) struct Gobuf {
     pub lr:   usize,
     /// Frame pointer / base pointer for frame-pointer-enabled builds.
     pub bp:   usize,
+    /// Callee-saved general-purpose register slots — see the doc-comment above.
+    /// Layout per platform:
+    ///   System V AMD64 (Linux/macOS x86_64): [rbx, r12, r13, r14, r15]
+    ///   Microsoft x64 (Windows x86_64):      [rbx, rdi, rsi, r12, r13, r14, r15]
+    #[cfg(target_arch = "x86_64")]
+    pub regs: [usize; CALLEE_SAVED_GPR_COUNT],
 }
+
+/// Number of callee-saved GPR slots in [`Gobuf::regs`].
+///
+/// - System V AMD64: 5 (RBX, R12, R13, R14, R15)
+/// - Microsoft x64:  7 (RBX, RDI, RSI, R12, R13, R14, R15)
+///
+/// Not defined for AArch64 — `Gobuf` on AArch64 has no `regs` field, leaving
+/// the struct bit-identical to `main`.
+///
+/// (Microsoft x64 callee-saved XMM6–15 are not currently saved; goroutine
+/// code on Windows that holds vector state across `mcall` may still corrupt.
+/// See `mcall_asm` for the open follow-up.)
+#[cfg(all(target_arch = "x86_64", not(windows)))]
+pub(crate) const CALLEE_SAVED_GPR_COUNT: usize = 5;
+#[cfg(all(target_arch = "x86_64", windows))]
+pub(crate) const CALLEE_SAVED_GPR_COUNT: usize = 7;
 
 // Byte offsets into `Gobuf` on a 64-bit target, derived from the
 // `#[repr(C)]` layout.  Used as immediate constants in `global_asm!` (step 3)
@@ -106,6 +157,10 @@ pub(crate) const GOBUF_CTXT_OFFSET: usize = 24;
 pub(crate) const GOBUF_RET_OFFSET:  usize = 32;
 pub(crate) const GOBUF_LR_OFFSET:   usize = 40;
 pub(crate) const GOBUF_BP_OFFSET:   usize = 48;
+/// Byte offset of `Gobuf::regs[0]` — the first callee-saved GPR slot.
+/// Subsequent slots are at `GOBUF_REGS_OFFSET + i*8`.  x86_64 only.
+#[cfg(target_arch = "x86_64")]
+pub(crate) const GOBUF_REGS_OFFSET: usize = 56;
 
 // Compile-time verification that the constants match the actual repr(C) layout.
 const _: () = {
@@ -117,6 +172,11 @@ const _: () = {
     assert!(offset_of!(Gobuf, ret)  == GOBUF_RET_OFFSET);
     assert!(offset_of!(Gobuf, lr)   == GOBUF_LR_OFFSET);
     assert!(offset_of!(Gobuf, bp)   == GOBUF_BP_OFFSET);
+};
+#[cfg(target_arch = "x86_64")]
+const _: () = {
+    use std::mem::offset_of;
+    assert!(offset_of!(Gobuf, regs) == GOBUF_REGS_OFFSET);
 };
 
 // SAFETY: `Gobuf` is passed between threads when the scheduler migrates a G.
@@ -135,6 +195,8 @@ impl Default for Gobuf {
             ret:  0,
             lr:   0,
             bp:   0,
+            #[cfg(target_arch = "x86_64")]
+            regs: [0; CALLEE_SAVED_GPR_COUNT],
         }
     }
 }
@@ -259,10 +321,18 @@ const _: () = {
     // Stack.lo is at Stack+0, Stack is at G+0, so G.stack.lo = G+0.
     // Stack.hi is at Stack+8, so G.stack.hi = G+8 = G_STACK_HI_OFFSET.
 
-    // Lock the compact layout (128 bytes on all 64-bit targets).
-    // If this fails you have changed the field list or ordering — update the
-    // layout table in the G doc-comment above.
-    assert!(size_of::<G>() == 128,
+    // Lock the compact layout.  Size varies by platform:
+    //   System V AMD64 (Linux/macOS x86_64): 5 callee-save regs → Gobuf 96 B → G 168 B
+    //   Microsoft x64 (Windows x86_64):      7 callee-save regs → Gobuf 112 B → G 184 B
+    //   AArch64 (all OS):                    no regs → Gobuf 56 B → G 128 B (matches main)
+    //
+    // The 72-byte non-Gobuf portion is the same on every platform.
+    const NON_GOBUF: usize = 72;
+    #[cfg(target_arch = "x86_64")]
+    const GOBUF: usize = 56 + CALLEE_SAVED_GPR_COUNT * 8;
+    #[cfg(not(target_arch = "x86_64"))]
+    const GOBUF: usize = 56;
+    assert!(size_of::<G>() == NON_GOBUF + GOBUF,
         "G struct size changed — update layout table and this assertion");
 };
 
