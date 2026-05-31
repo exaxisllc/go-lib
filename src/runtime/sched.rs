@@ -1405,13 +1405,39 @@ fn handle_goroutine_panic(payload: Box<dyn Any + Send + 'static>) {
         Some(f) => f(payload),
         None    => {
             // Default: print to stderr, matching Go's "goroutine panicked" output.
-            let msg = payload.downcast_ref::<String>()
-                .map(|s| s.as_str())
-                .or_else(|| payload.downcast_ref::<&str>().copied())
-                .unwrap_or("(unknown panic payload)");
+            //
+            // Unwrap up to 4 levels of `Box<dyn Any + Send>` nesting.  Without
+            // this, `scope::scope`'s re-panic via `std::panic::panic_any(payload)`
+            // (where `payload` is itself `Box<dyn Any>`) hides the real message:
+            // the outer payload's runtime type becomes `Box<dyn Any + Send>`, so
+            // a direct `downcast::<String>()` on the outer Box always fails and
+            // we'd otherwise print the unhelpful "(unknown panic payload)".
+            let msg = extract_panic_msg(&payload);
             eprintln!("goroutine panicked: {msg}");
         }
     }
+}
+
+/// Best-effort string extraction from a panic payload, recursing through up to
+/// `MAX_DEPTH` levels of `Box<dyn Any + Send>` wrapping (see comment in
+/// `handle_goroutine_panic`).
+fn extract_panic_msg(payload: &(dyn Any + Send)) -> String {
+    const MAX_DEPTH: u32 = 4;
+    fn recurse(p: &(dyn Any + Send), depth: u32) -> Option<String> {
+        if let Some(s) = p.downcast_ref::<String>() {
+            return Some(s.clone());
+        }
+        if let Some(s) = p.downcast_ref::<&str>() {
+            return Some((*s).to_string());
+        }
+        if depth < MAX_DEPTH {
+            if let Some(inner) = p.downcast_ref::<Box<dyn Any + Send + 'static>>() {
+                return recurse(inner.as_ref(), depth + 1);
+            }
+        }
+        None
+    }
+    recurse(payload, 0).unwrap_or_else(|| "(unknown panic payload)".to_string())
 }
 
 // ---------------------------------------------------------------------------
