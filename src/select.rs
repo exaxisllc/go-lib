@@ -345,11 +345,22 @@ pub fn selectgo(cases: &mut [SCase], has_default: bool) -> (usize, bool) {
 // ---------------------------------------------------------------------------
 
 pub(crate) unsafe fn lock_chan<T>(p: *const ()) {
+    // Suppress SIGURG-driven async preemption while the channel spinlock is
+    // held — same rationale as `LockGuard::new`.  `selectgo` may hold several
+    // chan locks at once; each `lock_chan`/`unlock_chan` pair bumps and then
+    // decrements `m.locks`, so the counter is back to zero once all locks
+    // are released.
+    std::mem::forget(crate::runtime::m::m_lock());
     (*(p as *const Hchan<T>)).mutex.lock();
 }
 
 pub(crate) unsafe fn unlock_chan<T>(p: *const ()) {
     (*(p as *const Hchan<T>)).mutex.unlock();
+    // Manual `m.locks -= 1` to match the `mem::forget`ed guard in
+    // `lock_chan`.  We avoid constructing/dropping an MLockGuard here
+    // because the lock/unlock are split across two separate functions.
+    let mp = crate::runtime::m::current_m();
+    if !mp.is_null() { (*mp).locks -= 1; }
 }
 
 pub(crate) unsafe fn try_send_chan<T: Send + 'static>(
