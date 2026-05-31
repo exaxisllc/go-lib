@@ -52,7 +52,7 @@ use super::g::{
     set_current_g, Gobuf, G,
     G0_SCHED,
     GOBUF_BP_OFFSET, GOBUF_G_OFFSET,
-    GOBUF_PC_OFFSET, GOBUF_SP_OFFSET,
+    GOBUF_PC_OFFSET, GOBUF_REGS_OFFSET, GOBUF_SP_OFFSET,
 };
 #[cfg(windows)]
 use super::g::{G_STACK_HI_OFFSET, G_STACK_LO_OFFSET};
@@ -72,33 +72,65 @@ use super::g::{G_STACK_HI_OFFSET, G_STACK_LO_OFFSET};
 /// - `rcx` = buf (*mut Gobuf, first arg)
 ///
 /// Common: `rax` = scratch (target pc), `rbp` / `rsp` restored from Gobuf.
+///
+/// ## Callee-saved register restoration
+///
+/// `gogo_asm` resumes execution at `buf.pc`, which (for a `mcall`-yielded
+/// goroutine) is the instruction *immediately after* `call mcall_asm`.  The
+/// Rust function that called `mcall` follows the platform ABI, which means
+/// it may hold live values in callee-saved registers across the call.  We
+/// restore those slots here so the caller's frame sees the exact register
+/// state it left behind, not whatever the scheduler happened to leave there.
+///
+/// System V AMD64 (Linux/macOS) callee-saved GPRs: RBX, R12, R13, R14, R15
+/// (plus RBP, which we already restore from `bp`).  No callee-saved XMM/YMM.
 // System V AMD64 ABI (Linux, macOS): first argument in rdi.
 #[cfg(not(windows))]
 #[unsafe(naked)]
 unsafe extern "C" fn gogo_asm(buf: *mut Gobuf) -> ! {
     core::arch::naked_asm!(
+        // Load callee-saved GPRs from gobuf.regs[..] BEFORE switching stacks.
+        // Order matches mcall_asm's save order: [rbx, r12, r13, r14, r15].
+        "mov rbx, [rdi + {regs} + 0]",
+        "mov r12, [rdi + {regs} + 8]",
+        "mov r13, [rdi + {regs} + 16]",
+        "mov r14, [rdi + {regs} + 24]",
+        "mov r15, [rdi + {regs} + 32]",
         "mov rax, [rdi + {pc}]",   // rax = gobuf.pc  (load before stack switch)
         "mov rbp, [rdi + {bp}]",   // rbp = gobuf.bp  (frame pointer)
         "mov rsp, [rdi + {sp}]",   // rsp = gobuf.sp  (stack switch — do last)
         "jmp rax",                  // jump to pc — never returns
-        pc = const GOBUF_PC_OFFSET,
-        bp = const GOBUF_BP_OFFSET,
-        sp = const GOBUF_SP_OFFSET,
+        pc   = const GOBUF_PC_OFFSET,
+        bp   = const GOBUF_BP_OFFSET,
+        sp   = const GOBUF_SP_OFFSET,
+        regs = const GOBUF_REGS_OFFSET,
     )
 }
 
 // Microsoft x64 ABI (Windows): first argument in rcx.
+// Microsoft x64 callee-saved GPRs add RDI and RSI vs. System V.
+// (Microsoft x64 also has callee-saved XMM6-15; not yet saved here — see
+// the FIXME in mcall_asm below.)
 #[cfg(windows)]
 #[unsafe(naked)]
 unsafe extern "C" fn gogo_asm(buf: *mut Gobuf) -> ! {
     core::arch::naked_asm!(
+        // Restore callee-saved GPRs: [rbx, rdi, rsi, r12, r13, r14, r15].
+        "mov rbx, [rcx + {regs} + 0]",
+        "mov rdi, [rcx + {regs} + 8]",
+        "mov rsi, [rcx + {regs} + 16]",
+        "mov r12, [rcx + {regs} + 24]",
+        "mov r13, [rcx + {regs} + 32]",
+        "mov r14, [rcx + {regs} + 40]",
+        "mov r15, [rcx + {regs} + 48]",
         "mov rax, [rcx + {pc}]",   // rax = gobuf.pc  (load before stack switch)
         "mov rbp, [rcx + {bp}]",   // rbp = gobuf.bp  (frame pointer)
         "mov rsp, [rcx + {sp}]",   // rsp = gobuf.sp  (stack switch — do last)
         "jmp rax",                  // jump to pc — never returns
-        pc = const GOBUF_PC_OFFSET,
-        bp = const GOBUF_BP_OFFSET,
-        sp = const GOBUF_SP_OFFSET,
+        pc   = const GOBUF_PC_OFFSET,
+        bp   = const GOBUF_BP_OFFSET,
+        sp   = const GOBUF_SP_OFFSET,
+        regs = const GOBUF_REGS_OFFSET,
     )
 }
 
@@ -129,6 +161,18 @@ unsafe extern "C" fn gogo_asm(buf: *mut Gobuf) -> ! {
 /// In both ABIs `[rsp]` on entry holds the return address pushed by the
 /// `call mcall_asm` instruction.  Caller SP = `rsp + 8`.
 // System V AMD64 ABI (Linux, macOS): args in rdi, rsi, rdx, rcx.
+//
+// ## Callee-saved register save
+//
+// `mcall_asm` is invoked by a Rust function that obeys the platform ABI: it
+// expects callee-saved GPRs (RBX, R12–R15 on System V, plus RBP) to be
+// preserved across the call.  But the goroutine is then yielded — the
+// scheduler will run arbitrary code on this M and may clobber every register.
+// Without saving the callee-saves here, the caller would resume with
+// scheduler garbage in RBX/R12–R15 → corruption.
+//
+// We save them into `g_sched.regs[..]` (slots [0..5]).  `gogo_asm` restores
+// them when the goroutine is resumed.  Order: [rbx, r12, r13, r14, r15].
 #[cfg(not(windows))]
 #[unsafe(naked)]
 unsafe extern "C" fn mcall_asm(
@@ -146,6 +190,13 @@ unsafe extern "C" fn mcall_asm(
         "mov [rsi + {bp}], rbp",           // g_sched.bp = frame pointer
         "mov [rsi + {g}],  rdi",           // g_sched.g  = g
 
+        // ── save callee-saved GPRs (System V AMD64): rbx, r12-r15 ────────
+        "mov [rsi + {regs} + 0],  rbx",
+        "mov [rsi + {regs} + 8],  r12",
+        "mov [rsi + {regs} + 16], r13",
+        "mov [rsi + {regs} + 24], r14",
+        "mov [rsi + {regs} + 32], r15",
+
         // ── switch to g0's stack (rdx = g0_gobuf) ────────────────────────
         "mov rsp, [rdx + {sp}]",           // rsp = g0.sp (stack switch)
         "mov rbp, [rdx + {bp}]",           // rbp = g0.bp
@@ -156,14 +207,21 @@ unsafe extern "C" fn mcall_asm(
         "call rcx",
         "ud2",
 
-        pc = const GOBUF_PC_OFFSET,
-        sp = const GOBUF_SP_OFFSET,
-        bp = const GOBUF_BP_OFFSET,
-        g  = const GOBUF_G_OFFSET,
+        pc   = const GOBUF_PC_OFFSET,
+        sp   = const GOBUF_SP_OFFSET,
+        bp   = const GOBUF_BP_OFFSET,
+        g    = const GOBUF_G_OFFSET,
+        regs = const GOBUF_REGS_OFFSET,
     )
 }
 
 // Microsoft x64 ABI (Windows): args in rcx, rdx, r8, r9.
+//
+// Microsoft x64 callee-saved GPRs: RBX, RBP, RDI, RSI, R12, R13, R14, R15.
+// We save all of them except RBP (already saved separately in `g_sched.bp`).
+// FIXME: Microsoft x64 ALSO requires XMM6–15 to be callee-saved.  Not saved
+// here yet — goroutines that hold SSE state across `mcall` may still corrupt.
+// Tracked as a follow-up.
 #[cfg(windows)]
 #[unsafe(naked)]
 unsafe extern "C" fn mcall_asm(
@@ -181,6 +239,15 @@ unsafe extern "C" fn mcall_asm(
         "mov [rdx + {sp}], rax",           // g_sched.sp = caller SP
         "mov [rdx + {bp}], rbp",           // g_sched.bp = frame pointer
         "mov [rdx + {g}],  rcx",           // g_sched.g  = g
+
+        // ── save callee-saved GPRs (Microsoft x64): rbx, rdi, rsi, r12-r15
+        "mov [rdx + {regs} + 0],  rbx",
+        "mov [rdx + {regs} + 8],  rdi",
+        "mov [rdx + {regs} + 16], rsi",
+        "mov [rdx + {regs} + 24], r12",
+        "mov [rdx + {regs} + 32], r13",
+        "mov [rdx + {regs} + 40], r14",
+        "mov [rdx + {regs} + 48], r15",
 
         // ── switch to g0's stack (r8 = g0_gobuf) ─────────────────────────
         "mov rsp, [r8 + {sp}]",            // rsp = g0.sp (= g0.stack.hi — top of allocation)
@@ -221,6 +288,7 @@ unsafe extern "C" fn mcall_asm(
         sp       = const GOBUF_SP_OFFSET,
         bp       = const GOBUF_BP_OFFSET,
         g        = const GOBUF_G_OFFSET,
+        regs     = const GOBUF_REGS_OFFSET,
         stack_lo = const G_STACK_LO_OFFSET,
         stack_hi = const G_STACK_HI_OFFSET,
     )
