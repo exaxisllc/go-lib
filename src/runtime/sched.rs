@@ -548,6 +548,14 @@ pub(crate) unsafe fn install_sigurg_handler() {
     assert_eq!(ret, 0, "install_sigurg_handler: sigaction failed");
 
     *PREV_SIGURG.lock().unwrap() = Some(old);
+
+    // Capture a TEXT-segment anchor so `sigurg_handler` can tell our code
+    // apart from foreign (system-library) code.  `goroutine_entry` is in our
+    // binary and never moves; its address acts as a fixed reference point.
+    OUR_TEXT_ANCHOR.store(
+        goroutine_entry as *const () as usize,
+        std::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 /// Extract the interrupted stack pointer from a signal `ucontext_t`.
@@ -582,6 +590,83 @@ fn ucontext_sp(ctx: *mut libc::c_void) -> usize {
     }
 }
 
+/// Extract the interrupted program counter from a signal `ucontext_t`.
+///
+/// Used by `sigurg_handler` to skip async preemption when the goroutine was
+/// interrupted inside a foreign (system-library) function such as
+/// `libsystem_malloc.dylib!free_tiny`.  Preempting there can leave a
+/// non-reentrant lock held (e.g., the tiny-allocator's `os_unfair_lock`);
+/// when the scheduler then runs another goroutine on the same thread, the
+/// next allocation tries to re-acquire that lock and the kernel detects the
+/// recursion and aborts with `EXC_BAD_INSTRUCTION` from
+/// `_os_unfair_lock_recursive_abort`.
+///
+/// Returns 0 on platforms where we don't have a definition — the caller
+/// treats 0 as "out of our text", so preemption is conservatively skipped.
+#[cfg(not(windows))]
+#[inline]
+fn ucontext_pc(ctx: *mut libc::c_void) -> usize {
+    let uc = ctx as *mut libc::ucontext_t;
+    unsafe {
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        return (*uc).uc_mcontext.gregs[libc::REG_RIP as usize] as usize;
+
+        #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+        return (*uc).uc_mcontext.pc as usize;
+
+        #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+        return (*(*uc).uc_mcontext).__ss.__rip as usize;
+
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        return (*(*uc).uc_mcontext).__ss.__pc as usize;
+
+        #[allow(unreachable_code)]
+        0_usize
+    }
+}
+
+/// Bounds of our own binary's executable text segment, captured once at
+/// `schedinit` time.  Used by `sigurg_handler` to decide whether the
+/// interrupted instruction is in our code (safe to preempt) or in a
+/// dynamically-linked system library (unsafe — see `ucontext_pc` doc).
+///
+/// Stored as two ranges: `[lo, hi)` — `lo` is a known function address
+/// (`goroutine_entry`); `hi` is `lo + TEXT_RANGE_BYTES`.  We don't need
+/// an exact match: system libraries on macOS sit at virtual addresses
+/// roughly 256 GiB above the main executable's TEXT segment, so any
+/// liberal bound that contains "our binary + bundled Rust std" but
+/// excludes system libraries works.
+///
+/// 256 MiB is far larger than any plausible Rust binary's TEXT and far
+/// smaller than the gap to system-library VM space.
+#[cfg(not(windows))]
+const TEXT_RANGE_BYTES: usize = 256 * 1024 * 1024;
+
+/// One-time capture of a known address in our binary's TEXT segment.
+/// Initialised by `install_sigurg_handler` to `goroutine_entry as usize`.
+#[cfg(not(windows))]
+static OUR_TEXT_ANCHOR: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Return `true` if `pc` looks like it points into our own binary's TEXT,
+/// `false` if it is in a dynamically-linked library.
+///
+/// Heuristic: `|pc − anchor| < TEXT_RANGE_BYTES` where `anchor` is the
+/// address of `goroutine_entry`.  This works because the linker lays out
+/// all of the main executable's code (Rust std, our crate, the test
+/// harness) contiguously, while macOS's dyld shared cache places system
+/// libraries hundreds of GiB away.
+#[cfg(not(windows))]
+#[inline]
+fn pc_in_our_text(pc: usize) -> bool {
+    let anchor = OUR_TEXT_ANCHOR.load(std::sync::atomic::Ordering::Relaxed);
+    if anchor == 0 {
+        return true; // not yet initialised — fail-open
+    }
+    let diff = if pc > anchor { pc - anchor } else { anchor - pc };
+    diff < TEXT_RANGE_BYTES
+}
+
 /// SIGURG handler: redirect a preemptable goroutine to `async_preempt_trampoline`.
 #[cfg(not(windows))]
 unsafe extern "C" fn sigurg_handler(
@@ -610,6 +695,30 @@ unsafe extern "C" fn sigurg_handler(
         let mp = super::m::current_m();
         if !mp.is_null() && unsafe { (*mp).locks } > 0 {
             return; // holding a scheduler-internal lock — skip preemption
+        }
+
+        // Guard 0.5: interrupted PC must be in OUR binary's TEXT segment.
+        //
+        // If we were interrupted inside a dynamically-linked system library
+        // (libsystem_malloc, libpthread, etc.), preempting and switching to
+        // another goroutine on the same thread will eventually re-enter the
+        // same library — which may try to re-acquire a non-reentrant lock
+        // it already holds (e.g., the tiny-allocator's `os_unfair_lock`).
+        // macOS detects the recursion and crashes with
+        // `_os_unfair_lock_recursive_abort` (EXC_BAD_INSTRUCTION / SIGILL).
+        //
+        // Concrete failure observed before this guard:
+        //   Box::drop → dealloc → free_tiny (holds malloc lock)
+        //   ←SIGURG redirects to preemptm → schedule() → another goroutine
+        //   other goroutine: Box::new → free_tiny → os_unfair_lock_lock_slow
+        //     ← recursive owner detected → abort
+        //
+        // Defer preemption to when we naturally exit the library back into
+        // our own code; sysmon will re-set `gp.preempt` and we'll get
+        // another SIGURG attempt soon enough.
+        let pc = ucontext_pc(ctx);
+        if !pc_in_our_text(pc) {
+            return; // interrupted in a system library — defer preemption
         }
 
         // Guard 1: goroutine must be GRUNNING.
