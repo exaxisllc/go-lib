@@ -1640,8 +1640,26 @@ unsafe extern "C" fn goexit_trampoline() -> ! {
 /// This function genuinely never returns: `goexit0` calls `schedule()` which
 /// loops forever.  The `unreachable_unchecked` is sound because dying
 /// goroutines are never resumed via `gogo` — they are dropped in `goexit0`.
+///
+/// ## Why we hold `m_lock` here
+///
+/// `m_lock` increments `(*m).locks`, which causes `sigurg_handler` (Guard 0)
+/// to skip async preemption.  Without this, SIGURG can fire between
+/// `goroutine_entry`'s `ret` and `goexit0`'s `casgstatus` → `schedule()`.
+///
+/// If preemption fires inside the `mcall(gp, goexit0)` call here, the async
+/// preempt's own `mcall` OVERWRITES `gp.sched.pc` with the trampoline's
+/// resume address.  When `gogo` later resumes the goroutine it jumps to that
+/// resume point — which is the instruction immediately after
+/// `unsafe { mcall(gp, goexit0) }` below — and hits `unreachable_unchecked`,
+/// aborting the process with "thread caused non-unwinding panic. aborting."
 #[cfg(target_arch = "x86_64")]
 unsafe extern "C" fn goexit0_handler() -> ! {
+    // Hold m_lock for the entire goexit path so SIGURG cannot preempt us.
+    // The guard is never dropped (this function never returns), but that is
+    // fine: the M's `locks` counter is irrelevant once the goroutine is dead
+    // and the M has re-entered `schedule()`.
+    let _lk = super::m::m_lock();
     let gp = current_g();
     unsafe { mcall(gp, goexit0) };
     // SAFETY: goexit0 → schedule() is an infinite loop; this is unreachable.
@@ -1655,6 +1673,9 @@ unsafe extern "C" fn goexit0_handler() -> ! {
 // function works with no naked-asm tricks.
 #[cfg(target_arch = "aarch64")]
 unsafe extern "C" fn goexit_trampoline() -> ! {
+    // Hold m_lock for the entire goexit path — see goexit0_handler's doc
+    // comment for the full explanation of why this is necessary.
+    let _lk = super::m::m_lock();
     let gp = current_g();
     unsafe { mcall(gp, goexit0) };
     // SAFETY: goexit0 → schedule() is an infinite loop; this is unreachable.

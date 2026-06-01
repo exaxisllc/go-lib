@@ -6,4 +6,23 @@
 # base-pointer (rbp / x29) chain is absent and pointer adjustment is limited
 # to the conservative full-stack scan.
 [build]
-rustflags = ["-C", "force-frame-pointers=yes"]
+rustflags = [
+  "-C", "force-frame-pointers=yes",
+  # Disable the System V AMD64 "red zone" (128 bytes below RSP that leaf
+  # functions may use as scratch space without adjusting RSP).
+  #
+  # Our async-preemption trampoline (async_preempt_trampoline in asm_amd64.rs)
+  # redirects the goroutine by writing the original RIP at [RSP-8] and then
+  # pushing RFLAGS + 15 GPRs = 136 bytes total below the preemption-time RSP.
+  # If the interrupted code was a leaf function with live data in its red zone
+  # ([RSP-1]..[RSP-128]), those bytes are overwritten with saved register values
+  # and the function computes wrong results on resume — observed as null-pointer
+  # dereferences in `new_goroutine` (crash in atomic_add at address=0x0, wrong
+  # val=4307550496 instead of 1) and other sites where a temporary holding an
+  # address was trashed.
+  #
+  # With no-redzone, the compiler never relies on the 128-byte region below RSP,
+  # so the trampoline's writes are always into dead space.  This flag applies to
+  # the entire build (including std/core) so all called-into code is safe too.
+  "-C", "no-redzone=yes",
+]
