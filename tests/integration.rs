@@ -539,7 +539,7 @@ fn run_returns_value() {
 // ---------------------------------------------------------------------------
 #[test]
 fn many_goroutines() {
-    const WORKERS: i32 = 50_000;
+    const WORKERS: i32 = 75_000;
     go_lib::run(|| {
         go_lib::scope(|s| {
             // Use i64 throughout so the assertion arithmetic does not
