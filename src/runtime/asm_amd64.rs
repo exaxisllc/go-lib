@@ -87,7 +87,7 @@ use super::g::{G_STACK_HI_OFFSET, G_STACK_LO_OFFSET};
 // System V AMD64 ABI (Linux, macOS): first argument in rdi.
 #[cfg(not(windows))]
 #[unsafe(naked)]
-unsafe extern "C" fn gogo_asm(buf: *mut Gobuf) -> ! {
+pub(crate) unsafe extern "C" fn gogo_asm(buf: *mut Gobuf) -> ! {
     core::arch::naked_asm!(
         // Load callee-saved GPRs from gobuf.regs[..] BEFORE switching stacks.
         // Order matches mcall_asm's save order: [rbx, r12, r13, r14, r15].
@@ -113,7 +113,7 @@ unsafe extern "C" fn gogo_asm(buf: *mut Gobuf) -> ! {
 // the FIXME in mcall_asm below.)
 #[cfg(windows)]
 #[unsafe(naked)]
-unsafe extern "C" fn gogo_asm(buf: *mut Gobuf) -> ! {
+pub(crate) unsafe extern "C" fn gogo_asm(buf: *mut Gobuf) -> ! {
     core::arch::naked_asm!(
         // Restore callee-saved GPRs: [rbx, rdi, rsi, r12, r13, r14, r15].
         "mov rbx, [rcx + {regs} + 0]",
@@ -175,7 +175,7 @@ unsafe extern "C" fn gogo_asm(buf: *mut Gobuf) -> ! {
 // them when the goroutine is resumed.  Order: [rbx, r12, r13, r14, r15].
 #[cfg(not(windows))]
 #[unsafe(naked)]
-unsafe extern "C" fn mcall_asm(
+pub(crate) unsafe extern "C" fn mcall_asm(
     _g:        *mut G,
     _g_sched:  *mut Gobuf,
     _g0_gobuf: *mut Gobuf,
@@ -224,7 +224,7 @@ unsafe extern "C" fn mcall_asm(
 // Tracked as a follow-up.
 #[cfg(windows)]
 #[unsafe(naked)]
-unsafe extern "C" fn mcall_asm(
+pub(crate) unsafe extern "C" fn mcall_asm(
     _g:        *mut G,
     _g_sched:  *mut Gobuf,
     _g0_gobuf: *mut Gobuf,
