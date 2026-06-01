@@ -1846,17 +1846,25 @@ where
         fn drop(&mut self) { self.0.unpark(); }
     }
 
-    // Slot used to shuttle the return value from the goroutine to the caller.
-    let slot: Arc<Mutex<Option<R>>> = Arc::new(Mutex::new(None));
+    // Slot shuttles either the return value or the panic payload from the
+    // goroutine back to the caller.  We catch the panic *inside* the wrapper
+    // (not relying on `goroutine_entry`'s catch_unwind alone) so the original
+    // payload reaches the test/user thread intact: `resume_unwind` here
+    // re-raises it with the correct file:line and writes via the test
+    // harness's stderr capture — invaluable for diagnosing intermittent
+    // failures where the panic message would otherwise be lost on an M
+    // thread's stderr.
+    type Slot<R> = Result<R, Box<dyn std::any::Any + Send + 'static>>;
+    let slot: Arc<Mutex<Option<Slot<R>>>> = Arc::new(Mutex::new(None));
     let slot2 = Arc::clone(&slot);
 
     let caller = std::thread::current();
     let wrapper = move || {
         // `_guard` is the *last* local to drop, so it unparks the caller only
-        // after `result` has been stored.  Drop order: `result` (moved into
-        // the slot) disappears first, then `_guard` fires.
+        // after the result has been stored.
         let _guard = UnparkOnDrop(caller);
-        let result  = f();
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
         *slot2.lock().unwrap() = Some(result);
         // _guard drops here → caller.unpark()
     };
@@ -1866,10 +1874,11 @@ where
     // Block until the goroutine's drop-guard fires caller.unpark().
     std::thread::park();
 
-    slot.lock()
-        .unwrap()
-        .take()
-        .expect("go_lib::run: first goroutine panicked without returning a value")
+    match slot.lock().unwrap().take() {
+        Some(Ok(v))       => v,
+        Some(Err(payload)) => std::panic::resume_unwind(payload),
+        None => panic!("go_lib::run: first goroutine exited without storing a result"),
+    }
 }
 
 // ---------------------------------------------------------------------------

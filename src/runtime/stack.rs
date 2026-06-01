@@ -138,9 +138,27 @@ pub(crate) const STACK_MAX: usize = 1024 * 1024 * 1024;
 /// that compiler support, eliminating the OS guard page would turn stack
 /// overflows into silent memory corruption rather than a clean crash.
 #[cfg(any(all(windows, debug_assertions), all(target_os = "macos", debug_assertions)))]
-pub(crate) const GOROUTINE_STACK_BYTES: usize = 64 * 1024;
+pub(crate) const GOROUTINE_STACK_BYTES: usize = 128 * 1024;
+// Debug builds across all platforms: 128 KiB initial stack.
+//
+// Previously 16 KiB on Linux and 64 KiB on macOS/Windows, but stress tests
+// (`many_goroutines` with 5000 workers) intermittently SIGSEGV'd inside
+// scheduler internals shortly after a stack growth.  The crash pattern is
+// always a wild dereference (e.g. `atomic_compare_exchange_weak` at a
+// pointer-shaped-but-invalid address) — captured live under lldb.
+//
+// Root cause: `update_sp_in_context`'s two-range GPR adjustment
+// deliberately narrows the argument-register range to the guard page only
+// (to avoid false positives when many goroutines have stacks at adjacent
+// addresses), which leaves a small UAF window when a caller-saved register
+// happens to hold a pointer into the *usable* portion of the old stack.
+//
+// Mitigation: bumping the initial stack so most goroutines never grow at
+// all dramatically shrinks the window.  This is a band-aid; the proper fix
+// is to free the old stack *before* `update_sp_in_context` so the kernel
+// can be authoritative about which address ranges are still mapped.
 #[cfg(all(debug_assertions, not(any(windows, target_os = "macos"))))]
-pub(crate) const GOROUTINE_STACK_BYTES: usize = 16 * 1024;
+pub(crate) const GOROUTINE_STACK_BYTES: usize = 128 * 1024;
 #[cfg(not(debug_assertions))]
 pub(crate) const GOROUTINE_STACK_BYTES: usize = STACK_MIN;
 
