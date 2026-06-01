@@ -680,14 +680,19 @@ unsafe fn update_sp_in_context(
                    REG_RBP,REG_RSP,REG_R8,REG_R9,REG_R10,REG_R11,
                    REG_R12,REG_R13,REG_R14,REG_R15};
         let mc = &mut (*(ctx as *mut libc::ucontext_t)).uc_mcontext;
-        // SP, FP, callee-saved: full range.
-        for reg in [REG_RSP, REG_RBP, REG_RBX, REG_R12, REG_R13, REG_R14, REG_R15] {
+        // SP + FP only: full range — these definitely point into the old stack.
+        for reg in [REG_RSP, REG_RBP] {
             let v = mc.gregs[reg as usize] as u64;
             mc.gregs[reg as usize] = adj(v, old_guard_lo, old_hi, delta) as libc::greg_t;
         }
-        // Argument/caller-saved: guard-page range only.
-        for reg in [REG_RAX, REG_RCX, REG_RDX, REG_RSI, REG_RDI,
-                    REG_R8, REG_R9, REG_R10, REG_R11] {
+        // Callee-saved (RBX, R12-R15) + caller-saved/argument: guard-page only.
+        // These registers commonly hold heap pointers (esp. RBX/R12-R15 for
+        // Vec/HashMap data pointers); adjusting them in the usable-stack
+        // range causes false positives at scale — observed channel-buffer
+        // discriminant flip after stack growth with 75k goroutines (PR #22+).
+        for reg in [REG_RBX, REG_R12, REG_R13, REG_R14, REG_R15,
+                    REG_RAX, REG_RCX, REG_RDX, REG_RSI, REG_RDI,
+                    REG_R8,  REG_R9,  REG_R10, REG_R11] {
             let v = mc.gregs[reg as usize] as u64;
             mc.gregs[reg as usize] = adj(v, old_guard_lo, old_lo, delta) as libc::greg_t;
         }
@@ -696,15 +701,12 @@ unsafe fn update_sp_in_context(
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
     unsafe {
         let mc = &mut (*(ctx as *mut libc::ucontext_t)).uc_mcontext;
-        // SP and FP (x29): full range.
+        // SP and FP (x29): full range — definite stack pointers.
         mc.sp       = adj(mc.sp,       old_guard_lo, old_hi, delta);
         mc.regs[29] = adj(mc.regs[29], old_guard_lo, old_hi, delta);
-        // Callee-saved x19–x28: full range.
-        for i in 19..=28usize {
-            mc.regs[i] = adj(mc.regs[i], old_guard_lo, old_hi, delta);
-        }
-        // Argument/caller-saved x0–x18: guard-page range only.
-        for i in 0..=18usize {
+        // All other GPRs: guard-page only (avoid heap-pointer false positives).
+        for i in 0..=28usize {
+            if i == 29 { continue; }
             mc.regs[i] = adj(mc.regs[i], old_guard_lo, old_lo, delta);
         }
         // AArch64 pre-indexed stores (e.g. `stp x29,x30,[sp,#-16]!`) commit
@@ -717,15 +719,19 @@ unsafe fn update_sp_in_context(
     #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
     unsafe {
         let ss = &mut (*(*  (ctx as *mut libc::ucontext_t)).uc_mcontext).__ss;
-        // SP, FP, callee-saved: full range.  Skip __rip (code pointer).
+        // SP + FP: full range — these definitely point into the old stack.
         ss.__rsp = adj(ss.__rsp, old_guard_lo, old_hi, delta);
         ss.__rbp = adj(ss.__rbp, old_guard_lo, old_hi, delta);
-        ss.__rbx = adj(ss.__rbx, old_guard_lo, old_hi, delta);
-        ss.__r12 = adj(ss.__r12, old_guard_lo, old_hi, delta);
-        ss.__r13 = adj(ss.__r13, old_guard_lo, old_hi, delta);
-        ss.__r14 = adj(ss.__r14, old_guard_lo, old_hi, delta);
-        ss.__r15 = adj(ss.__r15, old_guard_lo, old_hi, delta);
-        // Argument/caller-saved: guard-page range only.
+        // Callee-saved (RBX, R12-R15) + caller-saved: guard-page only.
+        // These registers commonly hold heap pointers (esp. RBX/R12-R15 for
+        // Vec/HashMap data pointers); adjusting them in the usable-stack
+        // range causes false positives at scale — observed channel-buffer
+        // discriminant flip after stack growth with 75k goroutines (PR #22+).
+        ss.__rbx = adj(ss.__rbx, old_guard_lo, old_lo, delta);
+        ss.__r12 = adj(ss.__r12, old_guard_lo, old_lo, delta);
+        ss.__r13 = adj(ss.__r13, old_guard_lo, old_lo, delta);
+        ss.__r14 = adj(ss.__r14, old_guard_lo, old_lo, delta);
+        ss.__r15 = adj(ss.__r15, old_guard_lo, old_lo, delta);
         ss.__rax = adj(ss.__rax, old_guard_lo, old_lo, delta);
         ss.__rcx = adj(ss.__rcx, old_guard_lo, old_lo, delta);
         ss.__rdx = adj(ss.__rdx, old_guard_lo, old_lo, delta);
@@ -742,15 +748,15 @@ unsafe fn update_sp_in_context(
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     unsafe {
         let ss = &mut (*(*(ctx as *mut libc::ucontext_t)).uc_mcontext).__ss;
-        // SP and FP (__fp = x29): full range.
+        // SP and FP (__fp = x29): full range — definite stack pointers.
         ss.__sp = adj(ss.__sp, old_guard_lo, old_hi, delta);
         ss.__fp = adj(ss.__fp, old_guard_lo, old_hi, delta);
-        // Callee-saved x19–x28: full range.
-        for i in 19..=28usize {
-            ss.__x[i] = adj(ss.__x[i], old_guard_lo, old_hi, delta);
-        }
-        // Argument/caller-saved x0–x18: guard-page range only.
-        for i in 0..=18usize {
+        // All other GPRs (x0–x28): guard-page only.  Avoids false positives
+        // when a register coincidentally holds a heap pointer that falls in
+        // the old stack range — observed channel-buffer corruption at 75k
+        // goroutines when callee-saved x19–x28 were adjusted in the full
+        // range (PR #22 follow-up).
+        for i in 0..=28usize {
             ss.__x[i] = adj(ss.__x[i], old_guard_lo, old_lo, delta);
         }
         // AArch64 pre-indexed stores commit SP before the data-abort.
