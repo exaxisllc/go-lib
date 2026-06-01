@@ -140,28 +140,30 @@ pub(crate) const STACK_MAX: usize = 1024 * 1024 * 1024;
 /// by emitting `morestack` stack-check prologues from the compiler.  Without
 /// that compiler support, eliminating the OS guard page would turn stack
 /// overflows into silent memory corruption rather than a clean crash.
+// macOS and Windows debug builds use 64 KiB — enough for the wider
+// non-optimised frames produced by debug codegen, including the AArch64
+// 16 KiB page-size constraint on macOS.
 #[cfg(any(all(windows, debug_assertions), all(target_os = "macos", debug_assertions)))]
-pub(crate) const GOROUTINE_STACK_BYTES: usize = 128 * 1024;
-// Debug builds across all platforms: 128 KiB initial stack.
+pub(crate) const GOROUTINE_STACK_BYTES: usize = 64 * 1024;
+// Linux debug builds use 16 KiB — wider than release (2 KiB) but tight
+// enough to exercise the stack-growth path regularly.
 //
-// Previously 16 KiB on Linux and 64 KiB on macOS/Windows, but stress tests
-// (`many_goroutines` with 5000 workers) intermittently SIGSEGV'd inside
-// scheduler internals shortly after a stack growth.  The crash pattern is
-// always a wild dereference (e.g. `atomic_compare_exchange_weak` at a
-// pointer-shaped-but-invalid address) — captured live under lldb.
-//
-// Root cause: `update_sp_in_context`'s two-range GPR adjustment
-// deliberately narrows the argument-register range to the guard page only
-// (to avoid false positives when many goroutines have stacks at adjacent
-// addresses), which leaves a small UAF window when a caller-saved register
-// happens to hold a pointer into the *usable* portion of the old stack.
-//
-// Mitigation: bumping the initial stack so most goroutines never grow at
-// all dramatically shrinks the window.  This is a band-aid; the proper fix
-// is to free the old stack *before* `update_sp_in_context` so the kernel
-// can be authoritative about which address ranges are still mapped.
+// Historical note: these values were temporarily inflated to 128 KiB as
+// a work-around for async-preemption crashes that occurred shortly after
+// stack growth (wild dereferences in `atomic_compare_exchange_weak`, etc.).
+// The root causes have since been fixed:
+//   • PR #23 — narrowed callee-saved register adjustment in
+//     `update_sp_in_context` to guard-page-only range, eliminating
+//     false-positive adjustments of heap pointers after stack growth.
+//   • PR #24 — added `pushfq`/`popfq` to `async_preempt_trampoline` to
+//     preserve RFLAGS across preemption, fixing iterator corruption.
+//   • PR #25 — added `-C no-redzone=yes` so the trampoline's register
+//     saves never clobber the red zone of the interrupted leaf function;
+//     added `m_lock()` to `goexit0_handler` to prevent SIGURG from
+//     overwriting `gp.sched.pc` during goexit.
+// The original sizes are restored now that all three root causes are fixed.
 #[cfg(all(debug_assertions, not(any(windows, target_os = "macos"))))]
-pub(crate) const GOROUTINE_STACK_BYTES: usize = 128 * 1024;
+pub(crate) const GOROUTINE_STACK_BYTES: usize = 16 * 1024;
 #[cfg(not(debug_assertions))]
 pub(crate) const GOROUTINE_STACK_BYTES: usize = STACK_MIN;
 
