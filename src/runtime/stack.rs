@@ -18,7 +18,10 @@
 //! 2. It calls `grow_goroutine_stack_from_signal` which:
 //!    a. Allocates a new stack double the current size (capped at 1 GiB).
 //!    b. Copies the live portion of the old stack to the new one.
-//!    c. Adjusts all pointer-sized words in `[old_lo, old_hi)` (conservative scan).
+//!    c. Adjusts pointer-sized words in the new stack (conservative scan: full
+//!       range `[old_guard_lo, old_hi)` for RSP/RBP; guard-page-only range
+//!       `[old_guard_lo, old_lo)` for all other GPRs to avoid false-positive
+//!       adjustment of heap pointers that coincide with the old stack range).
 //!    d. Updates `G.stack`, `G.stackguard0`, and SP in `ucontext_t` (OS retries the instruction).
 //! 3. The SIGSEGV handler returns; the OS restores the updated register state;
 //!    the faulting instruction is re-executed and now succeeds.
@@ -643,17 +646,22 @@ unsafe fn sp_predecrement_at_pc(pc: usize) -> usize {
 /// guard page (below `old_lo`).  Updating only RSP/RBP leaves RDI pointing to
 /// the now-unmapped guard page; the retry faults again immediately.
 ///
-/// We therefore scan the register file in two passes:
+/// We scan the register file in two groups:
 ///
-/// 1. **SP, FP, callee-saved** (RSP, RBP, RBX, R12–R15 / SP, FP, x19–x28):
-///    full range `[old_guard_lo, old_hi)`.  These registers hold frame-chain
-///    pointers that are almost always in the old usable stack.
+/// 1. **SP and FP only** (RSP, RBP / SP, x29):
+///    full range `[old_guard_lo, old_hi)`.  These definitively hold stack
+///    frame-chain pointers.
 ///
-/// 2. **Caller-saved / argument** (RAX–RDX, RSI, RDI, R8–R11 / x0–x18):
+/// 2. **All other GPRs** (callee-saved RBX/R12–R15 + caller-saved/argument
+///    RAX–RDX/RSI/RDI/R8–R11 / x0–x28):
 ///    narrow range `[old_guard_lo, old_lo)` — the guard page only.  This
-///    handles the `lea rdi, [rbp−N]` pattern while avoiding false-positive
-///    adjustments of heap pointers that could coincide with the usable-stack
-///    address range when many goroutines are active.
+///    handles the `lea rdi, [rbp−N]` overflow-into-guard-page pattern while
+///    avoiding false-positive adjustments of heap pointers.  Callee-saved
+///    registers (RBX, R12–R15) commonly hold heap pointers (Vec/HashMap
+///    data pointers, Arc data, etc.) whose values can coincide with the
+///    usable-stack address range at scale; adjusting them in the full range
+///    caused channel-buffer discriminant flips observed at WORKERS=75 000
+///    (fixed in PR #23).
 ///
 /// Platform-specific: Linux x86-64, Linux AArch64, macOS x86-64, macOS AArch64.
 #[cfg(not(windows))]

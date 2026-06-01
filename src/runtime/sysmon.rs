@@ -201,7 +201,8 @@ fn retake(now_ns: u64, ticks: &mut Vec<SysmonTick>) -> u32 {
                 tick.schedtick  = schedtick;
                 tick.schedwhen  = now_ns;
             } else if now_ns.saturating_sub(tick.schedwhen) > FORCE_PREEMPT_NS {
-                // RFLAGS save/restore fix under test — re-enable async preempt.
+                // Same G has been running for > 10 ms — set the preemption hint
+                // and deliver SIGURG so the goroutine yields promptly.
                 unsafe { preemptone(pp) };
                 acted += 1;
             }
