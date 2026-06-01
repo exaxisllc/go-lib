@@ -519,19 +519,19 @@ pub(crate) unsafe fn systemstack<F: FnOnce()>(f: F) {
 ///
 /// ## Frame layout (built by this function)
 /// ```text
-/// [RSP+0  .. RSP+239]: 15 × 8 B general-purpose registers
-///                       order: RBP, R15, R14, R13, R12, R11, R10, R9,
-///                              R8,  RDI, RSI, RDX, RCX, RBX, RAX
-/// [RSP-256 .. RSP-1]:  16 × 16 B XMM registers (XMM15 .. XMM0)
+/// [RSP+0  .. RSP+7]:    RFLAGS (8 B, saved by pushfq)
+/// [RSP+8  .. RSP+127]:  15 × 8 B GPRs: RBP R15 R14 R13 R12 R11 R10 R9
+///                                        R8  RDI RSI RDX RCX RBX RAX
+/// [RSP+128 .. RSP+383]: 264 B XMM area (16 × 16 B data + 8 B pad)
 /// ```
 ///
-/// Total frame: 15×8 + 16×16 = 120 + 256 = 376 B (RSP stays 16-byte aligned
-/// before the `call async_preempt2` instruction).
+/// Total frame: 8 + 120 + 264 = 392 B.
 ///
 /// ## Stack alignment
-/// On entry `RSP % 16 == 8` (the "call" pushed one 8-byte return address).
-/// After 15 pushes (120 B) `RSP % 16 == 8 - 120%16 == 8 - 8 == 0`.
-/// After `sub rsp, 256` (256 B) `RSP % 16 == 0`.  Correct for a call site.
+/// On entry `RSP % 16 == 8` (redirect pushed original RIP).
+/// After `pushfq` (8 B): `RSP % 16 == 0`.
+/// After 15 GPR pushes (120 B): `RSP % 16 == 8`.
+/// After `sub rsp, 264` (264 B): `RSP % 16 == 0`.  Correct for a call site.
 ///
 /// Ported from the auto-generated `asyncPreempt` in `runtime/preempt_amd64.s`.
 #[unsafe(naked)]
@@ -539,6 +539,33 @@ pub(crate) unsafe extern "C" fn async_preempt_trampoline() {
     // NOTE: this attribute / function body is only compiled on non-Windows
     // (gated by the #[cfg(not(windows))] on the doc-comment block above).
     core::arch::naked_asm!(
+        // ── save RFLAGS (must be first — before any flag-modifying instruction)
+        //
+        // The goroutine was interrupted at an arbitrary instruction.  Many
+        // Rust constructs read condition-code flags that were set by a
+        // preceding arithmetic instruction.  For example, the standard
+        // RangeInclusive::next() (spec_next) calls Step::forward_unchecked,
+        // which does:
+        //
+        //   addl %ecx, %edi      ← sets OF, SF, ZF, CF
+        //   movl %edi, -N(%rbp)  ← no flags effect
+        //   seto %al             ← reads OF (overflow check)
+        //   cmpl $0, %ecx
+        //   setl %cl             ← reads SF/OF
+        //
+        // If async preemption fires between the `addl` and `seto`, and we
+        // do not save RFLAGS here, the scheduler's Rust code (which freely
+        // uses arithmetic) clobbers OF.  On resume, `seto` reads the wrong
+        // OF → wrong `al` → wrong branch → wrong return value.  Observed:
+        // the iterator's `next()` returns None early (wrong sum) or jumps
+        // to an `unreachable_unchecked` abort path (SIGABRT).
+        //
+        // Entry invariant: RSP%16 == 8 (redirect_to_async_preempt pushed the
+        // original RIP).  pushfq stores full 64-bit RFLAGS and decrements RSP
+        // by 8, making RSP%16 == 0.
+        "pushfq",
+        // RSP % 16 == 0
+
         // ── save all general-purpose registers (15 pushes = 120 B) ──────────
         "push rbp",
         "push r15",
@@ -555,10 +582,13 @@ pub(crate) unsafe extern "C" fn async_preempt_trampoline() {
         "push rcx",
         "push rbx",
         "push rax",
-        // RSP % 16 == 0 here (15 pushes × 8 B from an 8-mod-16 base)
+        // After pushfq + 15 GPR pushes = 128 B total.  RSP%16 = 8 − 128 mod 16
+        // = 8 − 0 = 8.  Need RSP%16 == 0 before the `call`.  Allocating 264 B
+        // (= 256 for XMM data + 8 B alignment pad) gives RSP%16 = 8 − 264%16
+        // = 8 − 8 = 0.  ✓
 
-        // ── allocate XMM save area (256 B for 16 × 16 B XMM regs) ──────────
-        "sub rsp, 256",
+        // ── allocate XMM save area (264 B: 256 data + 8 B alignment pad) ────
+        "sub rsp, 264",
         // RSP % 16 == 0 — correct call-site alignment
 
         // ── save XMM registers ───────────────────────────────────────────────
@@ -601,8 +631,8 @@ pub(crate) unsafe extern "C" fn async_preempt_trampoline() {
         "movdqu xmm14, [rsp + 224]",
         "movdqu xmm15, [rsp + 240]",
 
-        // ── release XMM save area ────────────────────────────────────────────
-        "add rsp, 256",
+        // ── release XMM save area (264 B to match allocation above) ─────────
+        "add rsp, 264",
 
         // ── restore general-purpose registers ────────────────────────────────
         "pop rax",
@@ -620,6 +650,11 @@ pub(crate) unsafe extern "C" fn async_preempt_trampoline() {
         "pop r14",
         "pop r15",
         "pop rbp",
+
+        // ── restore RFLAGS ────────────────────────────────────────────────────
+        // popfq pops 64-bit RFLAGS from [RSP] and increments RSP by 8.
+        // Must come AFTER GPR restores and BEFORE `ret`.
+        "popfq",
 
         // ── return to the original interrupted PC ─────────────────────────────
         // [RSP] holds the original RIP (placed there by the SIGURG handler).
