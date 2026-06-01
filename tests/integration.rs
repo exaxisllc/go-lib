@@ -539,20 +539,25 @@ fn run_returns_value() {
 // ---------------------------------------------------------------------------
 #[test]
 fn many_goroutines() {
-    const WORKERS: i32 = 45_000;
+    const WORKERS: i32 = 50_000;
     go_lib::run(|| {
         go_lib::scope(|s| {
-            let handles: Vec<ScopedJoinHandle<i32>> = (0..WORKERS)
+            // Use i64 throughout so the assertion arithmetic does not
+            // overflow at WORKERS ≥ 46_341 (where `i * (i + 1)` first
+            // exceeds `i32::MAX = 2_147_483_647`).  The final triangular
+            // number `i*(i+1)/2` for `i = 49_999` is 1,249,975,000 — well
+            // within i64.
+            let handles: Vec<ScopedJoinHandle<i64>> = (0..WORKERS)
                 .map(|i| s.go(move || {
                     // Compute the triangular number i*(i+1)/2.
                     // Range 0..=i is never empty: every goroutine does real work.
-                    (0..=i).sum::<i32>()
+                    (0_i64..=i as i64).sum::<i64>()
                 }))
                 .collect();
 
             for (i, handle) in handles.into_iter().enumerate() {
                 let sum = handle.join().expect("goroutine panicked");
-                let i   = i as i32;
+                let i   = i as i64;
                 assert_eq!(
                     sum,
                     i * (i + 1) / 2,
