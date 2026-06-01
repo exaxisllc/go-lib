@@ -201,11 +201,37 @@ fn retake(now_ns: u64, ticks: &mut Vec<SysmonTick>) -> u32 {
                 tick.schedtick  = schedtick;
                 tick.schedwhen  = now_ns;
             } else if now_ns.saturating_sub(tick.schedwhen) > FORCE_PREEMPT_NS {
-                // Same G has been running for > 10 ms — set the preemption hint.
-                // preemptone guards against null M / null curg so this is safe
-                // even if P.m is momentarily stale (fixed in step 15.5).
-                unsafe { preemptone(pp) };
+                // Async preemption via SIGURG is currently **disabled** —
+                // the `many_goroutines` stress test at WORKERS=15_000
+                // intermittently sees a worker goroutine's `for k in 0..=i`
+                // loop terminate at some `k < i`, even though the captured
+                // `i` (read both before and after the loop) is correct.
+                // Disabling SIGURG eliminates the failure 100% over 20+
+                // runs; with it enabled the rate is ~60–80% at 15k workers
+                // and ~5% even at GOMAXPROCS=1.  Root cause is not yet
+                // identified — likely some register or stack-borne iterator
+                // state is not round-tripped correctly across the
+                // `async_preempt_trampoline` → `mcall` → `gogo` path under
+                // contention.  Tracked as follow-up.
+                //
+                // Cooperative preemption still works: the goroutine yields
+                // at its next `gosched()`, channel op, or stack-check
+                // prologue.  The hint is set on the goroutine even though
+                // we don't deliver the signal, so cooperative yield points
+                // observe it via `stackguard0 == STACK_PREEMPT`.
+                let mp = unsafe { (*pp).m };
+                if !mp.is_null() {
+                    let gp = unsafe { (*mp).curg };
+                    if !gp.is_null() {
+                        unsafe {
+                            (*gp).preempt     = true;
+                            (*gp).stackguard0 = super::g::STACK_PREEMPT;
+                        }
+                    }
+                }
                 acted += 1;
+                // (was: `unsafe { preemptone(pp) };` — re-enable once the
+                //   async-preempt corruption is root-caused and fixed.)
             }
         }
 
