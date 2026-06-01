@@ -667,6 +667,50 @@ fn pc_in_our_text(pc: usize) -> bool {
     diff < TEXT_RANGE_BYTES
 }
 
+/// Return `true` if `pc` falls inside one of our scheduler asm trampolines —
+/// `gogo_asm`, `mcall_asm`, or `async_preempt_trampoline`.
+///
+/// These functions are naked asm that switches stacks and restores registers
+/// out of band of the saved `g.sched` state.  Async-preempting inside any of
+/// them corrupts the goroutine's state on resume because the second
+/// `mcall_asm` overwrites `g.sched.regs[]` with whatever the trampoline path
+/// was carrying instead of the worker's saved values.
+///
+/// The heuristic is the same as `pc_in_our_text`: assume each function is at
+/// most 4 KiB (these are short asm fns) and check `|pc − fn_start| < 4096`.
+#[cfg(not(windows))]
+#[inline]
+fn pc_in_scheduler_asm(pc: usize) -> bool {
+    /// Maximum reasonable size of a scheduler asm trampoline (bytes).
+    const ASM_FN_MAX_BYTES: usize = 4096;
+
+    #[inline]
+    fn near(pc: usize, fn_addr: usize) -> bool {
+        let diff = if pc > fn_addr { pc - fn_addr } else { fn_addr - pc };
+        diff < ASM_FN_MAX_BYTES
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    let bases: [usize; 5] = [
+        super::asm_amd64::async_preempt_trampoline as *const () as usize,
+        super::asm_amd64::gogo                     as *const () as usize,
+        super::asm_amd64::mcall                    as *const () as usize,
+        super::asm_amd64::gogo_asm                 as *const () as usize,
+        super::asm_amd64::mcall_asm                as *const () as usize,
+    ];
+    #[cfg(target_arch = "aarch64")]
+    let bases: [usize; 3] = [
+        super::asm_arm64::async_preempt_trampoline as *const () as usize,
+        super::asm_arm64::gogo                     as *const () as usize,
+        super::asm_arm64::mcall                    as *const () as usize,
+    ];
+
+    for b in bases {
+        if near(pc, b) { return true; }
+    }
+    false
+}
+
 /// SIGURG handler: redirect a preemptable goroutine to `async_preempt_trampoline`.
 #[cfg(not(windows))]
 unsafe extern "C" fn sigurg_handler(
@@ -753,6 +797,22 @@ unsafe extern "C" fn sigurg_handler(
         let (lo, hi) = unsafe { ((*gp).stack.lo, (*gp).stack.hi) };
         if sp < lo || sp > hi {
             return; // not on goroutine's stack — skip preemption
+        }
+
+        // Guard 3: interrupted PC must not be inside our scheduler's asm
+        // trampolines — `gogo_asm`, `mcall_asm`, or `async_preempt_trampoline`
+        // itself.
+        //
+        // These trampolines do **stack switching and register restoration
+        // out of band** of the saved `g.sched` state.  If SIGURG fires inside
+        // them, redirecting to `async_preempt_trampoline` makes the new
+        // trampoline run with half-restored / out-of-sync state and the
+        // worker's iterator / loop locals on the stack get clobbered when
+        // the second `mcall_asm` overwrites `g.sched.regs[]` with whatever
+        // the trampoline path was carrying.  Mirrors Go's `sigctxt.sigpc`
+        // check against `runtime.gogo` / `runtime.mcall` address ranges.
+        if pc_in_scheduler_asm(pc) {
+            return; // inside gogo_asm / mcall_asm / preempt trampoline
         }
 
         // Redirect goroutine to the preempt trampoline.
