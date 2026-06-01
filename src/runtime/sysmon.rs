@@ -201,23 +201,9 @@ fn retake(now_ns: u64, ticks: &mut Vec<SysmonTick>) -> u32 {
                 tick.schedtick  = schedtick;
                 tick.schedwhen  = now_ns;
             } else if now_ns.saturating_sub(tick.schedwhen) > FORCE_PREEMPT_NS {
-                // Async preemption via SIGURG remains **disabled** while the
-                // many_goroutines bug is under investigation (PR #22, #23).
-                // Cooperative hint only: set `preempt`/`stackguard0` so the
-                // goroutine yields at its next safe point.
-                let mp = unsafe { (*pp).m };
-                if !mp.is_null() {
-                    let gp = unsafe { (*mp).curg };
-                    if !gp.is_null() {
-                        unsafe {
-                            (*gp).preempt     = true;
-                            (*gp).stackguard0 = super::g::STACK_PREEMPT;
-                        }
-                    }
-                }
+                // RFLAGS save/restore fix under test — re-enable async preempt.
+                unsafe { preemptone(pp) };
                 acted += 1;
-                // (was: `unsafe { preemptone(pp) };` — re-enable once the
-                //   discriminant-flip + iterator-clobber bugs are root-caused.)
             }
         }
 
