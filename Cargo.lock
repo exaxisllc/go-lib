@@ -50,7 +50,7 @@ dependencies = [
 
 [[package]]
 name = "go-lib"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "go-lib-macros",
  "libc",
@@ -59,7 +59,7 @@ dependencies = [
 
 [[package]]
 name = "go-lib-macros"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "proc-macro2",
  "quote",

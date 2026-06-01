@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 [package]
 name = "go-lib-macros"
-version = "0.4.2"
+version = "0.4.3"
 edition = "2024"
 authors = ["berryware"]
 description = "Procedural macros for go-lib (#[go_lib::main])"
