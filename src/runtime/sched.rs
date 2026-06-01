@@ -1876,7 +1876,15 @@ where
 
     match slot.lock().unwrap().take() {
         Some(Ok(v))       => v,
-        Some(Err(payload)) => std::panic::resume_unwind(payload),
+        Some(Err(payload)) => {
+            // Re-raise the panic on the caller's thread.  Use `panic_any`
+            // (which invokes the standard panic hook so the failure message
+            // appears in `cargo test`'s captured output) rather than
+            // `resume_unwind` (which skips the hook entirely — the failure
+            // would still be marked FAILED, but with no diagnostic).
+            let msg = extract_panic_msg(payload.as_ref());
+            std::panic::panic_any(format!("goroutine panicked: {msg}"))
+        }
         None => panic!("go_lib::run: first goroutine exited without storing a result"),
     }
 }
