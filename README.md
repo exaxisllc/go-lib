@@ -1052,9 +1052,10 @@ Async preemption (Step 4):
       pthread_kill(m.pthread_id, SIGURG)   → sigurg_handler
     sigurg_handler
       redirect_to_async_preempt(gp, ucontext)
-        push original RIP → [RSP]; set RIP = async_preempt_trampoline
-    async_preempt_trampoline (naked asm)
-      save all GPRs + XMM/FP regs → goroutine stack
+        write original RIP → [RSP-8]; RSP -= 8; RIP = async_preempt_trampoline
+    async_preempt_trampoline (naked asm, 392 B frame)
+      pushfq  (save RFLAGS — required to round-trip condition flags across preemption)
+      push all 15 GPRs + save 16 XMM regs → goroutine stack
       call async_preempt2()
     async_preempt2()
       mcall(preemptm):
@@ -1062,7 +1063,7 @@ Async preemption (Step 4):
         schedule()   [G re-queued; resumes later via gogo]
       (returns after gogo re-schedules this G)
     async_preempt_trampoline (resumed)
-      restore all regs; ret → original interrupted PC
+      restore all XMM regs + 15 GPRs; popfq (restore RFLAGS); ret → original RIP
 
 Netpoll (Step 5):
     Unix:

@@ -13,7 +13,9 @@ rustflags = [
   #
   # Our async-preemption trampoline (async_preempt_trampoline in asm_amd64.rs)
   # redirects the goroutine by writing the original RIP at [RSP-8] and then
-  # pushing RFLAGS + 15 GPRs = 136 bytes total below the preemption-time RSP.
+  # building a 392-byte frame: pushfq (8 B RFLAGS) + 15 GPR pushes (120 B) +
+  # sub $264, %rsp (256 B XMM area + 8 B alignment pad).  The first 136 bytes
+  # of that frame (RFLAGS + GPRs) fall squarely inside the 128-byte red zone.
   # If the interrupted code was a leaf function with live data in its red zone
   # ([RSP-1]..[RSP-128]), those bytes are overwritten with saved register values
   # and the function computes wrong results on resume — observed as null-pointer
