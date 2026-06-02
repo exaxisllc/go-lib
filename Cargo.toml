@@ -18,7 +18,7 @@ categories = ["asynchronous"]
 
 [dependencies]
 libc           = "0.2"
-go-lib-macros  = { path = "./macros", version = "0.4.1" }
+go-lib-macros  = { path = "./macros", version = "0.5.0" }
 
 [dev-dependencies]
 # Systematic concurrency model checker — explores all thread interleavings.
