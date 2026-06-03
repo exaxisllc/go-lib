@@ -6,6 +6,14 @@
 
 ## The Idea
 
+The Rust language doesn't pick a single concurrency model, instead, it provides primitives and ownership rules that make any model safe to implement. Unlike Java (virtual threads), Go (goroutines + channels) or Erlang (actor model), Rust ships without a runtime or a preferred style. The async working group and the async-std libraries were unsuccessful attempts to add concurrency to the language. The async-std library has been abandoned, in favor of smol and the async working group has not met in years.
+
+The standard library gives you:
+- std::thread — OS threads, nothing more
+- std::sync::{Mutex, RwLock, Condvar, Barrier} — shared-state primitives
+- std::sync::mpsc — a single-producer/multi-consumer channel
+That's it. Everything else — async/await, actors, work-stealing executors, lock-free data structures — lives in the ecosystem (tokio, rayon, crossbeam, actix, etc.).
+
 Go has one of the most elegant concurrency models in any systems language: goroutines that start tiny and grow, channels that block without burning threads, a work-stealing scheduler that squeezes every CPU core. The question was whether that model could be brought to Rust — not via `async/await`, not by wrapping Tokio, but by porting Go's actual runtime, source file by source file, into safe-ish Rust.
 
 The answer became **go-lib**: a crate that lets you write:

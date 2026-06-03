@@ -5,7 +5,7 @@ resolver = "2"
 
 [package]
 name = "go-lib"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2024"
 authors = ["berryware"]
 description = "rust native goroutines"
@@ -18,7 +18,7 @@ categories = ["asynchronous"]
 
 [dependencies]
 libc           = "0.2"
-go-lib-macros  = { path = "./macros", version = "0.5.0" }
+go-lib-macros  = { path = "./macros", version = "0.5.1" }
 
 [dev-dependencies]
 # Systematic concurrency model checker — explores all thread interleavings.
