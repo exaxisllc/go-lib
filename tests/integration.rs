@@ -567,3 +567,7 @@ fn many_goroutines() {
         });
     });
 }
+
+// TCP networking tests live in tests/net.rs — a separate integration test
+// binary with its own process and scheduler/netpoll instance, avoiding
+// interference with the many_goroutines test above.
