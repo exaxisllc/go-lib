@@ -35,7 +35,7 @@
 //! ```
 
 use std::ffi::c_void;
-use std::io;
+use std::io::{self, Read, Write};
 use std::net::{SocketAddr, ToSocketAddrs};
 
 use crate::runtime::g::WaitReason;
@@ -140,6 +140,7 @@ unsafe extern "system" {
         optlen: i32,
     ) -> i32;
     fn getsockname(s: Socket, name: *mut c_void, namelen: *mut i32) -> i32;
+    fn getpeername(s: Socket, name: *mut c_void, namelen: *mut i32) -> i32;
     fn WSAGetLastError() -> i32;
     fn WSARecv(
         s: Socket,
@@ -166,6 +167,22 @@ unsafe extern "system" {
     /// Convert an NTSTATUS code to the corresponding Win32 error code.
     fn RtlNtStatusToDosError(status: u32) -> u32;
 }
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetCurrentProcess() -> *mut c_void;
+    fn DuplicateHandle(
+        h_source_process: *mut c_void,
+        h_source:         *mut c_void,
+        h_target_process: *mut c_void,
+        lp_target_handle: *mut *mut c_void,
+        dw_desired_access: u32,
+        b_inherit_handle:  i32,
+        dw_options:        u32,
+    ) -> i32;
+}
+
+const DUPLICATE_SAME_ACCESS: u32 = 0x0002;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -196,6 +213,28 @@ fn to_sockaddr(addr: SocketAddr) -> (SockAddrStorage, i32) {
             sa.sin6_addr = v6.ip().octets();
             (storage, std::mem::size_of::<SockAddrIn6>() as i32)
         }
+    }
+}
+
+/// Decode a `SockAddrStorage` returned by `getsockname`/`getpeername` into a
+/// Rust `SocketAddr`.
+fn sockaddr_to_socketaddr(storage: &SockAddrStorage, len: i32) -> io::Result<SocketAddr> {
+    let family = u16::from_ne_bytes([storage._data[0], storage._data[1]]);
+    if family == AF_INET as u16 {
+        let sa = unsafe { &*(storage._data.as_ptr() as *const SockAddrIn) };
+        let ip   = std::net::Ipv4Addr::from(sa.sin_addr.to_ne_bytes());
+        let port = u16::from_be(sa.sin_port);
+        Ok(SocketAddr::new(std::net::IpAddr::V4(ip), port))
+    } else if family == AF_INET6 as u16 {
+        let sa = unsafe { &*(storage._data.as_ptr() as *const SockAddrIn6) };
+        let ip   = std::net::Ipv6Addr::from(sa.sin6_addr);
+        let port = u16::from_be(sa.sin6_port);
+        Ok(SocketAddr::new(std::net::IpAddr::V6(ip), port))
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("unsupported address family: {family}"),
+        ))
     }
 }
 
@@ -423,7 +462,7 @@ impl TcpListener {
     ///
     /// Useful for obtaining the OS-assigned port when the listener was bound
     /// with port 0.
-    pub fn local_addr(&self) -> io::Result<std::net::SocketAddr> {
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
         let mut storage = SockAddrStorage::zeroed();
         let mut len = std::mem::size_of::<SockAddrStorage>() as i32;
         if unsafe {
@@ -432,21 +471,7 @@ impl TcpListener {
         {
             return Err(wsa_last_error());
         }
-        // Read the address family from the first two bytes (ss_family).
-        let family = u16::from_ne_bytes([storage._data[0], storage._data[1]]);
-        if family == AF_INET as u16 {
-            let sa = unsafe { &*(storage._data.as_ptr() as *const SockAddrIn) };
-            // sin_addr is in network byte order; to_ne_bytes() gives the raw
-            // memory bytes which are already in dotted-decimal order.
-            let ip = std::net::Ipv4Addr::from(sa.sin_addr.to_ne_bytes());
-            let port = u16::from_be(sa.sin_port);
-            Ok(std::net::SocketAddr::new(std::net::IpAddr::V4(ip), port))
-        } else {
-            let sa = unsafe { &*(storage._data.as_ptr() as *const SockAddrIn6) };
-            let ip = std::net::Ipv6Addr::from(sa.sin6_addr);
-            let port = u16::from_be(sa.sin6_port);
-            Ok(std::net::SocketAddr::new(std::net::IpAddr::V6(ip), port))
-        }
+        sockaddr_to_socketaddr(&storage, len)
     }
 
     /// Return the underlying Windows `SOCKET` handle.
@@ -467,8 +492,13 @@ impl Drop for TcpListener {
 
 /// A goroutine-aware TCP stream socket (Windows IOCP backend).
 ///
-/// [`read`][TcpStream::read] and [`write`][TcpStream::write] park the goroutine
-/// and resume it when the overlapped operation completes via IOCP.
+/// Blocking reads and writes issue overlapped `WSARecv`/`WSASend` operations
+/// and park the goroutine until the IOCP completion fires.
+///
+/// `TcpStream` implements [`std::io::Read`] and [`std::io::Write`] (for both
+/// `&mut TcpStream` and `&TcpStream`), so it works with any Rust I/O adapter
+/// without unsafe wrapper code.  Use [`try_clone`][TcpStream::try_clone] to
+/// split a connection into independent read and write halves.
 pub struct TcpStream {
     socket: Socket,
 }
@@ -530,6 +560,67 @@ impl TcpStream {
         unsafe { overlapped_send(self.socket, buf) }
     }
 
+    /// Duplicate this stream, yielding a second `TcpStream` that refers to
+    /// the same TCP connection.
+    ///
+    /// Uses `DuplicateHandle` to copy the underlying `SOCKET` handle within
+    /// the current process, then associates the duplicate with the IOCP.
+    /// Both streams have independent lifetimes; closing one does not close
+    /// the other.
+    pub fn try_clone(&self) -> io::Result<TcpStream> {
+        let proc = unsafe { GetCurrentProcess() };
+        let mut new_handle: *mut c_void = std::ptr::null_mut();
+        let ok = unsafe {
+            DuplicateHandle(
+                proc,
+                self.socket as *mut c_void,
+                proc,
+                &mut new_handle,
+                0,
+                0,
+                DUPLICATE_SAME_ACCESS,
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let s = new_handle as Socket;
+        if !netpoll_iocp_associate(s) {
+            unsafe { closesocket(s) };
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "failed to associate cloned socket with IOCP",
+            ));
+        }
+        Ok(TcpStream { socket: s })
+    }
+
+    /// Return the remote address of the peer this stream is connected to.
+    pub fn peer_addr(&self) -> io::Result<SocketAddr> {
+        let mut storage = SockAddrStorage::zeroed();
+        let mut len = std::mem::size_of::<SockAddrStorage>() as i32;
+        if unsafe {
+            getpeername(self.socket, storage._data.as_mut_ptr() as *mut c_void, &mut len)
+        } == SOCKET_ERROR
+        {
+            return Err(wsa_last_error());
+        }
+        sockaddr_to_socketaddr(&storage, len)
+    }
+
+    /// Return the local address this stream is bound to.
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        let mut storage = SockAddrStorage::zeroed();
+        let mut len = std::mem::size_of::<SockAddrStorage>() as i32;
+        if unsafe {
+            getsockname(self.socket, storage._data.as_mut_ptr() as *mut c_void, &mut len)
+        } == SOCKET_ERROR
+        {
+            return Err(wsa_last_error());
+        }
+        sockaddr_to_socketaddr(&storage, len)
+    }
+
     /// Return the underlying Windows `SOCKET` handle.
     pub fn as_raw_socket(&self) -> usize {
         self.socket
@@ -542,6 +633,49 @@ impl Drop for TcpStream {
         // completion fires with STATUS_CANCELLED, waking the parked goroutine
         // (if any) so it returns an error rather than leaking.
         unsafe { closesocket(self.socket) };
+    }
+}
+
+// ---------------------------------------------------------------------------
+// std::io trait implementations for TcpStream (Windows)
+// ---------------------------------------------------------------------------
+
+impl Read for TcpStream {
+    #[inline]
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        TcpStream::read(self, buf)
+    }
+}
+
+/// `&TcpStream` Read: the overlapped operation uses the socket handle by
+/// value, so no mutation of the `TcpStream` struct is required.
+impl Read for &TcpStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        unsafe { overlapped_recv(self.socket, buf) }
+    }
+}
+
+impl Write for TcpStream {
+    #[inline]
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        TcpStream::write(self, buf)
+    }
+
+    #[inline]
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// `&TcpStream` Write: same reasoning as the `Read` impl above.
+impl Write for &TcpStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        unsafe { overlapped_send(self.socket, buf) }
+    }
+
+    #[inline]
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 
