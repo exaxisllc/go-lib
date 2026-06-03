@@ -21,14 +21,16 @@
 //! ## Usage
 //!
 //! ```no_run
+//! use std::io::{Read, Write};
+//!
 //! go_lib::run(|| {
 //!     let listener = go_lib::net::TcpListener::bind("127.0.0.1:8080").unwrap();
 //!     loop {
 //!         let mut stream = listener.accept().unwrap();
 //!         go_lib::go!(move || {
 //!             let mut buf = [0u8; 1024];
-//!             let n = stream.read(&mut buf).unwrap();
-//!             stream.write(&buf[..n]).unwrap();
+//!             let n = stream.read(&mut buf).unwrap();   // via impl Read
+//!             stream.write_all(&buf[..n]).unwrap();     // via impl Write
 //!         });
 //!     }
 //! });

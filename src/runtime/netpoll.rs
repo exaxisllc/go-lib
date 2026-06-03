@@ -517,12 +517,12 @@ pub(crate) fn iocp_win_init() {
     }
     let mut data = WsaData([0u8; 400]);
     let rc = unsafe { WSAStartup(0x0202u16, &mut data) };
-    assert_eq!(rc, 0, "netpoll_init: WSAStartup failed (error {rc})");
+    assert_eq!(rc, 0, "iocp_win_init: WSAStartup failed (error {rc})");
 
     // INVALID_HANDLE_VALUE = (HANDLE)(LONG_PTR)-1
     let invalid: WinHandle = usize::MAX as WinHandle;
     let h = unsafe { CreateIoCompletionPort(invalid, std::ptr::null_mut(), 0, 0) };
-    assert!(!h.is_null(), "netpoll_init: CreateIoCompletionPort failed");
+    assert!(!h.is_null(), "iocp_win_init: CreateIoCompletionPort failed");
 
     // If another thread raced us, we discard our handle (minor one-time leak).
     let _ = WIN_IOCP.set(h as usize);

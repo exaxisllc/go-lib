@@ -1849,8 +1849,8 @@ pub(crate) fn schedinit(nprocs: i32) {
     // before spawning any goroutines.  Without this, there is a window where
     // a goroutine can call WSASocketW before the sysmon thread has had a
     // chance to run netpoll_init(), producing WSANOTINITIALISED (10093).
-    // netpoll_init is idempotent (OnceLock-guarded), so the later call from
-    // sysmon_loop is a cheap no-op.
+    // netpoll_init is OnceLock-guarded, so any subsequent call (e.g. from
+    // sysmon_loop) is a cheap no-op.
     #[cfg(windows)]
     super::netpoll::netpoll_init();
 
