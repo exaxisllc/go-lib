@@ -38,6 +38,36 @@ No `async`, no executor, no Tokio — just goroutines.
 
 The build started from the bottom of the Go runtime stack and worked upward, one step at a time.
 
+**Step 1 — Workspace scaffold.**  
+The Cargo workspace was created with two members: the main `go-lib` crate and a `macros` sub-crate for procedural macros. The `edition = "2024"` was chosen from the start. A CI workflow skeleton was added to give every subsequent step a green-or-red signal.
+
+**Step 2 — `G` and `Gobuf`.**  
+The goroutine descriptor (`G`) and its register save area (`Gobuf`) were ported from `runtime/runtime2.go`. `Gobuf` holds `sp`, `pc`, `bp`, `g`, `ctxt`, `ret`, and `lr` — everything needed to freeze and restore a goroutine's execution state. `G` embeds `Gobuf` directly and is marked `#[repr(C)]` because the assembly in the next step addresses its fields by byte offset. The goroutine status constants (`GRUNNABLE`, `GRUNNING`, `GWAITING`, `GDEAD`, and the rest) were defined as `u32` constants alongside an `AtomicU32` `atomicstatus` field, exactly matching Go's design.
+
+Goroutine lifecycle infrastructure was also laid down here: thread-local `CURRENT_G`, `current_g()` / `set_current_g()`, the `WaitReason` enum, and the compile-time offset assertions (`GOBUF_SP_OFFSET`, `GOBUF_PC_OFFSET`, etc.) that the assembly relies on to address struct fields without unsafe Rust pointer arithmetic.
+
+**Step 3 — Assembly context switch primitives.**  
+`gogo_asm` and `mcall_asm` were written as naked functions in `asm_amd64.rs` and `asm_arm64.rs` using Rust's `naked_asm!`. Each function was written twice — once for System V AMD64 (Linux/macOS, arguments in `rdi`/`rsi`/`rdx`/`rcx`) and once for Microsoft x64 (Windows, arguments in `rcx`/`rdx`/`r8`/`r9` with a 32-byte shadow-space requirement).
+
+`gogo_asm` restores `pc`, `sp`, and `bp` from a `Gobuf` and jumps. `mcall_asm` saves the caller's `pc` (the return address at `[rsp]`), `sp` (= `rsp + 8`), and `bp`, switches RSP to g0's stack, and calls the scheduler function. Both functions end with `ud2` — a deliberate illegal instruction that fires if execution ever reaches code that "cannot be reached" (the scheduler function called by `mcall_asm` must never return).
+
+The g0 stack for each M was also introduced here: a 512 KiB `mmap`-backed region set aside for the scheduler loop, separate from the goroutine stacks that users run on. 512 KiB provides enough headroom for the `schedule → findrunnable → stopm → Condvar::wait` call chain even in debug builds.
+
+**Step 4 — Async preemption and the alternate signal stack.**  
+`M` gained two fields: `pthread_id` (the OS thread's `libc::pthread_t`, captured via `pthread_self()` in `M::start()`) and `sigaltstack` (a 64 KiB `mmap`-backed alternate stack installed via `sigaltstack(2)`). Both are needed for async preemption.
+
+The `async_preempt_trampoline` was written in naked assembly. When `sysmon` sends `SIGURG` to an M-thread, the signal handler redirects the goroutine's PC to the trampoline. The trampoline saves all live GPRs and XMM registers onto the goroutine's stack, calls `async_preempt2` (which `mcall`s into `preemptm`), and restores everything on the way back out. On x86-64, a `no-redzone` compilation flag is required to prevent the trampoline from clobbering the 128-byte red zone that the ABI permits leaf functions to use without adjusting RSP.
+
+SIGURG was chosen by the Go team (and reused here) because it is not used by any standard C library and is almost never sent by the OS, making it a safe "private" signal.
+
+**Step 5 — Netpoll and `WaitReason::IOWait`.**  
+Three platform backends were implemented: `epoll` (Linux), `kqueue` (macOS), and IOCP (Windows). Each backend registers non-blocking file descriptors and returns a list of ready goroutines when polled. `findrunnable()` calls `netpoll_wait(0)` (non-blocking) before giving up and parking the M, and the sysmon thread calls `netpoll_wait(timeout)` to wake goroutines whose I/O has completed. `WaitReason::IOWait` was added to the `WaitReason` enum to explain why a goroutine is parked.
+
+`net::TcpListener` and `net::TcpStream` were built on top of the netpoll layer, giving goroutines goroutine-aware blocking TCP I/O.
+
+**Step 6 — `M::new` and g0 initialisation.**  
+`M::new()` became the single place that allocates a g0 stack, initialises the `G0_SCHED` thread-local (the `Gobuf` that `mcall` uses to return to g0's stack), and records the M in `CURRENT_M`. `spawn_m()` wraps `std::thread::spawn` and calls `M::new()` inside the new thread before entering `schedule()`. The thread-local `G0_SCHED` uses a raw pointer (not `Arc`) because g0 outlives the thread and is cleaned up only when the scheduler tears down — which in the current design is never (the M-threads run forever).
+
 **Step 7 — The P (logical processor) struct.**  
 Go's scheduler uses three abstractions: G (goroutine), M (OS thread), and P (logical processor). P owns a 256-slot lock-free run queue — the goroutines it can run without touching a global lock. The ring buffer uses monotonically-increasing `runqhead`/`runqtail` counters and `AtomicUsize` slots, exactly matching Go's `p.runq` design.
 
