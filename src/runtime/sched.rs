@@ -1845,13 +1845,14 @@ pub(crate) fn schedinit(nprocs: i32) {
     #[cfg(windows)]
     install_windows_veh();
 
-    // Windows: initialise Winsock 2.2 and create the IOCP *synchronously*
-    // before spawning any goroutines.  Without this, there is a window where
-    // a goroutine can call WSASocketW before the sysmon thread has had a
-    // chance to run netpoll_init(), producing WSANOTINITIALISED (10093).
-    // netpoll_init is OnceLock-guarded, so any subsequent call (e.g. from
-    // sysmon_loop) is a cheap no-op.
-    #[cfg(windows)]
+    // Initialise the netpoll backend *synchronously* on all platforms before
+    // any goroutines or M threads start.  Without this, there is a window
+    // where a goroutine calls park_on_fd / WSASocketW before sysmon has had
+    // a chance to run netpoll_init(), producing:
+    //   • Unix:    a gopark that is never woken (kqueue/epoll fd is -1)
+    //   • Windows: WSANOTINITIALISED (error 10093)
+    // netpoll_init is idempotent (atomic/OnceLock-guarded), so the later call
+    // from sysmon_loop is a cheap no-op.
     super::netpoll::netpoll_init();
 
     // Start the background monitor thread (sysmon).
