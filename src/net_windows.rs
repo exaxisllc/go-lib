@@ -564,9 +564,12 @@ impl TcpStream {
     /// the same TCP connection.
     ///
     /// Uses `DuplicateHandle` to copy the underlying `SOCKET` handle within
-    /// the current process, then associates the duplicate with the IOCP.
-    /// Both streams have independent lifetimes; closing one does not close
-    /// the other.
+    /// the current process.  Both streams have independent lifetimes; closing
+    /// one does not close the other.
+    ///
+    /// **Note**: the IOCP association is on the kernel socket object and is
+    /// inherited by the duplicate — `CreateIoCompletionPort` must not be
+    /// called again on the new handle (it would return an error).
     pub fn try_clone(&self) -> io::Result<TcpStream> {
         let proc = unsafe { GetCurrentProcess() };
         let mut new_handle: *mut c_void = std::ptr::null_mut();
@@ -584,15 +587,10 @@ impl TcpStream {
         if ok == 0 {
             return Err(io::Error::last_os_error());
         }
-        let s = new_handle as Socket;
-        if !netpoll_iocp_associate(s) {
-            unsafe { closesocket(s) };
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                "failed to associate cloned socket with IOCP",
-            ));
-        }
-        Ok(TcpStream { socket: s })
+        // The duplicated handle shares the same kernel socket object, which is
+        // already registered with the IOCP.  Re-registering would fail with
+        // ERROR_INVALID_PARAMETER, so we skip netpoll_iocp_associate here.
+        Ok(TcpStream { socket: new_handle as Socket })
     }
 
     /// Return the remote address of the peer this stream is connected to.
