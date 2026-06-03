@@ -74,6 +74,9 @@ No `async`, no Tokio, no executor. Every goroutine starts with a **2 KiB stack**
 | Async preemption via `SIGURG` | ✅ v0.2.0 |
 | Netpoll — `epoll`/`kqueue`/IOCP I/O integration | ✅ v0.3.0 |
 | `net::TcpListener` / `net::TcpStream` | ✅ v0.2.0 |
+| `TcpStream`: `std::io::Read` + `std::io::Write` (`&mut` and `&`) | ✅ v0.5.0 |
+| `TcpStream::try_clone` — split read/write halves via `dup(2)` / `DuplicateHandle` | ✅ v0.5.0 |
+| `TcpStream::peer_addr` / `local_addr`, `TcpListener::local_addr` | ✅ v0.5.0 |
 | Loom concurrency model checker integration | ✅ v0.2.0 |
 | CI — standard + loom jobs on every push/PR | ✅ v0.2.0 |
 | G state machine — `casgstatus`, `GSYSCALL`, `GCOPYSTACK`, `GPREEMPTED`, `GSCAN` | ✅ v0.3.1 |
@@ -520,30 +523,60 @@ Wraps a potentially-blocking operation so the scheduler can hand the current M's
 | macOS | `kqueue` | readiness-based |
 | Windows | IOCP | completion-based (`WSARecv`/`WSASend` → park → operation done → resume) |
 
+`TcpStream` implements `std::io::Read` and `std::io::Write` for both `&mut TcpStream` and `&TcpStream`, so it works directly with any Rust I/O adapter — `BufReader`, `write!`, `read_to_string`, third-party parsers — without unsafe wrapper code.
+
 ```rust
+use std::io::{BufRead, BufReader, Write};
 use go_lib::net::{TcpListener, TcpStream};
 
 go_lib::run(|| {
     let listener = TcpListener::bind("127.0.0.1:8080").unwrap();
+    println!("listening on {}", listener.local_addr().unwrap());
 
     loop {
-        let mut stream = listener.accept().unwrap(); // parks until connection arrives
+        let stream = listener.accept().unwrap();
         go!(move || {
-            let mut buf = [0u8; 1024];
-            let n = stream.read(&mut buf).unwrap(); // parks if no data yet
-            stream.write(&buf[..n]).unwrap();        // parks if send buffer full
+            // TcpStream implements Read directly — no wrapper needed.
+            let mut reader = BufReader::new(stream);
+            let mut line   = String::new();
+            reader.read_line(&mut line).unwrap();
+            write!(reader.get_mut(), "echo: {line}").unwrap();
         });
     }
+});
+```
+
+Use `try_clone` to split a connection into independent read and write halves without unsafe fd manipulation:
+
+```rust
+go_lib::run(|| {
+    let listener = TcpListener::bind("127.0.0.1:9000").unwrap();
+    let stream   = listener.accept().unwrap();
+    let mut writer = stream.try_clone().unwrap(); // dup(2) / DuplicateHandle
+
+    go!(move || {
+        // Read half — shared reference impl.
+        let mut buf = [0u8; 512];
+        let n = (&stream).read(&mut buf).unwrap();
+        // Write half — owned clone.
+        writer.write_all(&buf[..n]).unwrap();
+    });
 });
 ```
 
 | Type | Method | Description |
 |---|---|---|
 | `TcpListener` | `bind(addr)` | Bind a server socket |
-| `TcpListener` | `accept()` | Accept; parks goroutine until a connection arrives |
+| `TcpListener` | `accept() -> TcpStream` | Accept; parks goroutine until a connection arrives |
+| `TcpListener` | `local_addr()` | Local address (useful with port 0) |
 | `TcpStream` | `connect(addr)` | Connect; parks until the connection is established |
-| `TcpStream` | `read(&mut buf)` | Read; parks if no data available |
-| `TcpStream` | `write(&buf)` | Write; parks if send buffer full |
+| `TcpStream` | `read(&mut buf)` | Read; parks if no data available (inherent method) |
+| `TcpStream` | `write(&buf)` | Write; parks if send buffer full (inherent method) |
+| `TcpStream` | `impl Read` / `impl Write` | `&mut TcpStream` — works with all `std::io` adapters |
+| `TcpStream` | `impl Read` / `impl Write` | `&TcpStream` — shared-reference path |
+| `TcpStream` | `try_clone()` | Duplicate the fd; returns an independent `TcpStream` |
+| `TcpStream` | `peer_addr()` | Remote address of the connected peer |
+| `TcpStream` | `local_addr()` | Local address this stream is bound to |
 
 The park/resume flow is integrated into the scheduler: `findrunnable` checks `netpoll_wait(0)` on every scheduling iteration, and `sysmon` polls it during idle periods.
 
@@ -940,8 +973,11 @@ print `Error: invalid digit found in string` and exit with code `1`.
 cargo test
 ```
 
-Runs 106 unit tests, 15 integration tests, and 23 doc tests.  All tests use
-`std::sync` primitives and the real go-lib scheduler.
+Runs 106 unit tests, 17 integration tests, 9 network integration tests, and 24 doc tests.  All tests use `std::sync` primitives and the real go-lib scheduler.
+
+The network tests (`tests/net.rs`) live in a dedicated test binary so they get
+an isolated scheduler and netpoll instance, avoiding interference with the
+`many_goroutines` test.
 
 ### Loom concurrency model checker
 
@@ -1092,7 +1128,7 @@ Netpoll (Step 5):
 | `runtime::time` | `runtime/time.go` | 4-ary min-heap timer, goroutine_sleep |
 | `runtime::asm_amd64` | `runtime/asm_amd64.s`, `runtime/preempt_amd64.s` | gogo, mcall, systemstack, async_preempt_trampoline (AMD64) |
 | `runtime::asm_arm64` | `runtime/asm_arm64.s`, `runtime/preempt_arm64.s` | gogo, mcall, systemstack, async_preempt_trampoline (AArch64) |
-| `net` | `net/tcpsock.go`, `net/fd_*.go` | TcpListener, TcpStream — goroutine-aware non-blocking TCP |
+| `net` | `net/tcpsock.go`, `net/fd_*.go` | TcpListener, TcpStream — goroutine-aware non-blocking TCP; implements `std::io::Read`/`Write`, `try_clone`, `peer_addr`, `local_addr` |
 | `chan` | `runtime/chan.go` | hchan, chansend, chanrecv, closechan |
 | `select` | `runtime/select.go` | selectgo, type-erased vtable |
 | `scope` | *(new — mirrors `std::thread::scope`)* | Scoped goroutines; safe short-lived borrows; `ScopedJoinHandle` |
@@ -1122,6 +1158,10 @@ Netpoll (Step 5):
 | `time.Sleep(d)` | `go_lib::sleep(d)` |
 | `runtime.GOMAXPROCS(n)` | `go_lib::set_gomaxprocs(n)` |
 | `errgroup.Group` / `golang.org/x/sync/errgroup` | `go_lib::scope` (with `h.join().unwrap()?`) |
+| `net.Conn` (`io.Reader` / `io.Writer`) | `TcpStream` via `impl Read` / `impl Write` |
+| `net.TCPConn.CloseRead` / split halves | `stream.try_clone()` |
+| `net.TCPConn.LocalAddr()` / `RemoteAddr()` | `stream.local_addr()` / `stream.peer_addr()` |
+| `net.Listener.Addr()` | `listener.local_addr()` |
 
 ---
 
