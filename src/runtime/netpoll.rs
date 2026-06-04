@@ -176,6 +176,73 @@ pub(crate) fn netpoll_unarm(fd: RawFd) {
 }
 
 // ---------------------------------------------------------------------------
+// netpoll_clear_reg — purge all stale registrations after go_lib::run() exits
+// ---------------------------------------------------------------------------
+
+/// Deregister every file descriptor from the epoll/kqueue backend and clear
+/// the registration table.
+///
+/// ## When to call
+///
+/// Call this once, from the caller's thread, immediately after `run_impl`'s
+/// `std::thread::park()` returns — i.e. after the main goroutine has finished
+/// but before `run_impl` returns to the user.
+///
+/// ## Why this is necessary
+///
+/// `go_lib::run()` can be called multiple times in the same process (e.g.
+/// each `#[test]` function calls it independently).  When the main closure
+/// exits, background goroutines spawned with `go!()` — such as HTTP server
+/// goroutines blocked in `listen_and_serve()` — continue running: they are
+/// parked in `gopark` with their `(fd, *mut G)` entry still live in `REG`
+/// and their fd still registered with epoll/kqueue.
+///
+/// The next `go_lib::run()` call in the same process reuses:
+/// * the same `POLL_FD` (epoll/kqueue fd, created once via `netpoll_init`)
+/// * the same `REG` global registration table
+///
+/// Without cleanup, `netpoll_wait` can then return stale `*mut G` pointers
+/// from the previous run.  `goready` dereferences those pointers, causing:
+/// * **Linux/epoll**: SIGSEGV (invalid memory reference)
+/// * **Windows/IOCP**: hang (IOCP threads from run N conflict with run N+1)
+///
+/// macOS/kqueue silently discards events for abandoned goroutines, so no
+/// crash is observed there, but the stale table entries are still incorrect.
+///
+/// ## What happens to abandoned goroutines
+///
+/// Goroutines left running after this call can never be woken by netpoll
+/// again (their fd is removed from epoll/kqueue and their entry is gone from
+/// `REG`).  They remain parked forever — a memory leak.  Fixing this properly
+/// requires a "stop the world" mechanism (out of scope for this patch).
+///
+/// ## Safety
+///
+/// Must be called from outside any goroutine (i.e. from the OS thread that
+/// called `run_impl`, after `park()` returns).  No M thread must be executing
+/// `netpoll_arm` or `netpoll_wait` concurrently; this is guaranteed because
+/// the main goroutine has already exited and no new goroutine can be spawned
+/// once `park()` has returned.
+pub(crate) fn netpoll_clear_reg() {
+    let pfd = POLL_FD.load(Acquire);
+    with_reg(|reg| {
+        // Deregister every fd from epoll/kqueue before clearing the map.
+        // Without this, stale kernel-level registrations can accumulate.
+        // When an old fd number is reused by a new socket, EPOLL_CTL_ADD
+        // would fail with EEXIST (the kernel sees the fd as already
+        // registered), falling through to EPOLL_CTL_MOD — subtle but
+        // harmless.  Explicit removal keeps the kernel poll table clean.
+        #[cfg(not(windows))]
+        if pfd >= 0 {
+            for (fd, _) in reg.iter() {
+                unsafe { poll_del(pfd, *fd) };
+            }
+        }
+        reg.clear();
+    });
+}
+
+// ---------------------------------------------------------------------------
 // netpoll_wait — collect goroutines whose I/O is ready or complete
 // ---------------------------------------------------------------------------
 
