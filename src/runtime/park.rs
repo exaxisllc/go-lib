@@ -128,9 +128,16 @@ pub(crate) unsafe fn goready(gp: *mut G) {
             // will run without further intervention.
             return;
         }
+        // GDEAD — the goroutine was cancelled by the run_impl shutdown drain
+        // (GWAITING → GDEAD CAS) before this goready call arrived.  Nothing
+        // to schedule; return without touching the G further.
+        use super::g::GDEAD;
+        if s == GDEAD {
+            return;
+        }
         debug_assert!(
             s == GRUNNING,
-            "goready: unexpected status {s} — expected GRUNNING, GWAITING, or GPREEMPTED"
+            "goready: unexpected status {s} — expected GRUNNING, GWAITING, GPREEMPTED, or GDEAD"
         );
         std::hint::spin_loop();
     };

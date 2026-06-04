@@ -57,6 +57,7 @@ pub(crate) const STACK_GUARD: usize = 928;
 /// `#[repr(C)]` because this struct sits at offset 0 of `G` and the assembly
 /// (step 3) may need a stable layout if `G` itself becomes `#[repr(C)]`.
 #[repr(C)]
+#[derive(Copy, Clone)]
 pub(crate) struct Stack {
     /// Low address — one page above the guard page after `mmap` (step 4).
     pub lo: usize,
@@ -507,7 +508,8 @@ fn is_valid_transition(from: u32, to: u32) -> bool {
         | (GCOPYSTACK, GRUNNING)    // copystack end
         | (GRUNNING,   GPREEMPTED)  // async preemption signal received
         | (GPREEMPTED, GRUNNABLE)   // scheduler re-enqueues preempted G
-        | (GRUNNING,   GDEAD)       // goexit0: goroutine finished
+        | (GRUNNING,   GDEAD)       // goexit0: goroutine finished normally
+        | (GWAITING,   GDEAD)       // run_impl drain: goroutine cancelled at exit
     )
 }
 

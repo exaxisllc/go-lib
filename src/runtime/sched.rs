@@ -48,10 +48,10 @@ use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, Ordering::*};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use super::g::{casgstatus, current_g, readgstatus, set_current_g, G, GDEAD, GPREEMPTED, GRUNNABLE, GRUNNING, STACK_GUARD};
+use super::g::{casgstatus, current_g, readgstatus, set_current_g, G, Stack, GDEAD, GPREEMPTED, GRUNNABLE, GRUNNING, STACK_GUARD};
 use super::m::{current_m, M};
 use super::p::{GlobalRunQueue, P, PIDLE, PRUNNING};
-use super::stack::{grow_stack_if_needed, stack_alloc};
+use super::stack::{grow_stack_if_needed, stack_alloc, stack_free};
 #[cfg(not(windows))]
 use super::stack::{install_sigsegv_handler, try_grow_stack_from_signal};
 use super::sysmon::start_sysmon;
@@ -98,11 +98,20 @@ pub(crate) struct Sched {
     pub gomaxprocs:   AtomicI32,
     /// Locked parts of scheduler state.
     pub inner:        Mutex<SchedInner>,
+    /// Registry of every live goroutine (matches Go's `allgs`).
+    /// `spawn_goroutine` inserts before making the G visible via the run queue;
+    /// `goexit0` removes before freeing the G.  The `run_impl` drain also
+    /// iterates this to reclaim goroutines that were never scheduled.
+    pub allg:         Mutex<Vec<*mut G>>,
 }
 
 // SAFETY: Sched is a process-global singleton; individual fields carry their
 // own synchronisation (Mutex / AtomicI32 / GlobalRunQueue's internal Mutex).
+// The Mutex<Vec<*mut G>> in allg does not auto-derive Send because *mut G is
+// !Send; the explicit impls assert that all raw-pointer access is serialised
+// through the Mutex and the scheduler's single-owner invariant.
 unsafe impl Sync for Sched {}
+unsafe impl Send for Sched {}
 
 static SCHED: OnceLock<Sched> = OnceLock::new();
 
@@ -119,6 +128,7 @@ pub(crate) fn sched() -> &'static Sched {
             allp:       Vec::new(),
             gomaxprocs: 1,
         }),
+        allg: Mutex::new(Vec::new()),
     })
 }
 
@@ -467,6 +477,11 @@ pub(crate) unsafe fn execute(gp: *mut G) -> ! {
 pub(crate) unsafe extern "C" fn goexit0(gp: *mut G) {
     let m = current_m();
 
+    // Snapshot stack bounds while we still own the G (GRUNNING).  After the
+    // casgstatus below the G is logically dead; we must not read its fields
+    // after the subsequent drop(Box::from_raw(gp)).
+    let stack: Stack = unsafe { (*gp).stack };
+
     unsafe {
         casgstatus(gp, GRUNNING, GDEAD);
         (*gp).m   = ptr::null_mut();
@@ -474,7 +489,25 @@ pub(crate) unsafe extern "C" fn goexit0(gp: *mut G) {
         set_current_g(ptr::null_mut());
     }
 
-    // Re-enter the scheduler on g0's stack.
+    // Remove from the live-goroutine registry before freeing so that the
+    // run_impl drain cannot observe a dangling pointer.
+    {
+        let mut allg = sched().allg.lock().unwrap();
+        if let Some(pos) = allg.iter().position(|&p| p == gp) {
+            allg.swap_remove(pos);
+        }
+    }
+
+    // Free the mmap'd stack (guard page + usable region).  stack_free computes
+    // base = stack.lo − page_size() and munmaps / VirtualFrees the whole region.
+    // Safe: gp is the only owner of this stack; it is GDEAD and off all queues.
+    unsafe { stack_free(&stack) };
+
+    // Reclaim the heap-allocated G descriptor.  gp must not be touched after
+    // this point; schedule() runs on g0's stack and never dereferences gp.
+    unsafe { drop(Box::from_raw(gp)) };
+
+    // Re-enter the scheduler on g0's stack — never returns.
     unsafe { schedule() }
 }
 
@@ -1758,6 +1791,10 @@ pub(crate) fn spawn_goroutine(f: impl FnOnce() + Send + 'static) {
     // preemptm, and self-deadlock when preemptm calls push_batch again.
     let _lk = super::m::m_lock();
     unsafe {
+        // Register in allg before the G becomes visible via the run queue.
+        // Ordering: allg insert → push_batch → startm, so the live-goroutine
+        // registry is never a subset of what M-threads can find in queues.
+        sched().allg.lock().unwrap().push(g_ptr);
         (*g_ptr).schedlink = ptr::null_mut();
         sched().global_run_q.push_batch(g_ptr, g_ptr, 1);
         startm(ptr::null_mut());
@@ -1977,6 +2014,51 @@ where
     // at this point: the main goroutine has exited, and no new goroutines can
     // be spawned until the next go_lib::run() call.
     super::netpoll::netpoll_clear_reg();
+
+    // ── Phase 2a: drain GRUNNABLE goroutines left in the run queues ──────────
+    //
+    // The main goroutine (wrapper) has exited.  Any goroutines that were
+    // spawned but never scheduled — or that were preempted back into a queue —
+    // are still GRUNNABLE.  Drain them now so their stacks and Box<G>
+    // descriptors are freed rather than leaked.
+    //
+    // M-threads are still running schedule().  The drain competes with them:
+    // every pop is atomic, so exactly one thread gets each G.  A G we pop is
+    // freed here; a G an M pops first runs to completion and is freed by the
+    // now-fixed goexit0.  The drain is best-effort — it is not a stop-the-world.
+    {
+        // Helper: remove gp from allg, free its stack, drop its Box<G>.
+        // Called only after an exclusive pop from a run queue, so no concurrent
+        // thread holds a pointer to gp at this point.
+        unsafe fn drain_and_free(gp: *mut G) {
+            let stack: Stack = unsafe { (*gp).stack };
+            {
+                let mut allg = sched().allg.lock().unwrap();
+                if let Some(pos) = allg.iter().position(|&p| p == gp) {
+                    allg.swap_remove(pos);
+                }
+            }
+            unsafe { stack_free(&stack) };
+            unsafe { drop(Box::from_raw(gp)) };
+        }
+
+        // Drain the global run queue.
+        loop {
+            let gp = unsafe { sched().global_run_q.pop() };
+            if gp.is_null() { break; }
+            unsafe { drain_and_free(gp) };
+        }
+
+        // Drain every P's local run queue (including the runnext slot).
+        let allp: Vec<*mut P> = sched().inner.lock().unwrap().allp.clone();
+        for p_ptr in allp {
+            loop {
+                let (gp, _) = unsafe { (*p_ptr).runqget() };
+                if gp.is_null() { break; }
+                unsafe { drain_and_free(gp) };
+            }
+        }
+    }
 
     match slot.lock().unwrap().take() {
         Some(Ok(v))       => v,
