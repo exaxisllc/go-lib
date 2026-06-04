@@ -2015,50 +2015,20 @@ where
     // be spawned until the next go_lib::run() call.
     super::netpoll::netpoll_clear_reg();
 
-    // ── Phase 2a: drain GRUNNABLE goroutines left in the run queues ──────────
+    // Phase 2a (drain GRUNNABLE goroutines from run queues) was removed.
     //
-    // The main goroutine (wrapper) has exited.  Any goroutines that were
-    // spawned but never scheduled — or that were preempted back into a queue —
-    // are still GRUNNABLE.  Drain them now so their stacks and Box<G>
-    // descriptors are freed rather than leaked.
+    // The global scheduler singleton is shared across all concurrent run_impl
+    // calls (e.g. parallel `cargo test` threads).  Draining "all GRUNNABLE
+    // goroutines" at exit popped goroutines belonging to OTHER concurrent
+    // run_impl calls and freed them before they executed, causing those calls
+    // to hang indefinitely waiting for their goroutines to complete.
     //
-    // M-threads are still running schedule().  The drain competes with them:
-    // every pop is atomic, so exactly one thread gets each G.  A G we pop is
-    // freed here; a G an M pops first runs to completion and is freed by the
-    // now-fixed goexit0.  The drain is best-effort — it is not a stop-the-world.
-    {
-        // Helper: remove gp from allg, free its stack, drop its Box<G>.
-        // Called only after an exclusive pop from a run queue, so no concurrent
-        // thread holds a pointer to gp at this point.
-        unsafe fn drain_and_free(gp: *mut G) {
-            let stack: Stack = unsafe { (*gp).stack };
-            {
-                let mut allg = sched().allg.lock().unwrap();
-                if let Some(pos) = allg.iter().position(|&p| p == gp) {
-                    allg.swap_remove(pos);
-                }
-            }
-            unsafe { stack_free(&stack) };
-            unsafe { drop(Box::from_raw(gp)) };
-        }
-
-        // Drain the global run queue.
-        loop {
-            let gp = unsafe { sched().global_run_q.pop() };
-            if gp.is_null() { break; }
-            unsafe { drain_and_free(gp) };
-        }
-
-        // Drain every P's local run queue (including the runnext slot).
-        let allp: Vec<*mut P> = sched().inner.lock().unwrap().allp.clone();
-        for p_ptr in allp {
-            loop {
-                let (gp, _) = unsafe { (*p_ptr).runqget() };
-                if gp.is_null() { break; }
-                unsafe { drain_and_free(gp) };
-            }
-        }
-    }
+    // GRUNNABLE goroutines left in queues are safe: M-threads loop forever in
+    // schedule() and will eventually pop and execute every queued goroutine.
+    // When each goroutine completes, goexit0 (Phase 1) frees its stack and
+    // Box<G>.  The only allocations that are not reclaimed by Phase 1 alone
+    // are those of goroutines still in GWAITING state — the subject of the
+    // deferred Phase 2b.
 
     match slot.lock().unwrap().take() {
         Some(Ok(v))       => v,
