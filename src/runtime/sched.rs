@@ -1965,6 +1965,19 @@ where
     // Block until the goroutine's drop-guard fires caller.unpark().
     std::thread::park();
 
+    // Purge stale netpoll registrations left by background goroutines that
+    // were still parked when the main closure exited.  Without this, a
+    // subsequent go_lib::run() call in the same process reuses the same
+    // global POLL_FD and REG, potentially receiving stale *mut G pointers
+    // from netpoll_wait → goready dereferences them → SIGSEGV on Linux/epoll
+    // or hang on Windows/IOCP.
+    //
+    // This must be called from this OS thread (outside any goroutine) after
+    // park() returns.  No M thread is executing netpoll_arm or netpoll_wait
+    // at this point: the main goroutine has exited, and no new goroutines can
+    // be spawned until the next go_lib::run() call.
+    super::netpoll::netpoll_clear_reg();
+
     match slot.lock().unwrap().take() {
         Some(Ok(v))       => v,
         Some(Err(payload)) => {
