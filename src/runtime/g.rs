@@ -446,7 +446,31 @@ thread_local! {
 }
 
 /// Return the goroutine currently running on this OS thread, or `null` on g0.
-#[inline]
+///
+/// ## Why `#[inline(never)]`
+///
+/// `CURRENT_G` is a thread-local cell.  Between two `current_g()` calls, the
+/// goroutine running on this OS thread can change — `mcall` switches to g0,
+/// `gosched_m` / `park_fn` / `preemptm` / `goexit0` clear `CURRENT_G` to null
+/// on g0, and a later `gogo` (potentially on a different M after preemption
+/// and migration) sets it to a new value.  Most of those writes happen inside
+/// `mcall_asm` (naked asm) which LLVM cannot inspect, so it must conservatively
+/// reload the TLS slot after every such call.
+///
+/// However, when `current_g()` is inlined into a hot user-visible function
+/// (e.g. a tight `for _ in 0..500 { gosched(); }` loop after release-mode
+/// inlining of `gosched` and `mcall`), LLVM's TLS access lowering can emit
+/// the gs-relative load in a form that gets hoisted by later passes.  The
+/// observed failure mode at `-C opt-level=3` on macOS x86-64 was
+/// `current_g()` returning null in user goroutine context, leading to
+/// `mcall(null, ...)` and a SIGSEGV inside `mcall_asm` at offset 0x28 (the
+/// `G.sched.pc` field).
+///
+/// Keeping `current_g` as a real function call forces LLVM to materialise a
+/// fresh TLS read at every call site, matching how the Go runtime's `getg`
+/// is implemented (a single asm instruction reading the TLS slot, never
+/// inlined into user code).
+#[inline(never)]
 pub(crate) fn current_g() -> *mut G {
     CURRENT_G.with(|c| c.get())
 }
@@ -457,7 +481,7 @@ pub(crate) fn current_g() -> *mut G {
 /// # Safety
 /// `g` must point to a live, heap-allocated `G` whose ownership has been
 /// transferred to the current OS thread by the scheduler.
-#[inline]
+#[inline(never)]
 pub(crate) unsafe fn set_current_g(g: *mut G) {
     CURRENT_G.with(|c| c.set(g));
 }
