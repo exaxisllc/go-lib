@@ -130,6 +130,24 @@ pub(crate) struct Sudog {
     /// `acquire_sudog` or just `release_sudog`-bound).
     pub unlink_for_drain:
         Option<unsafe extern "C" fn(channel: *mut u8, sudog: *mut Sudog)>,
+
+    /// Type-erased function that drops this sudog's `elem` payload.  Used by
+    /// the Phase 2b drain to reclaim heap allocations that the original
+    /// channel-op would have consumed had the goroutine not been killed.
+    ///
+    /// * For a send sudog: `elem` is `Box::into_raw(Box<ManuallyDrop<T>>)`;
+    ///   the function runs `ManuallyDrop::drop` (executing T's destructor)
+    ///   and frees the Box.
+    /// * For a recv sudog: `elem` is `Box::into_raw(Box<Option<T>>)`; the
+    ///   function frees the Box (which drops `Some(T)` if a value had
+    ///   already been written, or no-op if still `None`).
+    ///
+    /// `None` if `elem` is not a typed heap allocation (e.g. select-cases
+    /// whose `elem` points at a stack-allocated `ManuallyDrop<T>` /
+    /// `Option<T>` owned by the user's `selectgo` frame — that storage is
+    /// reclaimed by the goroutine-stack munmap, not by us).
+    pub drop_elem_for_drain:
+        Option<unsafe extern "C" fn(elem: *mut u8)>,
 }
 
 // SAFETY: Sudog instances are exchanged between goroutines only through the
@@ -153,6 +171,7 @@ impl Sudog {
             c:          std::ptr::null_mut(),
             g_link_next: std::ptr::null_mut(),
             unlink_for_drain: None,
+            drop_elem_for_drain: None,
         }
     }
 }

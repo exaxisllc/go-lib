@@ -137,6 +137,42 @@ pub(crate) unsafe extern "C" fn unlink_sudog_for_drain<T: Send + 'static>(
     unsafe { state.recvq.dequeue_sudog(sudog) };
 }
 
+/// Phase 2b drain helper: drop the payload allocated by `chansend`'s blocking
+/// path (a `Box<ManuallyDrop<T>>` holding the value being sent).  Runs `T`'s
+/// destructor and frees the Box.
+///
+/// # Safety
+/// `elem` must be `Box::into_raw(Box::new(ManuallyDrop::new(t)))` where the
+/// `T` has not yet been consumed by a receiver (i.e. the send sudog was
+/// never woken successfully).
+pub(crate) unsafe extern "C" fn drop_send_elem_for_drain<T: Send + 'static>(
+    elem: *mut u8,
+) {
+    let ep = elem as *mut ManuallyDrop<T>;
+    unsafe {
+        // Run T's destructor on the value that the receiver never picked up.
+        ManuallyDrop::drop(&mut *ep);
+        // Release the Box allocation.
+        let _ = Box::from_raw(ep);
+    }
+}
+
+/// Phase 2b drain helper: drop the payload allocated by `chanrecv`'s
+/// blocking path (a `Box<Option<T>>` for the receive slot).
+///
+/// `Option<T>`'s Drop runs `Some(T)`'s destructor if a sender had written to
+/// the slot before the goroutine was reclaimed (rare — usually still `None`).
+///
+/// # Safety
+/// `elem` must be `Box::into_raw(Box::new(None::<T>))` from `chanrecv`.
+pub(crate) unsafe extern "C" fn drop_recv_elem_for_drain<T: Send + 'static>(
+    elem: *mut u8,
+) {
+    let ep = elem as *mut Option<T>;
+    // Box::from_raw + drop runs Option<T>::drop (which drops T if Some).
+    unsafe { let _ = Box::from_raw(ep); };
+}
+
 impl<T> Hchan<T> {
     pub(crate) fn new(cap: usize) -> Self {
         Self {
@@ -311,7 +347,8 @@ pub(crate) unsafe fn chansend<T: Send + 'static>(
         (*s).boxed_elem = true; // Box<ManuallyDrop<T>> — must be freed by receiver
         (*s).success    = false;
         (*s).c          = Arc::as_ptr(c) as *mut u8;
-        (*s).unlink_for_drain = Some(unlink_sudog_for_drain::<T>);
+        (*s).unlink_for_drain    = Some(unlink_sudog_for_drain::<T>);
+        (*s).drop_elem_for_drain = Some(drop_send_elem_for_drain::<T>);
         (*gp).param     = ptr::null_mut();
         state.sendq.enqueue(s);
         // Phase 2b: link the sudog into gp's waiting-sudog list so the drain
@@ -410,7 +447,8 @@ pub(crate) unsafe fn chanrecv<T: Send + 'static>(
         (*s).boxed_elem = true; // Box<Option<T>> — must be freed on wakeup
         (*s).success    = false;
         (*s).c          = Arc::as_ptr(c) as *mut u8;
-        (*s).unlink_for_drain = Some(unlink_sudog_for_drain::<T>);
+        (*s).unlink_for_drain    = Some(unlink_sudog_for_drain::<T>);
+        (*s).drop_elem_for_drain = Some(drop_recv_elem_for_drain::<T>);
         (*gp).param     = ptr::null_mut();
         state.recvq.enqueue(s);
         // Phase 2b: link the sudog into gp's waiting-sudog list (see chansend
