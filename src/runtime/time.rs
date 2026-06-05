@@ -102,6 +102,26 @@ pub(crate) fn start_timer_thread() {
         .expect("time: failed to spawn timer thread");
 }
 
+/// Drop every pending timer from the global heap and discard them.
+///
+/// Called by `run_impl`'s Phase 2b drain when the last concurrent `run_impl`
+/// is exiting and we are about to reclaim GWAITING goroutines.  Any goroutines
+/// referenced by these timer entries are simultaneously being CAS'd to GDEAD
+/// by the Phase 2b drain, so the canceled timers would never fire usefully
+/// anyway; dropping them lets the timer thread sleep until a future
+/// `sleep(d)` call wakes it.
+///
+/// The timer thread itself is not stopped — it remains the same background
+/// thread across the lifetime of the process and is shared between
+/// `run_impl` invocations.
+pub(crate) fn drain_timer_heap_for_shutdown() {
+    let mut heap = TIMER_HEAP.lock().unwrap();
+    heap.clear();
+    // The thread may currently be sleeping with a stale deadline; that is
+    // fine — when it wakes (no later than 1 s; see `timer_thread_body`) it
+    // observes the empty heap and re-sleeps.
+}
+
 /// Main body of the background timer thread.
 fn timer_thread_body() {
     // Register the thread handle so `sleep` can unpark us early.

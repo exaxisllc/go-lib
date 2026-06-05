@@ -112,6 +112,31 @@ pub(crate) struct Hchan<T> {
 unsafe impl<T: Send> Send for Hchan<T> {}
 unsafe impl<T: Send> Sync for Hchan<T> {}
 
+/// Phase 2b drain helper: remove `sudog` from whichever waitq of
+/// `channel: *mut Hchan<T>` it currently lives in.  The drain knows nothing
+/// about `T`; it calls this function via the type-erased pointer stored in
+/// `Sudog.unlink_for_drain` and the channel pointer stored in `Sudog.c`.
+///
+/// The function is `extern "C"` so its address can be safely cast to/from
+/// `unsafe extern "C" fn(*mut u8, *mut crate::runtime::sudog::Sudog)`.
+///
+/// # Safety
+/// * `channel` must point at a `Hchan<T>` whose channel mutex is held by the
+///   caller (the Phase 2b drainer locks it via `Sudog.c as *const RawMutex`).
+/// * `sudog` must be a `*mut Sudog` originally enqueued in this channel.
+pub(crate) unsafe extern "C" fn unlink_sudog_for_drain<T: Send + 'static>(
+    channel: *mut u8,
+    sudog:   *mut crate::runtime::sudog::Sudog,
+) {
+    let hchan = channel as *const Hchan<T>;
+    // SAFETY: caller holds the channel lock; we read state behind the
+    // UnsafeCell, mutating the waitqs.
+    let state = unsafe { &mut *(*hchan).state.get() };
+    // `dequeue_sudog` is idempotent — no-op if the sudog isn't in the queue.
+    unsafe { state.sendq.dequeue_sudog(sudog) };
+    unsafe { state.recvq.dequeue_sudog(sudog) };
+}
+
 impl<T> Hchan<T> {
     pub(crate) fn new(cap: usize) -> Self {
         Self {
@@ -286,8 +311,12 @@ pub(crate) unsafe fn chansend<T: Send + 'static>(
         (*s).boxed_elem = true; // Box<ManuallyDrop<T>> — must be freed by receiver
         (*s).success    = false;
         (*s).c          = Arc::as_ptr(c) as *mut u8;
+        (*s).unlink_for_drain = Some(unlink_sudog_for_drain::<T>);
         (*gp).param     = ptr::null_mut();
         state.sendq.enqueue(s);
+        // Phase 2b: link the sudog into gp's waiting-sudog list so the drain
+        // can find it if this goroutine is reclaimed while parked.
+        crate::runtime::g::push_waiting_sudog(gp, s);
     }
 
     drop(_g); // release lock BEFORE parking
@@ -307,6 +336,9 @@ pub(crate) unsafe fn chansend<T: Send + 'static>(
             ManuallyDrop::drop(&mut *ep); // run T's destructor
             if (*s2).boxed_elem { let _ = Box::from_raw(ep); }
         }
+        // Phase 2b: unlink the sudog from gp's waiting list now that the
+        // wake has consumed it.  Idempotent under racing drain.
+        crate::runtime::g::remove_waiting_sudog(gp, s2);
         (*s2).g = ptr::null_mut();
         (*s2).c = ptr::null_mut();
         release_sudog(s2);
@@ -378,8 +410,12 @@ pub(crate) unsafe fn chanrecv<T: Send + 'static>(
         (*s).boxed_elem = true; // Box<Option<T>> — must be freed on wakeup
         (*s).success    = false;
         (*s).c          = Arc::as_ptr(c) as *mut u8;
+        (*s).unlink_for_drain = Some(unlink_sudog_for_drain::<T>);
         (*gp).param     = ptr::null_mut();
         state.recvq.enqueue(s);
+        // Phase 2b: link the sudog into gp's waiting-sudog list (see chansend
+        // for rationale).
+        crate::runtime::g::push_waiting_sudog(gp, s);
     }
 
     drop(_g);
@@ -418,6 +454,8 @@ pub(crate) unsafe fn chanrecv<T: Send + 'static>(
             None
         };
 
+        // Phase 2b: unlink the sudog from gp's waiting list.
+        crate::runtime::g::remove_waiting_sudog(gp, s2);
         (*s2).g = ptr::null_mut();
         (*s2).c = ptr::null_mut();
         release_sudog(s2);

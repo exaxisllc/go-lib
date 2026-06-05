@@ -137,8 +137,26 @@ impl WaitGroup {
         // Wake goroutine waiters outside the lock so we don't hold it during
         // the goready spin (which waits for GRUNNING → GWAITING).
         for gp in goroutine_waiters {
+            // Phase 2b: clear the gp.waiting_wg tag — once the goready fires,
+            // gp is no longer registered in our waiters list.  The Phase 2b
+            // drain will skip gps whose tag has been cleared.
+            unsafe { (*gp).waiting_wg = std::ptr::null_mut() };
             unsafe { goready(gp) };
         }
+    }
+
+    /// Phase 2b drain helper: remove `gp` from this WaitGroup's `waiters`
+    /// vector.  Called when the Phase 2b drainer is about to reclaim a
+    /// goroutine that was parked here.  Idempotent: no-op if `gp` is not in
+    /// the list (e.g. a concurrent `add(0)` already removed it).
+    ///
+    /// # Safety
+    /// `gp` must be a `*mut G` that this `WaitGroup` may have stored in its
+    /// waiters list.
+    pub(crate) unsafe fn remove_waiter(&self, gp: *mut G) {
+        let _lk = crate::runtime::m::m_lock();
+        let mut state = self.state.lock().unwrap();
+        state.waiters.retain(|&g| g != gp);
     }
 
     /// Decrement the counter by one.
@@ -181,11 +199,22 @@ impl WaitGroup {
                 // GWAITING, which closes the window between drop(state) and
                 // gopark().
                 state.waiters.push(gp);
+                // Phase 2b: tag gp with the WaitGroup it is parked on so the
+                // run_impl drain can remove the stale `*mut G` from `state.waiters`
+                // if gp is reclaimed while parked.  Cleared in two places: by
+                // `add()` when it drains us via goready, and below right after
+                // gopark resumes.
+                unsafe { (*gp).waiting_wg = self as *const WaitGroup as *mut u8 };
                 drop(state);
             }
             // Suspend this goroutine.  Execution resumes here after add()
             // calls goready(gp) once the counter reaches zero.
             gopark(WaitReason::Semacquire);
+            // Phase 2b: clear the tag now that we have been woken.  (The
+            // waker — `add()` below — clears it too, but doing it here as
+            // well is defensive against a future code path that wakes without
+            // going through add()).
+            unsafe { (*gp).waiting_wg = std::ptr::null_mut() };
             return;
         }
 

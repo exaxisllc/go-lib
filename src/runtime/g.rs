@@ -327,12 +327,14 @@ const _: () = {
     // Stack.hi is at Stack+8, so G.stack.hi = G+8 = G_STACK_HI_OFFSET.
 
     // Lock the compact layout.  Size varies by platform:
-    //   System V AMD64 (Linux/macOS x86_64): 5 callee-save regs → Gobuf 96 B → G 168 B
-    //   Microsoft x64 (Windows x86_64):      7 callee-save regs → Gobuf 112 B → G 184 B
-    //   AArch64 (all OS):                    no regs → Gobuf 56 B → G 128 B (matches main)
+    //   System V AMD64 (Linux/macOS x86_64): 5 callee-save regs → Gobuf 96 B → G 192 B
+    //   Microsoft x64 (Windows x86_64):      7 callee-save regs → Gobuf 112 B → G 208 B
+    //   AArch64 (all OS):                    no regs → Gobuf 56 B → G 152 B
     //
-    // The 72-byte non-Gobuf portion is the same on every platform.
-    const NON_GOBUF: usize = 72;
+    // The 96-byte non-Gobuf portion is the same on every platform.  The
+    // additional 24 bytes vs. the original 72 are the three Phase 2b
+    // waiter-tracking fields (`waiting_sudogs`, `waiting_wg`, `waiting_cond`).
+    const NON_GOBUF: usize = 96;
     #[cfg(target_arch = "x86_64")]
     const GOBUF: usize = 56 + CALLEE_SAVED_GPR_COUNT * 8;
     #[cfg(not(target_arch = "x86_64"))]
@@ -392,7 +394,34 @@ pub(crate) struct G {
     /// yield; the G should call `gosched()` at its next safe point.
     /// Mirrors setting `stackguard0 = STACK_PREEMPT`.
     pub preempt:     bool,
-    // 6 bytes implicit padding here (repr(C) aligns the struct to 8 bytes).
+    // 6 bytes implicit padding here (repr(C) aligns the next 8 B fields).
+
+    // ── Phase 2b waiter tracking ──────────────────────────────────────────
+    //
+    // The next three fields let `run_impl`'s Phase 2b drain remove this G
+    // from every waker that holds a `*mut G` pointing at it BEFORE freeing
+    // the `Box<G>`.  Without this tracking the Box must be leaked because a
+    // stale waker (e.g. a Sender held by user code across `run_impl` calls)
+    // could load the pointer in a future operation and dereference into
+    // freed memory inside `goready`.
+
+    /// Head of an intrusive linked list of `Sudog`s registering this G in
+    /// channel send/recv wait queues.  `null` if not waiting on any channel.
+    ///
+    /// A goroutine entering a `select!` may have multiple `Sudog`s (one per
+    /// case) linked through `Sudog.g_link_next`.  A goroutine in a plain
+    /// channel send/recv has at most one.  The waker that wakes this G
+    /// (peer handoff, close, drain) unlinks its `Sudog` here.
+    pub waiting_sudogs: *mut crate::runtime::sudog::Sudog,
+    /// `*const crate::sync::WaitGroup` (type-erased to avoid a cross-crate
+    /// generic dependency) if this G is parked in `WaitGroup::wait`, else
+    /// `null`.  The Phase 2b drain calls `WaitGroup::remove_waiter` through
+    /// this pointer to clear the stale `*mut G` from the WG's waiters list.
+    pub waiting_wg: *mut u8,
+    /// `*const crate::sync::Cond` (type-erased) if this G is parked in
+    /// `Cond::wait`, else `null`.  The Phase 2b drain calls
+    /// `Cond::remove_waiter` through this pointer.
+    pub waiting_cond: *mut u8,
 }
 
 // SAFETY: The scheduler guarantees at most one M executes a given G at any
@@ -422,6 +451,9 @@ impl G {
             param:        std::ptr::null_mut(),
             waitreason:   WaitReason::Zero,
             preempt:      false,
+            waiting_sudogs: std::ptr::null_mut(),
+            waiting_wg:     std::ptr::null_mut(),
+            waiting_cond:   std::ptr::null_mut(),
         });
         // Box<G> has a stable heap address — moving the Box moves only the
         // pointer, not the allocation — so this self-referential pointer is
@@ -510,6 +542,65 @@ pub(crate) unsafe fn set_g0_sched(buf: *mut Gobuf) {
 #[inline]
 pub(crate) fn g0_sched() -> *mut Gobuf {
     G0_SCHED.with(|c| c.get())
+}
+
+// ---------------------------------------------------------------------------
+// Waiter tracking — link/unlink Sudogs into G.waiting_sudogs
+// ---------------------------------------------------------------------------
+
+/// Push `sudog` onto the head of `gp`'s waiting-sudog list.
+///
+/// Used by channel send/recv park paths and by `selectgo` when enqueuing a
+/// sudog for each case.  The list is intrusive via `Sudog.g_link_next` and
+/// is owned exclusively by `gp` while parked — no concurrent access exists
+/// because no other thread mutates `gp.waiting_sudogs` while `gp` is parked
+/// (gp is single-threaded by the scheduler).
+///
+/// # Safety
+/// `gp` must be a valid `*mut G` whose owning thread is currently parking
+/// or already parked.  `sudog` must be a valid `*mut Sudog`.
+#[inline]
+pub(crate) unsafe fn push_waiting_sudog(
+    gp:    *mut G,
+    sudog: *mut super::sudog::Sudog,
+) {
+    unsafe {
+        (*sudog).g_link_next = (*gp).waiting_sudogs;
+        (*gp).waiting_sudogs = sudog;
+    }
+}
+
+/// Remove `sudog` from `gp`'s waiting-sudog list.  No-op if the sudog is
+/// not in the list (e.g. the Phase 2b drain raced ahead and already
+/// unlinked it).
+///
+/// Used by channel send/recv resume paths and by `selectgo` cleanup.
+///
+/// # Safety
+/// `gp` must be a valid `*mut G`.  `sudog` must be a valid `*mut Sudog`.
+#[inline]
+pub(crate) unsafe fn remove_waiting_sudog(
+    gp:    *mut G,
+    sudog: *mut super::sudog::Sudog,
+) {
+    unsafe {
+        let mut cur = (*gp).waiting_sudogs;
+        let mut prev: *mut super::sudog::Sudog = std::ptr::null_mut();
+        while !cur.is_null() {
+            if cur == sudog {
+                let next = (*cur).g_link_next;
+                if prev.is_null() {
+                    (*gp).waiting_sudogs = next;
+                } else {
+                    (*prev).g_link_next = next;
+                }
+                (*cur).g_link_next = std::ptr::null_mut();
+                return;
+            }
+            prev = cur;
+            cur = (*cur).g_link_next;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

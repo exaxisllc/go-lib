@@ -108,12 +108,22 @@ impl Cond {
         // notify_one / notify_all sees us in the queue.
         self.waitq.lock().unwrap().push_back(gp);
 
+        // Phase 2b: tag gp with this Cond so the run_impl drain can find and
+        // remove the stale `*mut G` from `self.waitq` if gp is reclaimed
+        // while parked.  Cleared by the waker (notify_one / notify_all) and
+        // again below after gopark returns.
+        unsafe { (*gp).waiting_cond = self as *const Cond as *mut u8 };
+
         // Release the user's mutex.  After this point a notifier may call
         // goready(gp); goready's spin loop handles the GRUNNING→GWAITING race.
         drop(guard);
 
         // Park until goready transitions us back to GRUNNABLE.
         gopark(WaitReason::CondVar);
+
+        // Phase 2b: clear the tag now that we have been woken (defence in
+        // depth — the notify path also clears it).
+        unsafe { (*gp).waiting_cond = std::ptr::null_mut() };
 
         // Woken — re-acquire the user's mutex.
         mu.lock().unwrap()
@@ -127,6 +137,10 @@ impl Cond {
         let _cs = crate::runtime::rcu::RcuGuard::new();
         let gp = self.waitq.lock().unwrap().pop_front();
         if let Some(gp) = gp {
+            // Phase 2b: clear the gp.waiting_cond tag — the wake removes gp
+            // from our waitq, so the Phase 2b drain no longer needs to touch
+            // us for this gp.
+            unsafe { (*gp).waiting_cond = std::ptr::null_mut() };
             // SAFETY: gp is a valid goroutine pointer (see module safety comment).
             unsafe { goready(gp) };
         }
@@ -139,9 +153,24 @@ impl Cond {
         let _cs = crate::runtime::rcu::RcuGuard::new();
         let waiters: Vec<*mut G> = self.waitq.lock().unwrap().drain(..).collect();
         for gp in waiters {
+            // Phase 2b: clear each waiter's tag (see notify_one).
+            unsafe { (*gp).waiting_cond = std::ptr::null_mut() };
             // SAFETY: same as notify_one.
             unsafe { goready(gp) };
         }
+    }
+
+    /// Phase 2b drain helper: remove `gp` from this Cond's `waitq`.  Called
+    /// when the Phase 2b drainer is about to reclaim a goroutine that was
+    /// parked here.  Idempotent: no-op if `gp` is not in the queue (e.g. a
+    /// concurrent `notify_one` already drained it).
+    ///
+    /// # Safety
+    /// `gp` must be a `*mut G` that this `Cond` may have stored in its
+    /// `waitq`.
+    pub(crate) unsafe fn remove_waiter(&self, gp: *mut G) {
+        let mut waitq = self.waitq.lock().unwrap();
+        waitq.retain(|&g| g != gp);
     }
 }
 

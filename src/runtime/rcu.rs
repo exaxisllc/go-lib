@@ -142,12 +142,6 @@ impl Drop for RcuGuard {
 
 /// RAII guard for the drainer's exclusive phase.
 ///
-/// **Not yet used by the runtime** — wired up in the follow-up Phase 2b PR
-/// that drains GWAITING goroutines at `run_impl` exit.  Kept here so the
-/// RCU/epoch read-side wiring lands in isolation and can be reviewed and
-/// stress-tested independently of the drain behaviour itself.
-#[allow(dead_code)] // wired up by the Phase 2b PR (see module docs)
-///
 /// `DrainSync::new()` returns only after every existing [`RcuGuard`] has
 /// been dropped, *and* prevents new ones from being acquired (they spin)
 /// until the `DrainSync` itself is dropped.  Between the two events, the
@@ -170,7 +164,6 @@ pub(crate) struct DrainSync;
 impl DrainSync {
     /// Enter the exclusive phase: block new readers, wait for current
     /// readers to drain.
-    #[allow(dead_code)] // wired up by the Phase 2b PR
     pub(crate) fn new() -> Self {
         // Raise the drain counter.  SeqCst pairs with the SeqCst increment
         // in RcuGuard::new(): if a reader's RCU_IN_CS fetch_add succeeds
