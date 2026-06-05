@@ -1987,17 +1987,31 @@ unsafe fn unregister_drained_g(gp: *mut G) {
             unsafe { (*mu).unlock() };
         }
 
+        // Drop the heap-allocated `elem` payload via the monomorphised
+        // function pointer set at enqueue time.  Only present for plain
+        // channel send/recv sudogs (`Box<ManuallyDrop<T>>` / `Box<Option<T>>`);
+        // `None` for select sudogs whose `elem` points into the user's
+        // `selectgo` stack frame (which the goroutine-stack munmap reclaims).
+        let drop_fn = unsafe { (*sg).drop_elem_for_drain };
+        let elem    = unsafe { (*sg).elem };
+        if let Some(drop_fn) = drop_fn
+            && !elem.is_null()
+        {
+            // SAFETY: `drop_fn` is the monomorphised
+            // `drop_send_elem_for_drain::<T>` or `drop_recv_elem_for_drain::<T>`
+            // for the channel's `T`, and `elem` is the Box pointer the
+            // send/recv path stored.  No other thread holds this pointer
+            // (the sudog is gone from the waitq after the unlink call above).
+            unsafe { drop_fn(elem) };
+        }
+
         unsafe {
-            (*sg).g = std::ptr::null_mut();
-            (*sg).c = std::ptr::null_mut();
-            // sudog.elem may still point to a `Box<ManuallyDrop<T>>` (send)
-            // or `Box<Option<T>>` (recv).  We do not know `T` at this layer,
-            // so the boxed value leaks — same class of leak as the closure
-            // captures on the freed goroutine stack.  Documented in the
-            // run_impl Phase 2b comment.
+            (*sg).g    = std::ptr::null_mut();
+            (*sg).c    = std::ptr::null_mut();
             (*sg).elem = std::ptr::null_mut();
-            (*sg).g_link_next = std::ptr::null_mut();
-            (*sg).unlink_for_drain = None;
+            (*sg).g_link_next         = std::ptr::null_mut();
+            (*sg).unlink_for_drain    = None;
+            (*sg).drop_elem_for_drain = None;
             release_sudog(sg);
         }
     }
@@ -2512,6 +2526,71 @@ mod tests {
             );
             // Try again — another test may have been concurrently in
             // run_impl, blocking our drain.
+        }
+    }
+
+    /// Phase 2b also drops the heap-allocated `elem` payloads on parked
+    /// channel sudogs — `Box<ManuallyDrop<T>>` for sends and
+    /// `Box<Option<T>>` for recvs.  Without that drop, the `T`'s destructor
+    /// would not run and any owned heap allocations inside `T` would leak.
+    ///
+    /// This test spawns a goroutine that blocks in `tx.send(value)` where
+    /// `value` is a wrapper around a counter-incrementing Drop.  After
+    /// `run_impl` returns and the drain runs, the counter must have been
+    /// incremented — i.e. `T`'s Drop ran.
+    #[test]
+    fn phase_2b_drain_drops_send_elem() {
+        use crate::chan::chan;
+
+        // T's Drop bumps this counter — visible across run_impl.
+        static DROP_COUNT: AtomicU64 = AtomicU64::new(0);
+
+        struct DropCounter;
+        impl Drop for DropCounter {
+            fn drop(&mut self) {
+                DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let baseline = DROP_COUNT.load(Ordering::Acquire);
+        let drain_baseline = PHASE_2B_DRAINED_COUNT.load(Ordering::Acquire);
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(10);
+
+        loop {
+            run_impl(|| {
+                // Unbuffered channel — every send must rendezvous with a
+                // recv, and we'll provide none.  Use capacity 0 so the
+                // sender immediately blocks.
+                let (tx, _rx) = chan::<DropCounter>(0);
+                spawn_goroutine(move || {
+                    // Parks forever in `chansend`'s Case 4 with a
+                    // `Box<ManuallyDrop<DropCounter>>` as `sudog.elem`.
+                    // Phase 2b's drop_elem_for_drain runs DropCounter's
+                    // Drop and frees the Box.
+                    tx.send(DropCounter);
+                });
+                // Give the sender a few quanta to reach gopark.
+                for _ in 0..50 {
+                    unsafe { gosched() };
+                }
+            });
+
+            // We need the drain to have fired (advanced PHASE_2B_DRAINED_COUNT)
+            // before we check DROP_COUNT — otherwise we're racing with a
+            // concurrent test that prevented our drain from running.
+            let drain_now = PHASE_2B_DRAINED_COUNT.load(Ordering::Acquire);
+            let drop_now  = DROP_COUNT.load(Ordering::Acquire);
+            if drain_now > drain_baseline && drop_now > baseline {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Phase 2b drain did not drop send elem in time: \
+                 drains advanced by {}, drops advanced by {}",
+                drain_now - drain_baseline,
+                drop_now  - baseline,
+            );
         }
     }
 }
