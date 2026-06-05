@@ -315,7 +315,7 @@ Over 80 commits and five minor versions, the public API grew to cover:
 | `with_syscall` — P hand-off during blocking I/O | ✅ |
 | `GOMAXPROCS` env var + `set_gomaxprocs()` | ✅ |
 | Goroutine panic handler | ✅ |
-| Dynamic stack growth (2 KiB → 1 GiB) | ✅ |
+| Dynamic stack growth (32 KiB → 1 GiB) | ✅ |
 | Async preemption via SIGURG | ✅ |
 | Netpoll — epoll/kqueue/IOCP integration | ✅ |
 | `net::TcpListener` / `net::TcpStream` | ✅ |

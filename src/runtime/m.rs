@@ -38,7 +38,7 @@
 //! ### g0 stack size (Step 3)
 //! The scheduler loop runs on the M's `g0` stack.  g0 uses
 //! `g0_stack_alloc()` (512 KiB — see `G0_STACK_BYTES`) rather than the
-//! goroutine default (2 KiB release / 16–64 KiB debug), because
+//! goroutine default (32 KiB release / 16–64 KiB debug), because
 //! `schedule → findrunnable → stopm → locking → Condvar::wait` has a much
 //! deeper call chain than a typical user goroutine and is not subject to
 //! the dynamic growth path.

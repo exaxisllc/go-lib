@@ -288,17 +288,21 @@ impl WaitReason {
 ///
 /// | Platform      | Stack  | OS guard page | G struct | Total   |
 /// |---------------|--------|---------------|----------|---------|
-/// | Linux x86-64  | 2 KiB  | 4 KiB         | 128 B    | ~6.1 KiB |
-/// | Linux AArch64 | 2 KiB  | 4 KiB         | 128 B    | ~6.1 KiB |
-/// | macOS x86-64  | 2 KiB  | 4 KiB         | 128 B    | ~6.1 KiB |
-/// | macOS AArch64 | 2 KiB  | 16 KiB        | 128 B    | ~18 KiB  |
-/// | Windows x86-64| 2 KiB  | 4 KiB (VEH)   | 128 B    | ~6.1 KiB |
+/// | Linux x86-64  | 32 KiB | 4 KiB         | 128 B    | ~36 KiB |
+/// | Linux AArch64 | 32 KiB | 4 KiB         | 128 B    | ~36 KiB |
+/// | macOS x86-64  | 32 KiB | 4 KiB         | 128 B    | ~36 KiB |
+/// | macOS AArch64 | 32 KiB | 16 KiB        | 128 B    | ~48 KiB |
+/// | Windows x86-64| 32 KiB | 4 KiB (VEH)   | 128 B    | ~36 KiB |
 ///
-/// The OS guard page accounts for the remaining gap vs. Go's ~2.4 KiB.
-/// Eliminating it would require compiler-generated `morestack` checks in
-/// every Rust function (not feasible without compiler changes); without them
-/// severe stack overflows would silently corrupt adjacent memory rather than
-/// crashing cleanly.
+/// The 32 KiB initial stack is sized for Rust's panic + libunwind unwind
+/// path (`_Unwind_RaiseException` + `unw_getcontext` together allocate
+/// ~12 KiB and overshoot a 4 KiB guard page in a single `sub rsp`
+/// instruction when starting from a smaller stack — see
+/// [`crate::runtime::stack::GOROUTINE_STACK_BYTES`] for the full rationale).
+/// Go achieves ~2.4 KiB per goroutine because the compiler emits
+/// `morestack` prologues that grow the stack safely before any frame is
+/// committed; without that compiler support, we must allocate enough up
+/// front to survive the deepest single-frame allocation we'll encounter.
 ///
 /// Byte offset of `G.stack.lo` within the G struct.  Used by Windows
 /// `mcall_asm` to restore TEB StackLimit after switching to g0.

@@ -33,7 +33,13 @@ and the contended path is made scheduler-safe via `entersyscall`/`exitsyscall`
   detection; `copystack` grows up to 1 GiB.  Bracketed with
   `casgstatus(GRUNNING→GCOPYSTACK→GRUNNING)` in v0.3.1.  Initial stack
   reduced from 64 KiB → 8 KiB → 2 KiB (release) to match Go's `stackMin`;
-  `G` descriptor compacted to 128 B in PR #14.
+  `G` descriptor compacted to 128 B in PR #14.  Later bumped back to
+  32 KiB in PR #31 — Rust's panic + libunwind unwind path allocates a
+  single ~12 KiB frame that overshoots the 4 KiB guard page when
+  starting from a smaller stack, and reactive growth past the guard is
+  unsafe (libunwind captures a register snapshot that gets invalidated
+  by a relocation).  See `STACK_MIN` (still 2 KiB, the absolute floor)
+  vs. `GOROUTINE_STACK_BYTES` (32 KiB release, the initial allocation).
 - **Async preemption** — ✅ v0.2.0: `SIGURG`-based preemption; `preemptm`
   transitions through `GPREEMPTED` (Go 1.14+ protocol) in v0.3.1.
 - **GC / write barriers / finalizers** — irrelevant; Rust owns memory.

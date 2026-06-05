@@ -492,10 +492,23 @@ mod tests {
     fn go_macro_spawns() {
         let count = Arc::new(AtomicI32::new(0));
         let c2    = Arc::clone(&count);
+        let c3    = Arc::clone(&count);
         run_impl(move || {
             go!(move || { c2.fetch_add(1, Ordering::Relaxed); });
-            // Yield enough times for the goroutine to run.
-            for _ in 0..50 { crate::gosched(); }
+            // Poll on the atomic with a wall-clock deadline instead of a
+            // fixed `gosched` count.  Each goroutine pays ~50 µs of startup
+            // (one-shot stack pre-grow + scheduler wakeup) before its closure
+            // runs; under heavy parallel test load (sysmon preemption, other
+            // tests' lingering Ms, signal handler queuing) that can briefly
+            // exceed any fixed yield count.  A wall-clock deadline keeps the
+            // test robust to those one-off spikes.
+            let deadline =
+                std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while c3.load(Ordering::Acquire) < 1
+                && std::time::Instant::now() < deadline
+            {
+                crate::gosched();
+            }
         });
         assert_eq!(count.load(Ordering::Acquire), 1);
     }
