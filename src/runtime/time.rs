@@ -169,6 +169,13 @@ fn fire_expired() {
         }
     }
 
+    // RCU read-side covers both the status check and the `goready` calls
+    // below.  The `to_wake` Vec holds `*mut G` pointers we loaded from
+    // TIMER_HEAP above.  Pairs with the run_impl Phase 2b drainer's
+    // `DrainSync` so a concurrent drain cannot free any of these `gp`
+    // pointers while we are using them.
+    let _cs = super::rcu::RcuGuard::new();
+
     for gp in to_wake {
         // Check the goroutine's status before calling goready.  If the
         // goroutine is still GRUNNABLE (preempted mid-sleep before gopark),

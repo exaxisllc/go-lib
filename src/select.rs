@@ -228,6 +228,13 @@ pub fn selectgo(cases: &mut [SCase], has_default: bool) -> (usize, bool) {
     }
 
     // ── 4. First pass: check each case in poll order ──────────────────────────
+    //
+    // RCU read-side covers `try_fn`'s dequeue (which loads a peer's `*mut G`
+    // out of a channel waitq), the lock releases below, and the eventual
+    // `goready(gp)` call.  Without the guard, a concurrent Phase 2b drainer
+    // could free the peer's `Box<G>` between the load inside `try_fn` and the
+    // `goready` call below, producing a use-after-free.
+    let _cs = crate::runtime::rcu::RcuGuard::new();
     for &i in &pollorder {
         let result = unsafe { (cases[i].try_fn)(cases[i].chan_ptr, cases[i].elem) };
         match result {
@@ -258,6 +265,7 @@ pub fn selectgo(cases: &mut [SCase], has_default: bool) -> (usize, bool) {
             }
         }
     }
+    drop(_cs);
 
     // ── 5. Default case ───────────────────────────────────────────────────────
     if has_default {

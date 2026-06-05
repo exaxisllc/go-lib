@@ -244,8 +244,13 @@ pub(crate) unsafe fn findrunnable() -> *mut G {
         }
 
         // ── 4. Non-blocking netpoll: check if any I/O goroutines are ready ──
+        //
+        // RCU read-side covers the netpoll result vector (which holds
+        // `*mut G` pointers loaded from REG) through the goready calls.
+        // Pairs with the run_impl Phase 2b drainer's `DrainSync`.
         {
             let ready = unsafe { super::netpoll::netpoll_wait(0) };
+            let _cs = super::rcu::RcuGuard::new();
             for gp in ready {
                 // Wake each I/O goroutine.  They are moved from Gwaiting →
                 // Grunnable and placed into the local P's run queue.

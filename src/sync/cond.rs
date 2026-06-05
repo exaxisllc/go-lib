@@ -121,6 +121,10 @@ impl Cond {
 
     /// Wake one waiting goroutine.  No-op if there are no waiters.
     pub fn notify_one(&self) {
+        // RCU read-side covers the pop from `waitq` and the goready call.
+        // Pairs with the run_impl Phase 2b drainer's `DrainSync` so a
+        // concurrent drain cannot free `gp` while we are using it.
+        let _cs = crate::runtime::rcu::RcuGuard::new();
         let gp = self.waitq.lock().unwrap().pop_front();
         if let Some(gp) = gp {
             // SAFETY: gp is a valid goroutine pointer (see module safety comment).
@@ -130,6 +134,9 @@ impl Cond {
 
     /// Wake all waiting goroutines.
     pub fn notify_all(&self) {
+        // RCU read-side covers the drain of `waitq` and every goready call.
+        // Pairs with the run_impl Phase 2b drainer's `DrainSync`.
+        let _cs = crate::runtime::rcu::RcuGuard::new();
         let waiters: Vec<*mut G> = self.waitq.lock().unwrap().drain(..).collect();
         for gp in waiters {
             // SAFETY: same as notify_one.

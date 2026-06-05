@@ -242,6 +242,10 @@ pub(crate) unsafe fn chansend<T: Send + 'static>(
     // ── Case 1: direct handoff to a waiting receiver ─────────────────────────
     let recv_sg = unsafe { state.recvq.dequeue() };
     if !recv_sg.is_null() {
+        // RCU read-side: covers the dereferences of the receiver G below.
+        // Pairs with the run_impl Phase 2b drainer's `DrainSync` so that a
+        // concurrent drain cannot free this `gp` while we are using it.
+        let _cs = crate::runtime::rcu::RcuGuard::new();
         let gp       = unsafe { (*recv_sg).g };
         // recv_sg.elem points to Option<T> (allocated by chanrecv or selectgo).
         let elem_ptr = unsafe { (*recv_sg).elem as *mut Option<T> };
@@ -469,6 +473,10 @@ fn recv_from_sender<T: Send + 'static>(
     state:   &mut HchanState<T>,
     send_sg: *mut Sudog,
 ) -> T {
+    // RCU read-side: covers the dereferences of the sender G below.  Pairs
+    // with the run_impl Phase 2b drainer's `DrainSync` so the drain cannot
+    // free `gp` while we are using it.
+    let _cs = crate::runtime::rcu::RcuGuard::new();
     let gp = unsafe { (*send_sg).g };
 
     let boxed = unsafe { (*send_sg).boxed_elem };
@@ -527,6 +535,12 @@ pub(crate) unsafe fn closechan<T: Send + 'static>(c: &Arc<Hchan<T>>) {
         panic!("close of closed channel");
     }
     state.closed = true;
+
+    // RCU read-side spans the entire load-and-wake sequence, including the
+    // dereferences of `(*sg).g` below and every `goready` call.  Pairs with
+    // the run_impl Phase 2b drainer's `DrainSync` so a concurrent drain
+    // cannot free any of these `gp` pointers while we are using them.
+    let _cs = crate::runtime::rcu::RcuGuard::new();
 
     let mut wakeup: Vec<*mut crate::runtime::g::G> = Vec::new();
 

@@ -109,6 +109,11 @@ impl WaitGroup {
         // same-thread re-lock blocks forever in `__psynch_mutexwait`).
         // Captured live via lldb on a hung `many_goroutines` run.
         let _lk = crate::runtime::m::m_lock();
+        // RCU read-side covers loading `*mut G` values out of the waiters Vec
+        // and the subsequent `goready` calls.  Pairs with the run_impl Phase
+        // 2b drainer's `DrainSync` so a concurrent drain cannot free any of
+        // these `gp` pointers while we are using them.
+        let _cs = crate::runtime::rcu::RcuGuard::new();
         // Collect goroutine waiters to wake (if counter reaches zero).
         let goroutine_waiters: Vec<*mut G> = {
             let mut state = self.state.lock().unwrap();
