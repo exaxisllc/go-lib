@@ -4,14 +4,16 @@
 //!
 //! ## v0.2.0 — dynamic stack growth
 //!
-//! Each goroutine starts with a 2 KiB stack in release builds (matching
-//! Go's `stackMin = 2048`).  Debug builds use larger initial sizes
-//! (Linux 16 KiB, macOS 64 KiB, Windows 64 KiB) to absorb the wider
-//! non-optimised frames produced by debug codegen — see
-//! [`GOROUTINE_STACK_BYTES`] for the full table.
-//! The guard page (`PROT_NONE`) immediately below `stack.lo` turns overflows
-//! into a `SIGSEGV` (Linux/Windows) or `SIGBUS` (macOS) that the runtime
-//! intercepts and recovers from by growing the stack.
+//! Each goroutine starts with a 32 KiB stack in release builds, sized to
+//! accommodate Rust's panic + libunwind unwind path without needing a
+//! reactive grow mid-unwind (which would invalidate libunwind's saved
+//! register snapshot).  Debug builds use 16 KiB on Linux and 64 KiB on
+//! macOS / Windows to absorb the wider non-optimised frames produced by
+//! debug codegen — see [`GOROUTINE_STACK_BYTES`] for the full table and
+//! [`STACK_MIN`] for the absolute floor.  The guard page (`PROT_NONE`)
+//! immediately below `stack.lo` turns overflows into a `SIGSEGV`
+//! (Linux/Windows) or `SIGBUS` (macOS) that the runtime intercepts and
+//! recovers from by growing the stack.
 //!
 //! When the guard page is touched:
 //! 1. `sigsegv_handler` identifies the fault as a goroutine stack overflow.
@@ -100,13 +102,14 @@ mod win32 {
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Minimum goroutine stack size (bytes).
+/// Absolute minimum goroutine stack size (bytes) — matches Go's
+/// `stackMin = 2048`.
 ///
-/// Matches Go's `stackMin = 2048`.  The stack grows on demand via the
-/// SIGBUS/SIGSEGV guard-page handler; 2 KiB is the initial allocation.
-/// Debug builds start larger to avoid frequently triggering the growth path
-/// with the deeper frames produced by non-optimised code.
-#[allow(dead_code)] // used in GOROUTINE_STACK_BYTES and documentation
+/// **Not** the initial allocation: see [`GOROUTINE_STACK_BYTES`] (release
+/// builds use 32 KiB, debug builds 16–64 KiB).  `STACK_MIN` is the lower
+/// bound below which the runtime will not allow a stack to shrink — useful
+/// when a future stack-shrink pass lands.
+#[allow(dead_code)] // reserved for future stack-shrink logic; doc-referenced.
 pub(crate) const STACK_MIN: usize = 2 * 1024;
 
 /// Maximum goroutine stack size (bytes). 1 GiB matches Go's `maxstacksize`.
@@ -118,54 +121,69 @@ pub(crate) const STACK_MAX: usize = 1024 * 1024 * 1024;
 ///
 /// | Platform      | Profile | Size  | Notes                                         |
 /// |---------------|---------|-------|-----------------------------------------------|
-/// | Linux release | release | 2 KiB | Matches Go's `stackMin`; grows on demand      |
-/// | Linux AArch64 | release | 2 KiB | Same; page_size = 4 KiB on most kernels       |
-/// | macOS release | release | 2 KiB | Guard-page faults raise SIGBUS, not SIGSEGV   |
-/// | Linux debug   | debug   | 16 KiB| Deeper frames avoid unnecessary growth        |
+/// | Linux release | release | 32 KiB| Sized for Rust panic + libunwind unwind path  |
+/// | Linux AArch64 | release | 32 KiB| Same; page_size = 4 KiB on most kernels       |
+/// | macOS release | release | 32 KiB| Guard-page faults raise SIGBUS, not SIGSEGV   |
+/// | Linux debug   | debug   | 16 KiB| Smaller for testing, exercises grow path      |
 /// | macOS debug   | debug   | 64 KiB| AArch64 CI: 16 KiB pages + wider debug frames |
 /// | Windows debug | debug   | 64 KiB| SEH/VEH overhead + 3–5× wider debug frames    |
-/// | Windows release| release| 2 KiB | Proactive growth handles overflow             |
+/// | Windows release| release| 32 KiB| Proactive growth still handles overflow       |
+///
+/// ## Why 32 KiB and not Go's 2 KiB minimum
+///
+/// Go's compiler emits per-function `morestack` checks that detect imminent
+/// stack exhaustion and call into the runtime to grow the stack BEFORE any
+/// frame is committed.  Without that compiler support, we rely on hardware
+/// guard pages: one PROT_NONE page below the usable stack.  Any write into
+/// the guard page traps, our SIGSEGV/SIGBUS handler grows the stack, and
+/// the OS retries the faulting instruction.
+///
+/// This works for ordinary functions whose prologues allocate at most one
+/// page of frame at a time.  It does **not** work for functions whose
+/// prologue `sub rsp, N` jumps past the entire guard page in one instruction
+/// — the first memory write then lands in unmapped territory below the
+/// guard, and the signal handler cannot safely recover (a register holding
+/// the overshot address cannot be adjusted without risking heap-pointer
+/// false positives; libunwind has already captured a register snapshot
+/// pointing into the pre-grow stack that gets invalidated by relocation).
+///
+/// Rust's panic path on macOS x86-64 hits this case:
+/// `_Unwind_RaiseException` alone allocates a ~3 KiB frame, and
+/// `unw_getcontext` allocates another ~8 KiB.  Combined with the few KiB of
+/// frames already on the stack at panic time, the deepest point of the
+/// unwind needs roughly 16 KiB of contiguous stack.  Allocating 32 KiB up
+/// front gives libunwind enough headroom that its prologue allocations stay
+/// within the usable region and the existing guard-page-based growth
+/// machinery handles the rest reactively.
 ///
 /// ## Per-goroutine memory (release builds)
 ///
 /// ```text
 /// Platform         Stack   OS guard   G struct   Total
 /// ───────────────  ──────  ─────────  ────────── ──────────
-/// Linux / Win x86  2 KiB   4 KiB      128 B      ~6.1 KiB
-/// macOS x86-64     2 KiB   4 KiB      128 B      ~6.1 KiB
-/// macOS AArch64    2 KiB  16 KiB      128 B      ~18 KiB
+/// Linux / Win x86  32 KiB   4 KiB      128 B      ~36 KiB
+/// macOS x86-64     32 KiB   4 KiB      128 B      ~36 KiB
+/// macOS AArch64    32 KiB  16 KiB      128 B      ~48 KiB
 /// ```
 ///
-/// Go achieves ~2.4 KiB (2 KiB stack + ~392 B descriptor, no OS guard page)
-/// by emitting `morestack` stack-check prologues from the compiler.  Without
-/// that compiler support, eliminating the OS guard page would turn stack
-/// overflows into silent memory corruption rather than a clean crash.
+/// This is significantly more than Go's ~6 KiB per goroutine.  The trade-off
+/// is dynamic-growth coverage: Go's compiler-emitted `morestack` prologue
+/// makes 2 KiB starts safe, but we lack that mechanism and so must allocate
+/// enough up front to survive the deepest single-frame allocation we will
+/// encounter (panic unwinding).
 // macOS and Windows debug builds use 64 KiB — enough for the wider
 // non-optimised frames produced by debug codegen, including the AArch64
 // 16 KiB page-size constraint on macOS.
 #[cfg(any(all(windows, debug_assertions), all(target_os = "macos", debug_assertions)))]
 pub(crate) const GOROUTINE_STACK_BYTES: usize = 64 * 1024;
-// Linux debug builds use 16 KiB — wider than release (2 KiB) but tight
-// enough to exercise the stack-growth path regularly.
-//
-// Historical note: these values were temporarily inflated to 128 KiB as
-// a work-around for async-preemption crashes that occurred shortly after
-// stack growth (wild dereferences in `atomic_compare_exchange_weak`, etc.).
-// The root causes have since been fixed:
-//   • PR #23 — narrowed callee-saved register adjustment in
-//     `update_sp_in_context` to guard-page-only range, eliminating
-//     false-positive adjustments of heap pointers after stack growth.
-//   • PR #24 — added `pushfq`/`popfq` to `async_preempt_trampoline` to
-//     preserve RFLAGS across preemption, fixing iterator corruption.
-//   • PR #25 — added `-C no-redzone=yes` so the trampoline's register
-//     saves never clobber the red zone of the interrupted leaf function;
-//     added `m_lock()` to `goexit0_handler` to prevent SIGURG from
-//     overwriting `gp.sched.pc` during goexit.
-// The original sizes are restored now that all three root causes are fixed.
+// Linux debug: 16 KiB — smaller than the release default so the grow path
+// stays exercised under tests.
 #[cfg(all(debug_assertions, not(any(windows, target_os = "macos"))))]
 pub(crate) const GOROUTINE_STACK_BYTES: usize = 16 * 1024;
+// All release builds: 32 KiB.  See doc-comment for the rationale (panic-safe
+// minimum on macOS x86-64).
 #[cfg(not(debug_assertions))]
-pub(crate) const GOROUTINE_STACK_BYTES: usize = STACK_MIN;
+pub(crate) const GOROUTINE_STACK_BYTES: usize = 32 * 1024;
 
 /// Stack size for each M's g0 (the scheduler stack).
 ///
@@ -791,10 +809,13 @@ unsafe fn update_sp_in_context(
 /// We use `STACK_GUARD` (928 bytes) as the low-water mark, matching Go's
 /// `stackGuard`.  This leaves exactly one guard zone of headroom — enough
 /// for a typical scheduler-call depth — before triggering a doubling.
-/// Using `2 × STACK_GUARD` was excessively conservative: on a 2 KiB initial
-/// stack it left only 192 bytes of effective space (`2048 − 1856 = 192`)
-/// and would force almost every goroutine to grow on its first scheduling
-/// point even when the stack is far from exhausted.
+/// Using `2 × STACK_GUARD` was excessively conservative when the runtime
+/// previously started goroutines at `STACK_MIN` (2 KiB): it left only
+/// 192 bytes of effective space (`2048 − 1856 = 192`) and would force
+/// almost every goroutine to grow on its first scheduling point even when
+/// the stack was far from exhausted.  The same principle applies at the
+/// current 32 KiB initial size — the smaller the threshold, the less
+/// reactive growth needed for ordinary deep call chains.
 ///
 /// The reactive SIGBUS/SIGSEGV growth handler remains the safety net for the
 /// rare case where a goroutine exhausts the remaining guard zone between two

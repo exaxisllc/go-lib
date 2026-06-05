@@ -816,6 +816,7 @@ mod tests {
         let wins = Arc::new(AtomicI32::new(0));
         let wins2 = Arc::clone(&wins);
         let wins3 = Arc::clone(&wins);
+        let wins4 = Arc::clone(&wins);
 
         run_impl(move || {
             let (tx, rx) = chan::<i32>(1);
@@ -843,8 +844,19 @@ mod tests {
                 }
             });
 
-            // Give goroutines time to race.
-            for _ in 0..200 { crate::gosched(); }
+            // Poll on the atomic with a wall-clock deadline so the test is
+            // robust to per-goroutine startup latency (a one-shot stack
+            // pre-grow + scheduler wakeup is ~50 µs, and the loser goroutine
+            // blocks forever in selectgo — we just need the winner to record
+            // its win).  Five seconds is comfortable headroom even on slow
+            // CI runners.
+            let deadline =
+                std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while wins4.load(Ordering::Acquire) < 1
+                && std::time::Instant::now() < deadline
+            {
+                crate::gosched();
+            }
         });
 
         // Exactly one goroutine should have received the value.
