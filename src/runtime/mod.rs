@@ -47,6 +47,7 @@
 pub(crate) mod g;
 pub(crate) mod m;
 pub(crate) mod rawmutex;
+pub(crate) mod rcu;
 pub(crate) mod netpoll;
 pub(crate) mod p;
 pub(crate) mod park;

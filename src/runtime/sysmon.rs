@@ -123,10 +123,15 @@ fn sysmon_loop() {
         // ── Netpoll: wake goroutines whose I/O is ready ───────────────────
         // Use a non-blocking poll here (0 ms timeout); sysmon must not block
         // indefinitely or it will miss retake/preempt duties.
+        //
+        // RCU read-side covers the netpoll result vector (which holds
+        // `*mut G` pointers loaded from REG) through the goready calls.
+        // Pairs with the run_impl Phase 2b drainer's `DrainSync`.
         {
             let ready = unsafe { super::netpoll::netpoll_wait(0) };
             if !ready.is_empty() {
                 idle = 0;
+                let _cs = super::rcu::RcuGuard::new();
                 for gp in ready {
                     unsafe { super::park::goready(gp) };
                 }
