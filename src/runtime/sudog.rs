@@ -108,6 +108,28 @@ pub(crate) struct Sudog {
     ///
     /// Typed `*mut u8` until `chan::Hchan` is defined (step 13).
     pub c: *mut u8,
+
+    /// Next Sudog in the **per-G** linked list rooted at `G.waiting_sudogs`.
+    ///
+    /// Distinct from `next` (which links sudogs within a single channel's
+    /// `WaitQ`).  This field links every sudog owned by the same goroutine —
+    /// usually just one for plain channel send/recv, but several for
+    /// `select!` (one per case).  Used by the Phase 2b drain to find every
+    /// channel waitq the doomed goroutine is registered with so the drain
+    /// can unlink each sudog before freeing the `Box<G>`.
+    pub g_link_next: *mut Sudog,
+
+    /// Type-erased channel-unlink function used by the Phase 2b drain.
+    ///
+    /// When a sudog is enqueued on a typed `Hchan<T>` channel, the channel
+    /// stores a monomorphised `unlink_sudog_for_drain::<T>` pointer here.
+    /// The drain calls it as `unlink_for_drain(c, sudog)` to remove `sudog`
+    /// from whichever queue it lives in without needing to know `T`.
+    ///
+    /// `None` if the sudog is not currently enqueued (e.g. fresh from
+    /// `acquire_sudog` or just `release_sudog`-bound).
+    pub unlink_for_drain:
+        Option<unsafe extern "C" fn(channel: *mut u8, sudog: *mut Sudog)>,
 }
 
 // SAFETY: Sudog instances are exchanged between goroutines only through the
@@ -129,6 +151,8 @@ impl Sudog {
             success:    false,
             boxed_elem: false,
             c:          std::ptr::null_mut(),
+            g_link_next: std::ptr::null_mut(),
+            unlink_for_drain: None,
         }
     }
 }

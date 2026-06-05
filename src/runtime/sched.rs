@@ -1933,6 +1933,94 @@ unsafe fn spawn_m(id: i64, p: *mut P) {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 2b helper — unregister a doomed G from every waker that holds it
+// ---------------------------------------------------------------------------
+
+/// Walk the `waiting_*` tracking on `gp` and remove the stale `*mut G`
+/// pointer from every waker that is registered with it.  Called by the
+/// Phase 2b drain in `run_impl` exactly once per drained goroutine,
+/// immediately after the GWAITING → GDEAD CAS and before the `DrainSync`
+/// barrier.
+///
+/// After this function returns:
+/// * No `Sudog.g == gp` in any channel's `sendq` / `recvq`.
+/// * No `WaitGroup.waiters` entry equals `gp`.
+/// * No `Cond.waitq` entry equals `gp`.
+/// * `gp.waiting_sudogs`, `gp.waiting_wg`, `gp.waiting_cond` are cleared.
+///
+/// # Safety
+/// `gp` must be a live `*mut G` whose `atomicstatus` is already `GDEAD` (so
+/// no normal waker can transition it again).  Callers in `run_impl` ensure
+/// this via the CAS done immediately before invoking this helper.
+unsafe fn unregister_drained_g(gp: *mut G) {
+    use super::sudog::release_sudog;
+
+    // ── Channel sudogs ──────────────────────────────────────────────────────
+    //
+    // Walk gp.waiting_sudogs (intrusive list via Sudog.g_link_next).  Each
+    // sudog has `c` pointing at its `Hchan` and `unlink_for_drain` pointing
+    // at a monomorphised helper that knows the channel's `T`.  We lock the
+    // channel by its mutex (at offset 0 of `Hchan<T>`), call the helper to
+    // remove the sudog from its sendq/recvq, then release the sudog.
+    let mut sudog_head = unsafe { (*gp).waiting_sudogs };
+    while !sudog_head.is_null() {
+        let sg = sudog_head;
+        let next = unsafe { (*sg).g_link_next };
+        sudog_head = next;
+
+        let chan_ptr = unsafe { (*sg).c };
+        let unlink_fn = unsafe { (*sg).unlink_for_drain };
+        if !chan_ptr.is_null() && unlink_fn.is_some() {
+            let mu = chan_ptr as *const super::rawmutex::RawMutex;
+            // SAFETY: the user-side Hchan<T> Arc is held by goroutines we
+            // have just CAS'd to GDEAD, but the Arc allocation itself stays
+            // mapped (closure-capture leak — see run_impl doc-comment).  No
+            // concurrent user code is running because ACTIVE_RUN_IMPLS holds
+            // the entry lock.
+            unsafe { (*mu).lock() };
+            // SAFETY: `unlink_fn` is the monomorphised
+            // `chan::unlink_sudog_for_drain::<T>` for the T of this channel,
+            // stored when the sudog was enqueued (`chansend`/`chanrecv`/
+            // `selectgo`).  It expects the channel pointer and a sudog
+            // pointer; both are valid here.
+            unsafe { unlink_fn.unwrap_unchecked()(chan_ptr, sg) };
+            unsafe { (*mu).unlock() };
+        }
+
+        unsafe {
+            (*sg).g = std::ptr::null_mut();
+            (*sg).c = std::ptr::null_mut();
+            // sudog.elem may still point to a `Box<ManuallyDrop<T>>` (send)
+            // or `Box<Option<T>>` (recv).  We do not know `T` at this layer,
+            // so the boxed value leaks — same class of leak as the closure
+            // captures on the freed goroutine stack.  Documented in the
+            // run_impl Phase 2b comment.
+            (*sg).elem = std::ptr::null_mut();
+            (*sg).g_link_next = std::ptr::null_mut();
+            (*sg).unlink_for_drain = None;
+            release_sudog(sg);
+        }
+    }
+    unsafe { (*gp).waiting_sudogs = std::ptr::null_mut() };
+
+    // ── WaitGroup ──────────────────────────────────────────────────────────
+    let wg_ptr = unsafe { (*gp).waiting_wg };
+    if !wg_ptr.is_null() {
+        let wg = wg_ptr as *const crate::sync::WaitGroup;
+        unsafe { (*wg).remove_waiter(gp) };
+        unsafe { (*gp).waiting_wg = std::ptr::null_mut() };
+    }
+
+    // ── Cond ───────────────────────────────────────────────────────────────
+    let cond_ptr = unsafe { (*gp).waiting_cond };
+    if !cond_ptr.is_null() {
+        let cond = cond_ptr as *const crate::sync::Cond;
+        unsafe { (*cond).remove_waiter(gp) };
+        unsafe { (*gp).waiting_cond = std::ptr::null_mut() };
+    }
+}
+
+// ---------------------------------------------------------------------------
 // run_impl — public entry point (exposed as go_lib::run)
 // ---------------------------------------------------------------------------
 
@@ -1962,6 +2050,35 @@ unsafe fn spawn_m(id: i64, p: *mut P) {
 /// even when the goroutine panics.
 ///
 /// Ported from the Go runtime bootstrap (`runtime·rt0_go` → `main.main`).
+/// Reference count of in-flight `run_impl` invocations.
+///
+/// Phase 2b's GWAITING-goroutine drain walks the global `Sched::allg` list
+/// and CASes each waiting goroutine to GDEAD before reclaiming its stack.
+/// `allg` is shared across all concurrent `run_impl` calls (the scheduler
+/// singleton is process-global), so an unconditional drain at every exit
+/// would reclaim goroutines spawned by **other** still-live `run_impl`
+/// invocations — the same trap that retired the original Phase 2a drain.
+///
+/// We dodge that by draining only when this counter drops to zero, i.e. when
+/// the currently-exiting `run_impl` is the last one in the process.  In the
+/// common single-run_impl-at-a-time case (production daemons, sequential
+/// tests with `--test-threads=1`) the drain runs at every exit and reclaims
+/// memory promptly; in the parallel-test case it runs only at the moment
+/// when all parallel tests have left `run_impl`, which is still enough to
+/// keep total memory bounded across the test session.
+///
+/// The Mutex provides both the counter and the serialisation between exit
+/// (decrement + drain decision) and any concurrent entry (increment): a new
+/// `run_impl` that wants to enter while a drain is running blocks on the
+/// lock, so the drain sees a stable count of zero throughout.
+static ACTIVE_RUN_IMPLS: Mutex<u32> = Mutex::new(0);
+
+/// Total number of goroutines transitioned `GWAITING → GDEAD` by Phase 2b
+/// drains across all `run_impl` exits.  Used by `phase_2b_drain_reclaims_gwaiting`
+/// to verify the drain code path executed at least once during the test run.
+#[cfg(test)]
+pub(crate) static PHASE_2B_DRAINED_COUNT: AtomicU64 = AtomicU64::new(0);
+
 pub(crate) fn run_impl<F, R>(f: F) -> R
 where
     F: FnOnce() -> R + Send + 'static,
@@ -1972,6 +2089,11 @@ where
         .unwrap_or(1);
 
     schedinit(nprocs);
+
+    // Register as an active run_impl so the Phase 2b drain (below) can detect
+    // whether it is safe to reclaim GWAITING goroutines.  See the doc-comment
+    // on `ACTIVE_RUN_IMPLS` for the full rationale.
+    *ACTIVE_RUN_IMPLS.lock().unwrap() += 1;
 
     // Drop guard: unparks the calling thread whether `f` returns or panics.
     struct UnparkOnDrop(std::thread::Thread);
@@ -2031,9 +2153,123 @@ where
     // GRUNNABLE goroutines left in queues are safe: M-threads loop forever in
     // schedule() and will eventually pop and execute every queued goroutine.
     // When each goroutine completes, goexit0 (Phase 1) frees its stack and
-    // Box<G>.  The only allocations that are not reclaimed by Phase 1 alone
-    // are those of goroutines still in GWAITING state — the subject of the
-    // deferred Phase 2b.
+    // Box<G>.
+
+    // ── Phase 2b: drain GWAITING goroutines ──────────────────────────────────
+    //
+    // Reclaim every goroutine still parked in a channel, WaitGroup, Cond,
+    // timer, or netpoll wait queue.  We do this only when we are the *last*
+    // in-flight `run_impl` (see ACTIVE_RUN_IMPLS) so we don't reclaim
+    // goroutines spawned by other concurrent invocations.
+    //
+    // For each goroutine we drain we reclaim:
+    //   * The stack — the big mmap'd region (32 KiB – 1 GiB) — via stack_free.
+    //   * The Box<G> — the 128 B descriptor.
+    //   * Membership in `allg`.
+    //
+    // Safety of freeing the Box (Phase 2b's hard problem):
+    //
+    //   1. We CAS each GWAITING → GDEAD on `allg`, so any concurrent
+    //      `goready(gp)` already in flight observes GDEAD and returns early
+    //      via the guard added in PR #29.
+    //
+    //   2. We walk each drained gp's tracked wakers (G.waiting_sudogs /
+    //      G.waiting_wg / G.waiting_cond — added in this PR) and unregister
+    //      it from every channel waitq / WaitGroup / Cond that holds its
+    //      pointer.  Timer entries are dropped wholesale by
+    //      `drain_timer_heap_for_shutdown`; netpoll registrations were
+    //      cleared up-front by `netpoll_clear_reg`.  After this step **no
+    //      waker holds a stale `*mut G`** — any future `goready` invocation
+    //      cannot load one of our gp pointers, so cannot dereference it
+    //      after we free.
+    //
+    //   3. We hold a `DrainSync` (PR #32) across the actual frees.  That
+    //      blocks any new `goready` callers from entering their RCU
+    //      read-side CS and waits for any in-flight ones to finish.
+    //      Combined with step 2 this means no thread can be dereferencing
+    //      or about to dereference one of our gp pointers when we free.
+    //
+    // What still leaks (irreducible without compiler support):
+    //   * Closure captures on the freed stack (Arc<Hchan>, Arc<WaitGroup>,
+    //     boxed sudog elem, …) — we cannot enumerate stack-rooted values
+    //     without compiler-emitted stack maps, so their `Drop` impls don't
+    //     run.  The pointed-to allocations stay mapped until process exit.
+    //     The leak is bounded by the captures of every drained goroutine.
+    {
+        let mut active = ACTIVE_RUN_IMPLS.lock().unwrap();
+        debug_assert!(*active >= 1, "ACTIVE_RUN_IMPLS underflow");
+        *active -= 1;
+        if *active == 0 {
+            // We're the last; safe to drain.
+            //
+            // Drain pending timers first so the timer thread cannot fire one
+            // of these GWAITING goroutines between our CAS and our stack
+            // free.  (The fire would observe GDEAD via the goready guard,
+            // but the diagnostic is cleaner if no fires happen at all.)
+            super::time::drain_timer_heap_for_shutdown();
+
+            // Collect every gp that we can transition GWAITING → GDEAD.
+            // A goroutine that races us (e.g. a peer wakes it while we're
+            // looping) fails our CAS — we skip it; it will run normally.
+            let drained: Vec<*mut G> = {
+                let allg = sched().allg.lock().unwrap();
+                allg.iter()
+                    .filter_map(|&gp| {
+                        let ok = unsafe {
+                            (*gp).atomicstatus
+                                .compare_exchange(
+                                    super::g::GWAITING,
+                                    GDEAD,
+                                    AcqRel,
+                                    Relaxed,
+                                )
+                                .is_ok()
+                        };
+                        if ok { Some(gp) } else { None }
+                    })
+                    .collect()
+            };
+
+            if !drained.is_empty() {
+                // Step 2: unregister each drained gp from every waker that
+                // holds its pointer.  After this loop, no Sudog in any
+                // channel waitq has `sudog.g == gp`, no WaitGroup.waiters
+                // contains gp, no Cond.waitq contains gp.
+                for &gp in &drained {
+                    unsafe { unregister_drained_g(gp) };
+                }
+
+                // Step 3: barrier — block new RCU read-side CSes and wait
+                // for in-flight ones to finish.  Combined with step 2 this
+                // means no thread can dereference one of our gps now.
+                let _sync = super::rcu::DrainSync::new();
+
+                // Step 4: reclaim stacks and Box<G> descriptors.
+                for &gp in &drained {
+                    let stack = unsafe { (*gp).stack };
+                    unsafe { super::stack::stack_free(&stack) };
+                    // SAFETY: gp came from `Box::into_raw` in `new_goroutine`
+                    // (PR #29).  Step 2 cleared every reference to gp; step 3
+                    // ensured no in-flight dereference is pending.  We are
+                    // now the sole owner — drop the Box.
+                    unsafe { drop(Box::from_raw(gp)) };
+                }
+
+                // Remove drained goroutines from `allg`.
+                //
+                // Done with raw pointer equality (the Boxes are freed, so
+                // `contains` is the same pattern as everywhere else — we
+                // only use the addresses, not load through them).
+                let mut allg = sched().allg.lock().unwrap();
+                allg.retain(|gp| !drained.contains(gp));
+
+                // Telemetry: tests read this to verify the drain ran.
+                #[cfg(test)]
+                PHASE_2B_DRAINED_COUNT
+                    .fetch_add(drained.len() as u64, Relaxed);
+            }
+        }
+    }
 
     match slot.lock().unwrap().take() {
         Some(Ok(v))       => v,
@@ -2057,6 +2293,7 @@ where
 #[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
 
     // ── Singleton tests ───────────────────────────────────────────────────
 
@@ -2209,5 +2446,72 @@ mod tests {
                 unsafe { gosched() };
             }
         });
+    }
+
+    /// Phase 2b drain: a goroutine that parks on an unreachable channel
+    /// gets removed from `allg` by `run_impl` exit (when this is the last
+    /// in-flight run).
+    ///
+    /// Spawns goroutines that block on `rx.recv()` of a buffered channel
+    /// whose `tx` is captured by the wrapper but never written to.  They
+    /// have no path to be woken, so they stay GWAITING when the wrapper
+    /// returns.  After `run_impl` returns, the drain should have
+    /// transitioned them to GDEAD and reclaimed their stacks.
+    ///
+    /// Because `cargo test` runs tests in parallel by default and Phase 2b
+    /// only fires when *no other* `run_impl` is in flight, the drain may
+    /// not run on every invocation of this test.  Instead of asserting on
+    /// `allg` (which is shared and noisy), we observe a global counter
+    /// (`PHASE_2B_DRAINED_COUNT`) that increments by the number of
+    /// goroutines drained on each successful drain.  We repeat the
+    /// test body in a loop until the counter has advanced, with a
+    /// generous deadline — every test in this binary spawns its own
+    /// goroutines, so a drain firing somewhere is overwhelmingly likely
+    /// within the deadline.
+    #[test]
+    fn phase_2b_drain_reclaims_gwaiting() {
+        use crate::chan::chan;
+
+        let baseline = PHASE_2B_DRAINED_COUNT.load(Ordering::Acquire);
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(10);
+
+        loop {
+            run_impl(|| {
+                let (tx, rx) = chan::<i32>(0);
+                // Keep the sender alive in the wrapper's closure so the
+                // channel is not dropped (which would drop its waitq).  The
+                // receiver(s) below will park on a live channel that no one
+                // ever sends to.
+                let _tx_alive = tx;
+
+                for _ in 0..3 {
+                    let rx2 = rx.clone();
+                    spawn_goroutine(move || {
+                        // Parks in GWAITING and is never woken — Phase 2b
+                        // drain transitions it to GDEAD.
+                        let _ = rx2.recv();
+                    });
+                }
+                // Give the children quanta to reach gopark.
+                for _ in 0..50 {
+                    unsafe { gosched() };
+                }
+            });
+
+            // If the drain fired (we were the last in-flight run_impl),
+            // we should see the counter advance by at least 3.
+            let now = PHASE_2B_DRAINED_COUNT.load(Ordering::Acquire);
+            if now >= baseline + 3 {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Phase 2b drain did not fire within deadline: \
+                 baseline={baseline}, observed={now}",
+            );
+            // Try again — another test may have been concurrently in
+            // run_impl, blocking our drain.
+        }
     }
 }
