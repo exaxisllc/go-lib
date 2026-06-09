@@ -47,7 +47,7 @@ jobs:
         # (e.g. STATUS_ACCESS_VIOLATION on Windows).
         # timeout-minutes: guard against a run_impl park() hang on slow runners.
         timeout-minutes: 10
-        run: cargo test -- --nocapture
+        run: cargo test --release -- --nocapture
 
       - name: Print Windows VEH crash file (if present)
         if: runner.os == 'Windows'
@@ -62,6 +62,19 @@ jobs:
           } else {
             Write-Host "(no crash file — process either did not crash or VEH was not reached)"
           }
+
+      - name: cargo run --examples
+        timeout-minutes: 10
+        run: |
+          cargo run --release --example attr_run
+          cargo run --release --example cond
+          cargo run --release --example hello
+          cargo run --release --example main_exitcode
+          cargo run --release --example main_result
+          cargo run --release --example pipeline
+          cargo run --release --example scope
+          cargo run --release --example scope_channel
+          cargo run --release --example select_fanin
 
       - name: cargo doc (no deps, no-run)
         run: cargo doc --no-deps
