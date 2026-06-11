@@ -50,7 +50,9 @@ jobs:
         run: cargo test --release -- --nocapture
 
       - name: Print Windows VEH crash file (if present)
-        if: runner.os == 'Windows'
+        # always(): the crash file matters most when `cargo test` just failed,
+        # which would otherwise skip this step entirely.
+        if: always() && runner.os == 'Windows'
         shell: pwsh
         # The VEH writes .\go-lib-crash-veh.txt on crash.  Print it so the
         # diagnostics appear in the CI log even when the test binary exits via

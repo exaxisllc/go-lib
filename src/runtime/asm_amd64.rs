@@ -108,9 +108,8 @@ pub(crate) unsafe extern "C" fn gogo_asm(buf: *mut Gobuf) -> ! {
 }
 
 // Microsoft x64 ABI (Windows): first argument in rcx.
-// Microsoft x64 callee-saved GPRs add RDI and RSI vs. System V.
-// (Microsoft x64 also has callee-saved XMM6-15; not yet saved here — see
-// the FIXME in mcall_asm below.)
+// Microsoft x64 callee-saved GPRs add RDI and RSI vs. System V, plus the
+// full 128 bits of XMM6–XMM15.
 #[cfg(windows)]
 #[unsafe(naked)]
 pub(crate) unsafe extern "C" fn gogo_asm(buf: *mut Gobuf) -> ! {
@@ -123,6 +122,17 @@ pub(crate) unsafe extern "C" fn gogo_asm(buf: *mut Gobuf) -> ! {
         "mov r13, [rcx + {regs} + 32]",
         "mov r14, [rcx + {regs} + 40]",
         "mov r15, [rcx + {regs} + 48]",
+        // Restore callee-saved XMM6–15 (full 128 bits, saved by mcall_asm).
+        "movdqu xmm6,  [rcx + {regs} + 56]",
+        "movdqu xmm7,  [rcx + {regs} + 72]",
+        "movdqu xmm8,  [rcx + {regs} + 88]",
+        "movdqu xmm9,  [rcx + {regs} + 104]",
+        "movdqu xmm10, [rcx + {regs} + 120]",
+        "movdqu xmm11, [rcx + {regs} + 136]",
+        "movdqu xmm12, [rcx + {regs} + 152]",
+        "movdqu xmm13, [rcx + {regs} + 168]",
+        "movdqu xmm14, [rcx + {regs} + 184]",
+        "movdqu xmm15, [rcx + {regs} + 200]",
         "mov rax, [rcx + {pc}]",   // rax = gobuf.pc  (load before stack switch)
         "mov rbp, [rcx + {bp}]",   // rbp = gobuf.bp  (frame pointer)
         "mov rsp, [rcx + {sp}]",   // rsp = gobuf.sp  (stack switch — do last)
@@ -220,11 +230,14 @@ pub(crate) unsafe extern "C" fn mcall_asm(
 
 // Microsoft x64 ABI (Windows): args in rcx, rdx, r8, r9.
 //
-// Microsoft x64 callee-saved GPRs: RBX, RBP, RDI, RSI, R12, R13, R14, R15.
-// We save all of them except RBP (already saved separately in `g_sched.bp`).
-// FIXME: Microsoft x64 ALSO requires XMM6–15 to be callee-saved.  Not saved
-// here yet — goroutines that hold SSE state across `mcall` may still corrupt.
-// Tracked as a follow-up.
+// Microsoft x64 callee-saved registers: RBX, RBP, RDI, RSI, R12–R15, plus
+// the full 128 bits of XMM6–XMM15.  We save all of them except RBP (already
+// saved separately in `g_sched.bp`); the XMM slots live in the same
+// `gobuf.regs` array after the GPRs and are accessed with `movdqu` because
+// the array is only 8-byte aligned.  Missing the XMM saves manifested as
+// STATUS_HEAP_CORRUPTION on Windows CI: a resumed goroutine continued with
+// scheduler garbage in XMM6+, corrupting whatever its vectorised code
+// touched next.
 #[cfg(windows)]
 #[unsafe(naked)]
 pub(crate) unsafe extern "C" fn mcall_asm(
@@ -251,6 +264,19 @@ pub(crate) unsafe extern "C" fn mcall_asm(
         "mov [rdx + {regs} + 32], r13",
         "mov [rdx + {regs} + 40], r14",
         "mov [rdx + {regs} + 48], r15",
+
+        // ── save callee-saved XMM6–15 (Microsoft x64, full 128 bits each) ─
+        // movdqu: the regs array is only 8-byte aligned.
+        "movdqu [rdx + {regs} + 56],  xmm6",
+        "movdqu [rdx + {regs} + 72],  xmm7",
+        "movdqu [rdx + {regs} + 88],  xmm8",
+        "movdqu [rdx + {regs} + 104], xmm9",
+        "movdqu [rdx + {regs} + 120], xmm10",
+        "movdqu [rdx + {regs} + 136], xmm11",
+        "movdqu [rdx + {regs} + 152], xmm12",
+        "movdqu [rdx + {regs} + 168], xmm13",
+        "movdqu [rdx + {regs} + 184], xmm14",
+        "movdqu [rdx + {regs} + 200], xmm15",
 
         // ── switch to g0's stack (r8 = g0_gobuf) ─────────────────────────
         "mov rsp, [r8 + {sp}]",            // rsp = g0.sp (= g0.stack.hi — top of allocation)

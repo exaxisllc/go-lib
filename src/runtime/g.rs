@@ -129,7 +129,9 @@ pub(crate) struct Gobuf {
     /// Callee-saved register slots — see the doc-comment above.
     /// Layout per platform:
     ///   System V AMD64 (Linux/macOS x86_64): [rbx, r12, r13, r14, r15]
-    ///   Microsoft x64 (Windows x86_64):      [rbx, rdi, rsi, r12, r13, r14, r15]
+    ///   Microsoft x64 (Windows x86_64):      [rbx, rdi, rsi, r12, r13, r14,
+    ///                                         r15, xmm6..xmm15 (2 slots each,
+    ///                                         stored with movdqu)]
     ///   AArch64 (AAPCS64, all OS):           [x19..x28, d8..d15]
     pub regs: [usize; CALLEE_SAVED_GPR_COUNT],
 }
@@ -137,16 +139,14 @@ pub(crate) struct Gobuf {
 /// Number of callee-saved register slots in [`Gobuf::regs`].
 ///
 /// - System V AMD64: 5  (RBX, R12, R13, R14, R15)
-/// - Microsoft x64:  7  (RBX, RDI, RSI, R12, R13, R14, R15)
+/// - Microsoft x64:  27 (RBX, RDI, RSI, R12–R15, plus XMM6–XMM15 — each XMM
+///   is a full 128 bits = 2 slots, saved/restored with `movdqu` so the array
+///   needs no 16-byte alignment)
 /// - AArch64:        18 (x19–x28 + d8–d15)
-///
-/// (Microsoft x64 callee-saved XMM6–15 are not currently saved; goroutine
-/// code on Windows that holds vector state across `mcall` may still corrupt.
-/// See `mcall_asm` for the open follow-up.)
 #[cfg(all(target_arch = "x86_64", not(windows)))]
 pub(crate) const CALLEE_SAVED_GPR_COUNT: usize = 5;
 #[cfg(all(target_arch = "x86_64", windows))]
-pub(crate) const CALLEE_SAVED_GPR_COUNT: usize = 7;
+pub(crate) const CALLEE_SAVED_GPR_COUNT: usize = 27;
 #[cfg(target_arch = "aarch64")]
 pub(crate) const CALLEE_SAVED_GPR_COUNT: usize = 18;
 
@@ -327,7 +327,8 @@ const _: () = {
 
     // Lock the compact layout.  Size varies by platform:
     //   System V AMD64 (Linux/macOS x86_64): 5  callee-save regs → Gobuf 96 B  → G 192 B
-    //   Microsoft x64 (Windows x86_64):      7  callee-save regs → Gobuf 112 B → G 208 B
+    //   Microsoft x64 (Windows x86_64):      27 callee-save regs → Gobuf 272 B → G 368 B
+    //                                        (7 GPRs + 10 × 128-bit XMM6–15)
     //   AArch64 (all OS):                    18 callee-save regs → Gobuf 200 B → G 296 B
     //
     // The 96-byte non-Gobuf portion is the same on every platform.  The
