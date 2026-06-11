@@ -2535,6 +2535,71 @@ mod tests {
         });
     }
 
+    /// Regression test: retiring a goroutine must not leave `m.locks`
+    /// elevated.
+    ///
+    /// `goexit_trampoline` / `goexit0_handler` bump `m.locks` before
+    /// `mcall(gp, goexit0)`.  Since mcall never returns there, the count must
+    /// be released inside `goexit0` itself; if it leaked, every M that ever
+    /// retired a goroutine would keep `locks > 0` forever, permanently
+    /// disabling SIGURG async preemption on that M (sigurg_handler Guard 0).
+    ///
+    /// Strategy: retire a batch of goroutines (each exit runs the goexit path
+    /// on some M), then run a second batch of checkers, each recording the
+    /// `locks` value of the M it starts on.  At goroutine entry no MLockGuard
+    /// is held, so every observed value must be 0.  With the leak, any
+    /// checker scheduled onto an M that retired a first-batch goroutine
+    /// observes `locks >= 1`.
+    #[test]
+    fn goroutine_exit_releases_m_locks() {
+        use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        const N: usize = 64;
+
+        let exited    = Arc::new(AtomicUsize::new(0));
+        let checked   = Arc::new(AtomicUsize::new(0));
+        let max_locks = Arc::new(AtomicI32::new(0));
+
+        let exited_w    = Arc::clone(&exited);
+        let checked_w   = Arc::clone(&checked);
+        let max_locks_w = Arc::clone(&max_locks);
+
+        run_impl(move || {
+            // Batch 1: N goroutines that immediately exit.
+            for _ in 0..N {
+                let exited = Arc::clone(&exited_w);
+                spawn_goroutine(move || {
+                    exited.fetch_add(1, Ordering::AcqRel);
+                });
+            }
+            while exited_w.load(Ordering::Acquire) < N {
+                unsafe { gosched() };
+            }
+
+            // Batch 2: N checkers recording their M's `locks` at entry.
+            for _ in 0..N {
+                let checked   = Arc::clone(&checked_w);
+                let max_locks = Arc::clone(&max_locks_w);
+                spawn_goroutine(move || {
+                    let locks = unsafe { (*current_m()).locks };
+                    max_locks.fetch_max(locks, Ordering::AcqRel);
+                    checked.fetch_add(1, Ordering::AcqRel);
+                });
+            }
+            while checked_w.load(Ordering::Acquire) < N {
+                unsafe { gosched() };
+            }
+        });
+
+        assert_eq!(
+            max_locks.load(Ordering::Acquire),
+            0,
+            "m.locks did not return to 0 after goroutine exits — the goexit \
+             path leaked an increment, permanently disabling async preemption"
+        );
+    }
+
     /// Phase 2b drain: a goroutine that parks on an unreachable channel
     /// gets removed from `allg` by `run_impl` exit (when this is the last
     /// in-flight run).
