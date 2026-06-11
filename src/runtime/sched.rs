@@ -793,12 +793,19 @@ fn pc_in_scheduler_asm(pc: usize) -> bool {
         goexit0_handler                            as *const () as usize,
     ];
     #[cfg(target_arch = "aarch64")]
-    let bases: [usize; 4] = [
+    let bases: [usize; 6] = [
         super::asm_arm64::async_preempt_trampoline as *const () as usize,
         super::asm_arm64::gogo                     as *const () as usize,
         super::asm_arm64::mcall                    as *const () as usize,
-        // Same pre-lock window as AMD64: goexit_trampoline calls m_lock() but
-        // the TLS accessor runs before m.locks is incremented.
+        // The naked context-switch bodies must be covered explicitly — the
+        // linker may place them more than ASM_FN_MAX_BYTES away from their
+        // Rust wrappers, leaving a window where SIGURG could redirect
+        // mid-switch with half-saved/half-restored register state.  The
+        // x86-64 list above includes gogo_asm/mcall_asm for the same reason.
+        super::asm_arm64::gogo_asm                 as *const () as usize,
+        super::asm_arm64::mcall_asm                as *const () as usize,
+        // Same pre-lock window as AMD64: goexit_trampoline bumps m.locks but
+        // the TLS accessor runs before the increment lands.
         goexit_trampoline                          as *const () as usize,
     ];
 
@@ -956,7 +963,17 @@ unsafe fn redirect_to_async_preempt(gp: *mut G, ctx: *mut libc::c_void) {
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
     unsafe {
         let uc  = ctx as *mut libc::ucontext_t;
-        // Save original PC into x30 (LR); the trampoline saves and restores x30.
+        // Push the ORIGINAL x30 (LR) onto the goroutine stack before
+        // clobbering it.  If the interrupted code is a leaf function (or an
+        // epilogue after reloading x30), its return address lives only in
+        // x30; overwriting it without saving would make the eventual `ret`
+        // jump back to the interrupted PC — an infinite loop.  Mirrors Go's
+        // sigctxt.pushCall.  The trampoline restores x30 from this slot and
+        // pops it before branching to the resume PC.
+        let sp = ((*uc).uc_mcontext.sp - 16) as *mut u64; // keep 16-byte alignment
+        *sp = (*uc).uc_mcontext.regs[30];
+        (*uc).uc_mcontext.sp = sp as u64;
+        // x30 = resume PC; the trampoline saves it and branches there at exit.
         (*uc).uc_mcontext.regs[30] = (*uc).uc_mcontext.pc;
         (*uc).uc_mcontext.pc = async_preempt_trampoline as u64;
     }
@@ -977,6 +994,13 @@ unsafe fn redirect_to_async_preempt(gp: *mut G, ctx: *mut libc::c_void) {
     unsafe {
         let uc  = ctx as *mut libc::ucontext_t;
         let ss  = &mut (*(*uc).uc_mcontext).__ss;
+        // Push the ORIGINAL x30 (LR) onto the goroutine stack before
+        // clobbering it — see the Linux aarch64 branch above for the full
+        // rationale (leaf functions keep their return address only in x30;
+        // losing it loops the goroutine forever on its next `ret`).
+        let sp = (ss.__sp - 16) as *mut u64; // keep 16-byte alignment
+        *sp = ss.__lr;
+        ss.__sp = sp as u64;
         ss.__lr = ss.__pc;
         ss.__pc = async_preempt_trampoline as u64;
     }
