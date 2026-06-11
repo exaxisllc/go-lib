@@ -47,10 +47,12 @@ jobs:
         # (e.g. STATUS_ACCESS_VIOLATION on Windows).
         # timeout-minutes: guard against a run_impl park() hang on slow runners.
         timeout-minutes: 10
-        run: cargo test -- --nocapture
+        run: cargo test --release -- --nocapture
 
       - name: Print Windows VEH crash file (if present)
-        if: runner.os == 'Windows'
+        # always(): the crash file matters most when `cargo test` just failed,
+        # which would otherwise skip this step entirely.
+        if: always() && runner.os == 'Windows'
         shell: pwsh
         # The VEH writes .\go-lib-crash-veh.txt on crash.  Print it so the
         # diagnostics appear in the CI log even when the test binary exits via
@@ -62,6 +64,27 @@ jobs:
           } else {
             Write-Host "(no crash file — process either did not crash or VEH was not reached)"
           }
+
+      - name: cargo run --examples
+        timeout-minutes: 10
+        # bash on all three platforms so the inverted exit-code check below
+        # behaves identically (the default Windows shell is pwsh).
+        shell: bash
+        run: |
+          cargo run --release --example attr_run
+          cargo run --release --example cond
+          cargo run --release --example hello
+          # main_exitcode exits 1 BY DESIGN (it demonstrates returning
+          # ExitCode::FAILURE from main).  Assert the non-zero exit instead
+          # of failing the job on it.
+          if cargo run --release --example main_exitcode; then
+            echo "main_exitcode: expected a non-zero exit code"; exit 1
+          fi
+          cargo run --release --example main_result
+          cargo run --release --example pipeline
+          cargo run --release --example scope
+          cargo run --release --example scope_channel
+          cargo run --release --example select_fanin
 
       - name: cargo doc (no deps, no-run)
         run: cargo doc --no-deps

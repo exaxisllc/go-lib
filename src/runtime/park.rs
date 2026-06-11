@@ -25,7 +25,7 @@ use std::ptr;
 
 use super::g::{casgstatus, current_g, readgstatus, set_current_g, G, GPREEMPTED, GRUNNABLE, GRUNNING, GWAITING, WaitReason};
 use super::m::current_m;
-use super::sched::{sched, schedule, startm};
+use super::sched::{current_rt_ptr, sched, schedule, set_current_rt, startm};
 
 #[cfg(target_arch = "x86_64")]
 use super::asm_amd64::mcall;
@@ -184,6 +184,58 @@ pub(crate) unsafe fn goready(gp: *mut G) {
         sc.global_run_q.push_batch(gp, gp, 1);
         startm(ptr::null_mut());
     }
+}
+
+/// Wake a parked goroutine that belongs to a **different `Rt`** than the
+/// calling thread.
+///
+/// Netpoll shares one process-wide poll fd between every concurrent
+/// `run_impl` invocation, so an M-thread (or sysmon) of Rt-B can harvest a
+/// readiness event for a goroutine owned by Rt-A.  Calling plain [`goready`]
+/// there would enqueue A's goroutine on B's local P — B's scheduler would
+/// then execute a foreign G against the wrong run queues, `allg`, and
+/// shutdown flag.  This variant always takes the **global-queue path of the
+/// owning `Rt`**, temporarily binding `CURRENT_RT` so `startm` wakes one of
+/// the owner's M-threads.
+///
+/// The status-spin protocol mirrors [`goready`]; see its doc-comment.
+pub(crate) unsafe fn goready_remote(gp: *mut G, rt: *const super::sched::Rt) {
+    use super::g::GDEAD;
+
+    // RCU read-side — same pairing as goready (Phase 2b drainer's DrainSync).
+    let _cs = super::rcu::RcuGuard::new();
+
+    let old_status = loop {
+        let s = unsafe { readgstatus(gp) };
+        if s == GWAITING || s == GPREEMPTED {
+            break s;
+        }
+        if s == GRUNNABLE || s == GDEAD {
+            return; // already queued / cancelled by the owner's drain
+        }
+        debug_assert!(
+            s == GRUNNING,
+            "goready_remote: unexpected status {s}"
+        );
+        std::hint::spin_loop();
+    };
+
+    unsafe { casgstatus(gp, old_status, GRUNNABLE) };
+
+    // Suppress async preemption across the foreign Mutex critical section
+    // (same rationale as goready's m_lock guard).
+    let _lk = super::m::m_lock();
+
+    // Bind CURRENT_RT to the owner so startm operates on its idle lists,
+    // then restore the caller's binding.
+    let prev = current_rt_ptr();
+    set_current_rt(rt);
+    unsafe {
+        (*gp).schedlink = ptr::null_mut();
+        (*rt).global_run_q.push_batch(gp, gp, 1);
+        startm(ptr::null_mut());
+    }
+    set_current_rt(prev);
 }
 
 // ---------------------------------------------------------------------------

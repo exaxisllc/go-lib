@@ -67,14 +67,20 @@ struct GRaw(usize);
 // serialised by either the scheduler Mutex or the Mutex below.
 unsafe impl Send for GRaw {}
 
-/// Global registration table: maps file descriptor → (G pointer, poll mode).
+/// Global registration table: maps file descriptor → (G pointer, poll mode,
+/// owning `Rt` as a raw usize).
 ///
 /// Mode bit 1 = read; bit 2 = write.
-static REG: Mutex<Option<HashMap<RawFd, (GRaw, u32)>>> = Mutex::new(None);
+///
+/// The `rt_ptr` mirrors `TimerEntry.rt_ptr` in `time.rs`: multiple `run_impl`
+/// invocations (one per concurrent `#[test]`) share this table and the
+/// process-wide poll fd, so every consumer must know which `Rt` owns a
+/// wakeup, and `netpoll_clear_reg` must only purge its own Rt's entries.
+static REG: Mutex<Option<HashMap<RawFd, (GRaw, u32, usize)>>> = Mutex::new(None);
 
 fn with_reg<F, R>(f: F) -> R
 where
-    F: FnOnce(&mut HashMap<RawFd, (GRaw, u32)>) -> R,
+    F: FnOnce(&mut HashMap<RawFd, (GRaw, u32, usize)>) -> R,
 {
     let mut guard = REG.lock().unwrap();
     f(guard.get_or_insert_with(HashMap::new))
@@ -150,8 +156,11 @@ pub(crate) unsafe fn netpoll_arm(fd: RawFd, mode: u32, gp: *mut G) {
         return;
     }
 
+    // Tag the entry with the goroutine's Rt: netpoll_arm runs on the
+    // goroutine's own M, where CURRENT_RT is the owning scheduler.
+    let rt_ptr = super::sched::current_rt_ptr() as usize;
     with_reg(|reg| {
-        reg.insert(fd, (GRaw(gp as usize), mode));
+        reg.insert(fd, (GRaw(gp as usize), mode, rt_ptr));
     });
 
     #[cfg(not(windows))]
@@ -225,8 +234,15 @@ pub(crate) fn netpoll_unarm(fd: RawFd) {
 /// once `park()` has returned.
 pub(crate) fn netpoll_clear_reg() {
     let pfd = POLL_FD.load(Acquire);
+    // Only purge entries belonging to THIS Rt.  run_impl invocations run
+    // concurrently (one per parallel #[test]); clearing the whole table would
+    // strand every other Rt's parked I/O goroutines — their fds vanish from
+    // the kernel poll set and they sleep forever (observed as simultaneous
+    // hangs of all parallel net tests on macOS CI).  Mirrors
+    // `drain_timer_heap_for_shutdown` in time.rs.
+    let my_rt = super::sched::current_rt_ptr() as usize;
     with_reg(|reg| {
-        // Deregister every fd from epoll/kqueue before clearing the map.
+        // Deregister this Rt's fds from epoll/kqueue before removing them.
         // Without this, stale kernel-level registrations can accumulate.
         // When an old fd number is reused by a new socket, EPOLL_CTL_ADD
         // would fail with EEXIST (the kernel sees the fd as already
@@ -234,11 +250,13 @@ pub(crate) fn netpoll_clear_reg() {
         // harmless.  Explicit removal keeps the kernel poll table clean.
         #[cfg(not(windows))]
         if pfd >= 0 {
-            for (fd, _) in reg.iter() {
-                unsafe { poll_del(pfd, *fd) };
+            for (fd, (_, _, rt_ptr)) in reg.iter() {
+                if *rt_ptr == my_rt {
+                    unsafe { poll_del(pfd, *fd) };
+                }
             }
         }
-        reg.clear();
+        reg.retain(|_, (_, _, rt_ptr)| *rt_ptr != my_rt);
     });
 }
 
@@ -261,14 +279,24 @@ pub(crate) fn netpoll_clear_reg() {
 /// operation and returns the goroutine that was waiting on it.
 ///
 /// The caller must call [`goready`][super::park::goready] on each returned
-/// goroutine.
+/// goroutine **with `CURRENT_RT` bound to the entry's `rt_ptr`** — the G may
+/// belong to a different `Rt` than the polling thread (concurrent `run_impl`
+/// invocations share one poll fd).  Restore the previous `CURRENT_RT`
+/// afterwards.
 ///
 /// # Safety
 /// Must not be called concurrently with itself on the same poll handle.
-pub(crate) unsafe fn netpoll_wait(timeout_ms: i32) -> Vec<*mut G> {
-    // Windows: drain the IOCP.
+pub(crate) unsafe fn netpoll_wait(timeout_ms: i32) -> Vec<(*mut G, usize)> {
+    // Windows: drain the IOCP.  IOCP ops are not yet Rt-tagged; attribute
+    // wakeups to the polling thread's Rt (the pre-existing behaviour).
     #[cfg(windows)]
-    return unsafe { iocp_win_wait(timeout_ms) };
+    {
+        let rt_ptr = super::sched::current_rt_ptr() as usize;
+        return unsafe { iocp_win_wait(timeout_ms) }
+            .into_iter()
+            .map(|gp| (gp, rt_ptr))
+            .collect();
+    }
 
     // Unix: drain epoll / kqueue.
     #[cfg(not(windows))]
@@ -281,8 +309,8 @@ pub(crate) unsafe fn netpoll_wait(timeout_ms: i32) -> Vec<*mut G> {
         let mut goroutines = Vec::with_capacity(ready_fds.len());
         with_reg(|reg| {
             for fd in &ready_fds {
-                if let Some((g_raw, _mode)) = reg.remove(fd) {
-                    goroutines.push(g_raw.0 as *mut G);
+                if let Some((g_raw, _mode, rt_ptr)) = reg.remove(fd) {
+                    goroutines.push((g_raw.0 as *mut G, rt_ptr));
                     unsafe { poll_del(pfd, *fd) };
                 }
             }

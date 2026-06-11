@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 
 use super::g::STACK_PREEMPT;
 use super::p::{PIDLE, PSYSCALL, PRUNNING};
-use super::sched::{sched, startm};
+use super::sched::{set_current_rt, startm, Rt};
 // libc is used for pthread_kill in preemptone (Step 4).
 
 // ---------------------------------------------------------------------------
@@ -80,16 +80,17 @@ struct SysmonTick {
 // start_sysmon — spawn the monitor thread
 // ---------------------------------------------------------------------------
 
-/// Spawn the sysmon background OS thread.
+/// Spawn a per-Rt sysmon background OS thread.
 ///
-/// The thread is detached — it is never joined and runs for the lifetime of
-/// the process.  Call exactly once from `schedinit`.
+/// Each `run_impl` invocation gets its own sysmon thread bound to its `Rt`.
+/// The thread exits when `rt.shutdown` is set.
 ///
 /// Ported from the sysmon goroutine launch in `runtime/proc.go`.
-pub(crate) fn start_sysmon() {
+pub(crate) fn start_sysmon(rt: &'static Rt) {
+    let rt_addr = rt as *const Rt as usize;
     std::thread::Builder::new()
         .name("go-sysmon".to_string())
-        .spawn(sysmon_loop)
+        .spawn(move || sysmon_loop(rt_addr))
         .expect("start_sysmon: failed to spawn sysmon thread");
     // Thread handle is dropped here — the thread runs detached.
 }
@@ -98,10 +99,14 @@ pub(crate) fn start_sysmon() {
 // sysmon_loop — the monitor loop (runs on its own OS thread)
 // ---------------------------------------------------------------------------
 
-/// Main sysmon loop.  Runs indefinitely on the go-sysmon OS thread.
+/// Main sysmon loop.  Runs until `rt.shutdown` is set.
 ///
 /// Ported from `sysmon` in `runtime/proc.go`.
-fn sysmon_loop() {
+fn sysmon_loop(rt_addr: usize) {
+    let rt = unsafe { &*(rt_addr as *const Rt) };
+    // Bind this thread to its Rt so sched() calls work correctly.
+    set_current_rt(rt as *const Rt);
+
     // Initialise the netpoll backend (idempotent).
     super::netpoll::netpoll_init();
 
@@ -111,6 +116,9 @@ fn sysmon_loop() {
     let mut ticks: Vec<SysmonTick> = Vec::new();
 
     loop {
+        if rt.shutdown.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
         // ── Exponential sleep backoff ─────────────────────────────────────
         // Go: delay=20µs on first iteration; double after 50 idle iters; cap 10ms.
         if idle == 0 {
@@ -132,15 +140,23 @@ fn sysmon_loop() {
             if !ready.is_empty() {
                 idle = 0;
                 let _cs = super::rcu::RcuGuard::new();
-                for gp in ready {
-                    unsafe { super::park::goready(gp) };
+                let my_rt = rt as *const Rt as usize;
+                for (gp, rt_ptr) in ready {
+                    if rt_ptr == my_rt {
+                        unsafe { super::park::goready(gp) };
+                    } else {
+                        // Shared poll fd: this wakeup belongs to a different
+                        // Rt (another concurrent run_impl).  Route it to the
+                        // owner's global run queue.
+                        unsafe { super::park::goready_remote(gp, rt_ptr as *const Rt) };
+                    }
                 }
             }
         }
 
         // ── Retake Ps stuck in syscalls ───────────────────────────────────
         let now_ns = monotonic_ns();
-        if retake(now_ns, &mut ticks) != 0 {
+        if retake(rt, now_ns, &mut ticks) != 0 {
             idle = 0; // found work — reset backoff
         } else {
             idle += 1;
@@ -166,16 +182,21 @@ fn sysmon_loop() {
 /// retaken).
 ///
 /// Ported from `retake` in `runtime/proc.go`.
-fn retake(now_ns: u64, ticks: &mut Vec<SysmonTick>) -> u32 {
-    let sc = sched();
+fn retake(sc: &'static Rt, now_ns: u64, ticks: &mut Vec<SysmonTick>) -> u32 {
 
     // Snapshot allp under the scheduler lock so we can iterate without holding
     // the lock (matches Go's use of allpLock in retake).
     let allp: Vec<*mut super::p::P> = {
         let inner = sc.inner.lock().unwrap();
         // Grow the ticks vec lazily; Ps are never removed in v1.
-        if ticks.len() < inner.allp.len() {
-            ticks.resize(inner.allp.len(), SysmonTick::default());
+        // Initialize schedwhen/syscallwhen to now_ns so that freshly-added Ps
+        // are not immediately considered stale on the very first pass.
+        while ticks.len() < inner.allp.len() {
+            ticks.push(SysmonTick {
+                schedwhen:   now_ns,
+                syscallwhen: now_ns,
+                ..SysmonTick::default()
+            });
         }
         inner.allp.clone()
     };
@@ -349,14 +370,17 @@ mod tests {
     /// schedtick freshly set) must find nothing to retake on a first pass.
     #[test]
     fn retake_finds_nothing_on_first_pass() {
-        let mut ticks = Vec::new();
-        let now = monotonic_ns();
-        // First call: all schedtick/syscalltick observations are brand-new,
-        // elapsed == 0 for every P — nothing should be retaken or preempted.
-        let _ = retake(now, &mut ticks);
-        // Second call immediately after: elapsed is still < thresholds.
-        let n = retake(monotonic_ns(), &mut ticks);
-        assert_eq!(n, 0, "retake must return 0 when all Ps just started their tick");
+        crate::runtime::sched::run_impl(|| {
+            let rt = crate::runtime::sched::sched();
+            let mut ticks = Vec::new();
+            let now = monotonic_ns();
+            // First call: all schedtick/syscalltick observations are brand-new,
+            // elapsed == 0 for every P — nothing should be retaken or preempted.
+            let _ = retake(rt, now, &mut ticks);
+            // Second call immediately after: elapsed is still < thresholds.
+            let n = retake(rt, monotonic_ns(), &mut ticks);
+            assert_eq!(n, 0, "retake must return 0 when all Ps just started their tick");
+        });
     }
 
     /// `preemptone` sets `preempt = true` and `stackguard0 = STACK_PREEMPT`

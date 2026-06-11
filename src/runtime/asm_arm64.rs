@@ -39,7 +39,7 @@ use super::g::{
     set_current_g, Gobuf, G,
     G0_SCHED,
     GOBUF_BP_OFFSET, GOBUF_G_OFFSET, GOBUF_LR_OFFSET,
-    GOBUF_PC_OFFSET, GOBUF_SP_OFFSET,
+    GOBUF_PC_OFFSET, GOBUF_REGS_OFFSET, GOBUF_SP_OFFSET,
 };
 
 // ---------------------------------------------------------------------------
@@ -55,19 +55,42 @@ use super::g::{
 /// - `x9`  = scratch (target pc)
 /// - `x10` = scratch (sp value, cannot load sp from memory directly)
 /// - `x29` = frame pointer (bp), `x30` = link register (lr) — restored
+///
+/// ## Callee-saved register restoration
+///
+/// `gogo_asm` resumes execution at `buf.pc`, which (for an `mcall`-yielded
+/// goroutine) is the instruction immediately after `blr mcall_asm`.  The
+/// Rust caller obeys AAPCS64 and may hold live values in callee-saved
+/// registers (x19–x28, d8–d15) across that call; the scheduler clobbered
+/// them while the G was parked.  Restore the slots saved by `mcall_asm` so
+/// the resumed frame sees the exact register state it left behind.  For a
+/// fresh G (never yielded) the slots are zero-initialised, which is harmless
+/// — `goroutine_entry` writes its callee-saves before reading them.
 #[unsafe(naked)]
-unsafe extern "C" fn gogo_asm(buf: *mut Gobuf) -> ! {
+pub(crate) unsafe extern "C" fn gogo_asm(buf: *mut Gobuf) -> ! {
     core::arch::naked_asm!(
+        // ── restore callee-saved registers: x19–x28, d8–d15 ──────────────
+        "ldp  x19, x20, [x0, #{regs} + 0]",
+        "ldp  x21, x22, [x0, #{regs} + 16]",
+        "ldp  x23, x24, [x0, #{regs} + 32]",
+        "ldp  x25, x26, [x0, #{regs} + 48]",
+        "ldp  x27, x28, [x0, #{regs} + 64]",
+        "ldp  d8,  d9,  [x0, #{regs} + 80]",
+        "ldp  d10, d11, [x0, #{regs} + 96]",
+        "ldp  d12, d13, [x0, #{regs} + 112]",
+        "ldp  d14, d15, [x0, #{regs} + 128]",
+
         "ldr  x9,  [x0, #{pc}]",   // x9  = gobuf.pc  (target instruction)
         "ldr  x29, [x0, #{bp}]",   // x29 = gobuf.bp  (frame pointer)
         "ldr  x30, [x0, #{lr}]",   // x30 = gobuf.lr  (link register)
         "ldr  x10, [x0, #{sp}]",   // x10 = gobuf.sp
         "mov  sp,  x10",            // SP  = gobuf.sp  (cannot be a load target)
         "br   x9",                  // jump to pc — never returns
-        pc = const GOBUF_PC_OFFSET,
-        bp = const GOBUF_BP_OFFSET,
-        lr = const GOBUF_LR_OFFSET,
-        sp = const GOBUF_SP_OFFSET,
+        pc   = const GOBUF_PC_OFFSET,
+        bp   = const GOBUF_BP_OFFSET,
+        lr   = const GOBUF_LR_OFFSET,
+        sp   = const GOBUF_SP_OFFSET,
+        regs = const GOBUF_REGS_OFFSET,
     )
 }
 
@@ -102,7 +125,7 @@ unsafe extern "C" fn gogo_asm(buf: *mut Gobuf) -> ! {
 /// must not return — it must tail into `gogo` or loop in `schedule()`.
 /// The `brk #1` that follows is a hard trap for debug builds only.
 #[unsafe(naked)]
-unsafe extern "C" fn mcall_asm(
+pub(crate) unsafe extern "C" fn mcall_asm(
     _g:        *mut G,
     _g_sched:  *mut Gobuf,
     _g0_gobuf: *mut Gobuf,
@@ -119,6 +142,20 @@ unsafe extern "C" fn mcall_asm(
         "str  x29, [x1, #{bp}]",   // g_sched.bp = frame pointer (x29)
         "str  x0,  [x1, #{g}]",    // g_sched.g  = g (keep field in sync)
 
+        // ── save callee-saved registers (AAPCS64): x19–x28, d8–d15 ───────
+        // The scheduler clobbers every register while the G is parked;
+        // gogo_asm restores these slots on resume.  Mirrors the x86-64
+        // rbx/r12–r15 save in asm_amd64.rs.
+        "stp  x19, x20, [x1, #{regs} + 0]",
+        "stp  x21, x22, [x1, #{regs} + 16]",
+        "stp  x23, x24, [x1, #{regs} + 32]",
+        "stp  x25, x26, [x1, #{regs} + 48]",
+        "stp  x27, x28, [x1, #{regs} + 64]",
+        "stp  d8,  d9,  [x1, #{regs} + 80]",
+        "stp  d10, d11, [x1, #{regs} + 96]",
+        "stp  d12, d13, [x1, #{regs} + 112]",
+        "stp  d14, d15, [x1, #{regs} + 128]",
+
         // ── switch to g0's stack (x2 = g0_gobuf) ────────────────────────
         // g0's stack must be 16-byte aligned at this point (ABI requirement
         // for bl/blr).  The invariant is maintained by M::new (step 6).
@@ -131,14 +168,16 @@ unsafe extern "C" fn mcall_asm(
         // x3 = fn_ptr
         "blr  x3",
 
-        // fn_ptr must never return.  If it does, execute an explicit trap
-        // so the failure is obvious rather than silently corrupt.
-        "brk  #0x1",
+        // If fn_ptr returns (shutdown path: schedule() returned), exit this
+        // OS thread cleanly rather than hitting a breakpoint trap.
+        "bl   {m_exit}",
 
-        pc = const GOBUF_PC_OFFSET,
-        sp = const GOBUF_SP_OFFSET,
-        bp = const GOBUF_BP_OFFSET,
-        g  = const GOBUF_G_OFFSET,
+        pc     = const GOBUF_PC_OFFSET,
+        sp     = const GOBUF_SP_OFFSET,
+        bp     = const GOBUF_BP_OFFSET,
+        g      = const GOBUF_G_OFFSET,
+        regs   = const GOBUF_REGS_OFFSET,
+        m_exit = sym crate::runtime::sched::m_thread_exit,
     )
 }
 
@@ -176,6 +215,17 @@ pub(crate) unsafe fn gogo(g: *mut G) -> ! {
 /// debug builds if it has not been set yet.
 ///
 /// Ported from `runtime·mcall` in `runtime/proc.go` + `runtime/asm_arm64.s`.
+///
+/// ## Why `#[inline(never)]` is load-bearing
+///
+/// Same reason as the x86-64 `mcall` (see `asm_amd64.rs`): if this function
+/// is inlined into a caller that yields more than once, LLVM CSEs the
+/// `G0_SCHED` TLS accessor and carries the slot address across the
+/// suspension in a callee-saved register.  After a cross-thread resume the
+/// next yield then switches onto the *old* thread's g0 stack, corrupting
+/// that M's live scheduler frames.  Out-of-lining forces the TLS read to be
+/// re-derived on the current thread at every suspension point.
+#[inline(never)]
 pub(crate) unsafe fn mcall(g: *mut G, fn_ptr: unsafe extern "C" fn(*mut G)) {
     unsafe {
         let g_sched  = addr_of_mut!((*g).sched);
@@ -269,24 +319,41 @@ pub(crate) unsafe fn systemstack<F: FnOnce()>(f: F) {
 
 /// AArch64 async-preemption trampoline.
 ///
-/// The SIGURG handler sets `x30` (LR) = original `PC` then redirects `PC` to
-/// this function.  Execution resumes here with all registers intact except x30.
+/// The SIGURG handler (`redirect_to_async_preempt`) pushes the goroutine's
+/// ORIGINAL `x30` onto its stack (16-byte slot), sets `x30` = original `PC`
+/// (the resume target), and redirects `PC` here.  Execution resumes with all
+/// registers intact except x30, and `[sp]` = the original x30.
 ///
-/// ## Frame layout (512 B, 16-byte aligned)
+/// ## Frame layout (512 B, 16-byte aligned; redirect slot above it)
 /// ```text
+/// sp+512 .. sp+527  : redirect slot — [sp+512] = ORIGINAL x30 (pushed by handler)
 /// sp+0   .. sp+231  : x0–x28 (29 GPRs × 8 B)
 /// sp+232 .. sp+239  : x29 (frame pointer)
-/// sp+240 .. sp+247  : x30 (LR = original PC)
+/// sp+240 .. sp+247  : x30 (= resume PC, set by the SIGURG handler)
 /// sp+248 .. sp+375  : d0–d15  (16 × 8 B double FP regs, caller-saved)
 /// sp+376 .. sp+503  : d16–d31 (16 × 8 B double FP regs, callee-saved in AAPCS64)
 ///   ↑ 504 B used, padded to 512 B for 16-byte alignment
 /// ```
 ///
 /// After `bl async_preempt2` (which calls `mcall → schedule` and returns when
-/// the goroutine is rescheduled), all registers are restored and `ret` returns
-/// to the original PC (via restored x30).
+/// the goroutine is rescheduled), all registers are restored, the ORIGINAL
+/// x30 is reloaded from the redirect slot, and execution branches to the
+/// resume PC via `x18`.
 ///
-/// Ported from the auto-generated `asyncPreempt` in `runtime/preempt_arm64.s`.
+/// ## Why `x18` for the final branch
+///
+/// The resume PC must be in a register to branch (AArch64 has no
+/// branch-to-memory), but every general register may hold live interrupted
+/// state.  `x18` is the AAPCS64 platform register: reserved (never allocated
+/// by LLVM) on Darwin, Windows, Android, and Fuchsia, so clobbering it on
+/// macOS is guaranteed safe.  Go avoids this with its dedicated REGTMP (x27),
+/// which its own compiler never keeps live at preemption points — a luxury
+/// Rust code does not have.  On `aarch64-unknown-linux-gnu` x18 is
+/// allocatable, so a (very unlikely) interrupt with live x18 could corrupt
+/// it; tracked as a follow-up if Linux/aarch64 becomes a supported target.
+///
+/// Ported from the auto-generated `asyncPreempt` in `runtime/preempt_arm64.s`
+/// plus `sigctxt.pushCall` in `runtime/signal_arm64.go`.
 #[unsafe(naked)]
 pub(crate) unsafe extern "C" fn async_preempt_trampoline() {
     core::arch::naked_asm!(
@@ -309,7 +376,7 @@ pub(crate) unsafe extern "C" fn async_preempt_trampoline() {
         "stp x24, x25, [sp, #192]",
         "stp x26, x27, [sp, #208]",
         "stp x28, x29, [sp, #224]",
-        "str x30,      [sp, #240]",   // x30 = original PC (set by SIGURG handler)
+        "str x30,      [sp, #240]",   // x30 = resume PC (set by SIGURG handler)
 
         // ── save FP regs d0–d31 ───────────────────────────────────────────────
         "stp d0,  d1,  [sp, #248]",
@@ -354,7 +421,6 @@ pub(crate) unsafe extern "C" fn async_preempt_trampoline() {
         "ldp d30, d31, [sp, #488]",
 
         // ── restore GPRs ──────────────────────────────────────────────────────
-        "ldr x30,      [sp, #240]",   // restore original PC into x30 (LR)
         "ldp x28, x29, [sp, #224]",
         "ldp x26, x27, [sp, #208]",
         "ldp x24, x25, [sp, #192]",
@@ -371,9 +437,16 @@ pub(crate) unsafe extern "C" fn async_preempt_trampoline() {
         "ldp x2,  x3,  [sp, #16]",
         "ldp x0,  x1,  [sp, #0]",
 
-        // ── release frame and return to original PC ────────────────────────────
-        "add sp, sp, #512",
-        "ret",                          // branches to x30 = original PC
+        // ── return to the resume PC, restoring the ORIGINAL x30 ───────────────
+        // x18 = resume PC (the platform register — reserved on Darwin, see
+        // the doc-comment).  x30 is reloaded from the redirect slot the
+        // SIGURG handler pushed above this frame, restoring the interrupted
+        // code's true return address (critical for leaf functions).
+        "ldr x18, [sp, #240]",          // x18 = resume PC
+        "add sp, sp, #512",             // release trampoline frame
+        "ldr x30, [sp]",                // x30 = ORIGINAL x30 (redirect slot)
+        "add sp, sp, #16",              // pop redirect slot → original SP
+        "br  x18",                      // resume interrupted code
 
         ap2 = sym crate::runtime::sched::async_preempt2,
     )
