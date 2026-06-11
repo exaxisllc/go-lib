@@ -39,7 +39,7 @@ use super::g::{
     set_current_g, Gobuf, G,
     G0_SCHED,
     GOBUF_BP_OFFSET, GOBUF_G_OFFSET, GOBUF_LR_OFFSET,
-    GOBUF_PC_OFFSET, GOBUF_SP_OFFSET,
+    GOBUF_PC_OFFSET, GOBUF_REGS_OFFSET, GOBUF_SP_OFFSET,
 };
 
 // ---------------------------------------------------------------------------
@@ -55,19 +55,42 @@ use super::g::{
 /// - `x9`  = scratch (target pc)
 /// - `x10` = scratch (sp value, cannot load sp from memory directly)
 /// - `x29` = frame pointer (bp), `x30` = link register (lr) — restored
+///
+/// ## Callee-saved register restoration
+///
+/// `gogo_asm` resumes execution at `buf.pc`, which (for an `mcall`-yielded
+/// goroutine) is the instruction immediately after `blr mcall_asm`.  The
+/// Rust caller obeys AAPCS64 and may hold live values in callee-saved
+/// registers (x19–x28, d8–d15) across that call; the scheduler clobbered
+/// them while the G was parked.  Restore the slots saved by `mcall_asm` so
+/// the resumed frame sees the exact register state it left behind.  For a
+/// fresh G (never yielded) the slots are zero-initialised, which is harmless
+/// — `goroutine_entry` writes its callee-saves before reading them.
 #[unsafe(naked)]
 unsafe extern "C" fn gogo_asm(buf: *mut Gobuf) -> ! {
     core::arch::naked_asm!(
+        // ── restore callee-saved registers: x19–x28, d8–d15 ──────────────
+        "ldp  x19, x20, [x0, #{regs} + 0]",
+        "ldp  x21, x22, [x0, #{regs} + 16]",
+        "ldp  x23, x24, [x0, #{regs} + 32]",
+        "ldp  x25, x26, [x0, #{regs} + 48]",
+        "ldp  x27, x28, [x0, #{regs} + 64]",
+        "ldp  d8,  d9,  [x0, #{regs} + 80]",
+        "ldp  d10, d11, [x0, #{regs} + 96]",
+        "ldp  d12, d13, [x0, #{regs} + 112]",
+        "ldp  d14, d15, [x0, #{regs} + 128]",
+
         "ldr  x9,  [x0, #{pc}]",   // x9  = gobuf.pc  (target instruction)
         "ldr  x29, [x0, #{bp}]",   // x29 = gobuf.bp  (frame pointer)
         "ldr  x30, [x0, #{lr}]",   // x30 = gobuf.lr  (link register)
         "ldr  x10, [x0, #{sp}]",   // x10 = gobuf.sp
         "mov  sp,  x10",            // SP  = gobuf.sp  (cannot be a load target)
         "br   x9",                  // jump to pc — never returns
-        pc = const GOBUF_PC_OFFSET,
-        bp = const GOBUF_BP_OFFSET,
-        lr = const GOBUF_LR_OFFSET,
-        sp = const GOBUF_SP_OFFSET,
+        pc   = const GOBUF_PC_OFFSET,
+        bp   = const GOBUF_BP_OFFSET,
+        lr   = const GOBUF_LR_OFFSET,
+        sp   = const GOBUF_SP_OFFSET,
+        regs = const GOBUF_REGS_OFFSET,
     )
 }
 
@@ -119,6 +142,20 @@ unsafe extern "C" fn mcall_asm(
         "str  x29, [x1, #{bp}]",   // g_sched.bp = frame pointer (x29)
         "str  x0,  [x1, #{g}]",    // g_sched.g  = g (keep field in sync)
 
+        // ── save callee-saved registers (AAPCS64): x19–x28, d8–d15 ───────
+        // The scheduler clobbers every register while the G is parked;
+        // gogo_asm restores these slots on resume.  Mirrors the x86-64
+        // rbx/r12–r15 save in asm_amd64.rs.
+        "stp  x19, x20, [x1, #{regs} + 0]",
+        "stp  x21, x22, [x1, #{regs} + 16]",
+        "stp  x23, x24, [x1, #{regs} + 32]",
+        "stp  x25, x26, [x1, #{regs} + 48]",
+        "stp  x27, x28, [x1, #{regs} + 64]",
+        "stp  d8,  d9,  [x1, #{regs} + 80]",
+        "stp  d10, d11, [x1, #{regs} + 96]",
+        "stp  d12, d13, [x1, #{regs} + 112]",
+        "stp  d14, d15, [x1, #{regs} + 128]",
+
         // ── switch to g0's stack (x2 = g0_gobuf) ────────────────────────
         // g0's stack must be 16-byte aligned at this point (ABI requirement
         // for bl/blr).  The invariant is maintained by M::new (step 6).
@@ -139,6 +176,7 @@ unsafe extern "C" fn mcall_asm(
         sp     = const GOBUF_SP_OFFSET,
         bp     = const GOBUF_BP_OFFSET,
         g      = const GOBUF_G_OFFSET,
+        regs   = const GOBUF_REGS_OFFSET,
         m_exit = sym crate::runtime::sched::m_thread_exit,
     )
 }
