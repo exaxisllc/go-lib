@@ -205,13 +205,16 @@ pub(crate) unsafe extern "C" fn mcall_asm(
         // rdi = g (first argument, System V: first arg in rdi ✓)
         // rcx = fn_ptr
         "call rcx",
-        "ud2",
+        // If fn_ptr returns (shutdown path: schedule() returned), exit this
+        // OS thread cleanly rather than hitting an illegal instruction.
+        "call {m_exit}",
 
-        pc   = const GOBUF_PC_OFFSET,
-        sp   = const GOBUF_SP_OFFSET,
-        bp   = const GOBUF_BP_OFFSET,
-        g    = const GOBUF_G_OFFSET,
-        regs = const GOBUF_REGS_OFFSET,
+        pc     = const GOBUF_PC_OFFSET,
+        sp     = const GOBUF_SP_OFFSET,
+        bp     = const GOBUF_BP_OFFSET,
+        g      = const GOBUF_G_OFFSET,
+        regs   = const GOBUF_REGS_OFFSET,
+        m_exit = sym crate::runtime::sched::m_thread_exit,
     )
 }
 
@@ -282,7 +285,9 @@ pub(crate) unsafe extern "C" fn mcall_asm(
         // rcx = g (still holds g — Microsoft x64 first arg in rcx ✓)
         // r9  = fn_ptr
         "call r9",
-        "ud2",
+        // If fn_ptr returns (shutdown path: schedule() returned), exit this
+        // OS thread cleanly rather than hitting an illegal instruction.
+        "call {m_exit}",
 
         pc       = const GOBUF_PC_OFFSET,
         sp       = const GOBUF_SP_OFFSET,
@@ -291,6 +296,7 @@ pub(crate) unsafe extern "C" fn mcall_asm(
         regs     = const GOBUF_REGS_OFFSET,
         stack_lo = const G_STACK_LO_OFFSET,
         stack_hi = const G_STACK_HI_OFFSET,
+        m_exit   = sym crate::runtime::sched::m_thread_exit,
     )
 }
 

@@ -44,9 +44,10 @@
 //! run queue carries its own internal lock.
 
 use std::any::Any;
+use std::cell::Cell;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, Ordering::*};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use super::g::{casgstatus, current_g, readgstatus, set_current_g, G, Stack, GDEAD, GPREEMPTED, GRUNNABLE, GRUNNING, STACK_GUARD};
 use super::m::{current_m, M};
@@ -87,64 +88,94 @@ pub(crate) struct SchedInner {
 // SAFETY: All raw pointer access inside SchedInner is guarded by the Mutex.
 unsafe impl Send for SchedInner {}
 
-/// Process-global scheduler state, equivalent to Go's `sched` variable.
-pub(crate) struct Sched {
+/// Per-`run_impl` scheduler state.  One instance is created (and leaked) for
+/// every `run_impl` call; each has its own run queues, M-threads, Ps, and
+/// goroutine registry, so concurrent `run_impl` invocations are fully isolated.
+///
+/// Replaces the old process-global `static SCHED: OnceLock<Sched>` singleton.
+pub(crate) struct Rt {
     /// Global run queue — goroutines that are runnable but not yet on any P.
     pub global_run_q: GlobalRunQueue,
     /// Number of Ms currently spinning (looking for work in `findrunnable`).
     pub nmspinning:   AtomicI32,
     /// Current GOMAXPROCS value — readable without holding `inner`.
-    /// Updated by `schedinit` and `set_gomaxprocs`.
     pub gomaxprocs:   AtomicI32,
     /// Locked parts of scheduler state.
     pub inner:        Mutex<SchedInner>,
     /// Registry of every live goroutine (matches Go's `allgs`).
-    /// `spawn_goroutine` inserts before making the G visible via the run queue;
-    /// `goexit0` removes before freeing the G.  The `run_impl` drain also
-    /// iterates this to reclaim goroutines that were never scheduled.
     pub allg:         Mutex<Vec<*mut G>>,
+    /// Set to `true` by `run_impl` after Phase 2b drain; causes idle M-threads
+    /// to exit their `schedule()` loops and terminate.
+    pub shutdown:     AtomicBool,
 }
 
-// SAFETY: Sched is a process-global singleton; individual fields carry their
-// own synchronisation (Mutex / AtomicI32 / GlobalRunQueue's internal Mutex).
-// The Mutex<Vec<*mut G>> in allg does not auto-derive Send because *mut G is
-// !Send; the explicit impls assert that all raw-pointer access is serialised
-// through the Mutex and the scheduler's single-owner invariant.
-unsafe impl Sync for Sched {}
-unsafe impl Send for Sched {}
+// SAFETY: Rt is created once per run_impl and leaked for its lifetime.  All
+// fields carry their own synchronisation.  Raw-pointer access through allg and
+// the run queues is serialised by the scheduler's ownership invariants.
+unsafe impl Sync for Rt {}
+unsafe impl Send for Rt {}
 
-static SCHED: OnceLock<Sched> = OnceLock::new();
+// ---------------------------------------------------------------------------
+// CURRENT_RT — per-thread pointer to the owning Rt
+// ---------------------------------------------------------------------------
 
-/// Return a reference to the global scheduler, initialising it on first call.
-pub(crate) fn sched() -> &'static Sched {
-    SCHED.get_or_init(|| Sched {
-        global_run_q: GlobalRunQueue::new(),
-        nmspinning:   AtomicI32::new(0),
-        gomaxprocs:   AtomicI32::new(1),
-        inner: Mutex::new(SchedInner {
-            idle_p:     ptr::null_mut(),
-            idle_m:     ptr::null_mut(),
-            nmidle:     0,
-            allp:       Vec::new(),
-            gomaxprocs: 1,
-        }),
-        allg: Mutex::new(Vec::new()),
-    })
+thread_local! {
+    /// Set on every OS thread that participates in an `Rt`: M-threads (via
+    /// `spawn_m`), the sysmon thread (via `start_sysmon`), and the
+    /// `run_impl` calling thread (via `schedinit`).  Never set on bare OS
+    /// threads that have no scheduler role.
+    static CURRENT_RT: Cell<*const Rt> = Cell::new(ptr::null());
+}
+
+/// Return a reference to the calling thread's `Rt`.
+///
+/// # Panics (debug builds)
+/// Panics if `CURRENT_RT` has not been set on this thread.
+#[inline]
+pub(crate) fn current_rt() -> &'static Rt {
+    let p = CURRENT_RT.with(|c| c.get());
+    debug_assert!(!p.is_null(), "current_rt: CURRENT_RT is not set on this thread");
+    // SAFETY: p was set by set_current_rt to a Box::leak'd Rt which is valid
+    // for the process lifetime.
+    unsafe { &*p }
+}
+
+/// Return the raw `*const Rt` for this thread (null if not set).
+#[inline]
+pub(crate) fn current_rt_ptr() -> *const Rt {
+    CURRENT_RT.with(|c| c.get())
+}
+
+/// Bind `rt` as the `Rt` for the current OS thread.
+#[inline]
+pub(crate) fn set_current_rt(rt: *const Rt) {
+    CURRENT_RT.with(|c| c.set(rt));
+}
+
+/// Return the scheduler for the current thread.  All internal scheduler
+/// functions call this instead of a global singleton.
+#[inline]
+pub(crate) fn sched() -> &'static Rt {
+    current_rt()
 }
 
 // ---------------------------------------------------------------------------
 // schedule — main scheduler loop (runs on g0)
 // ---------------------------------------------------------------------------
 
-/// Main scheduling loop.  Runs on g0's stack; never returns.
+/// Main scheduling loop.  Runs on g0's stack.
 ///
 /// Picks a runnable goroutine via `findrunnable` and transfers control to it
-/// via `execute`.  Called initially from `M::start` and re-entered via
-/// `goexit0` and `gosched_m`.
+/// via `execute`.  Called initially from `M::start` and re-entered via mcall
+/// targets (`goexit0`, `gosched_m`, `park_fn`, `preemptm`, etc.).
+///
+/// Returns `()` when the owning `Rt` signals shutdown (all goroutines have
+/// finished and Phase 2b drain has completed).  After returning, the caller
+/// (mcall target or spawn_m's thread closure) should terminate the OS thread
+/// — mcall_asm accomplishes this by calling `m_thread_exit` instead of `ud2`.
 ///
 /// Ported from `schedule` in `runtime/proc.go`.
-#[allow(clippy::never_loop)] // loop is the intended infinite-scheduler idiom; execute() diverges
-pub(crate) unsafe fn schedule() -> ! {
+pub(crate) unsafe fn schedule() {
     let m = current_m();
     debug_assert!(!m.is_null(), "schedule: CURRENT_M is null — call set_current_m first");
 
@@ -153,13 +184,11 @@ pub(crate) unsafe fn schedule() -> ! {
         debug_assert!(!p.is_null(), "schedule: M has no P attached");
 
         // Every 61 ticks drain one G from the global queue to prevent starvation.
-        // 61 is a prime chosen by Go so the check is not aligned to any bursty
-        // producer period.
         let tick = unsafe { (*p).schedtick.load(Relaxed) };
         if tick % 61 == 0 && sched().global_run_q.len() > 0 {
             let gp = unsafe { sched().global_run_q.pop() };
             if !gp.is_null() {
-                unsafe { execute(gp) }; // -> !
+                unsafe { execute(gp) }; // -> !, never returns
             }
         }
 
@@ -170,10 +199,13 @@ pub(crate) unsafe fn schedule() -> ! {
             gp
         } else {
             // Local queue empty; find work elsewhere.
-            unsafe { findrunnable() } // may park; always returns a G
+            match unsafe { findrunnable() } {
+                Some(gp) => gp,
+                None => return, // Rt is shutting down — caller will exit the thread
+            }
         };
 
-        unsafe { execute(gp) }; // -> !
+        unsafe { execute(gp) }; // -> !, never returns
     }
 }
 
@@ -187,13 +219,14 @@ pub(crate) unsafe fn schedule() -> ! {
 /// 1. Local P run queue.
 /// 2. Global run queue.
 /// 3. Work-steal from a random P (4 attempts).
-/// 4. If none, surrender the P and park the M.  On wakeup, loop.
+/// 4. Non-blocking netpoll.
+/// 5. Surrender the P and park the M.  On wakeup, loop.
 ///
-/// Always returns a non-null `*mut G`.  Parks the calling M indefinitely if
-/// there is truly no work.
+/// Returns `Some(gp)` with a non-null goroutine, or `None` when the `Rt`
+/// is shutting down and there is no work.
 ///
 /// Ported from `findrunnable` in `runtime/proc.go` (trimmed for v1).
-pub(crate) unsafe fn findrunnable() -> *mut G {
+pub(crate) unsafe fn findrunnable() -> Option<*mut G> {
     let m  = current_m();
     let sc = sched();
 
@@ -203,7 +236,7 @@ pub(crate) unsafe fn findrunnable() -> *mut G {
         if !p.is_null() {
             let (gp, _) = unsafe { (*p).runqget() };
             if !gp.is_null() {
-                return gp;
+                return Some(gp);
             }
         }
 
@@ -211,7 +244,7 @@ pub(crate) unsafe fn findrunnable() -> *mut G {
         {
             let gp = unsafe { sc.global_run_q.pop() };
             if !gp.is_null() {
-                return gp;
+                return Some(gp);
             }
         }
 
@@ -221,7 +254,6 @@ pub(crate) unsafe fn findrunnable() -> *mut G {
             let allp  = &inner.allp;
             let np    = allp.len();
             if np > 1 && !p.is_null() {
-                // Simple deterministic pseudo-random start derived from M id.
                 let start = (unsafe { (*m).id as usize }).wrapping_mul(0x9e3779b9) % np;
                 let victim_ptrs: Vec<*mut P> = (0..4)
                     .map(|i| allp[(start.wrapping_add(i)) % np])
@@ -232,35 +264,33 @@ pub(crate) unsafe fn findrunnable() -> *mut G {
                     if *victim_ptr == p {
                         continue;
                     }
-                    // Steal runnext on the last attempt.
                     let stolen = unsafe {
                         (*p).runqsteal(&**victim_ptr, i == 3)
                     };
                     if !stolen.is_null() {
-                        return stolen;
+                        return Some(stolen);
                     }
                 }
             }
         }
 
         // ── 4. Non-blocking netpoll: check if any I/O goroutines are ready ──
-        //
-        // RCU read-side covers the netpoll result vector (which holds
-        // `*mut G` pointers loaded from REG) through the goready calls.
-        // Pairs with the run_impl Phase 2b drainer's `DrainSync`.
         {
             let ready = unsafe { super::netpoll::netpoll_wait(0) };
             let _cs = super::rcu::RcuGuard::new();
             for gp in ready {
-                // Wake each I/O goroutine.  They are moved from Gwaiting →
-                // Grunnable and placed into the local P's run queue.
                 unsafe { super::park::goready(gp) };
             }
         }
 
         // ── 5. No work found — surrender P and park ───────────────────────
         unsafe { stopm() };
-        // Woken up by startm/goready; P has been (re-)attached.  Try again.
+        // After stopm() returns: either startm woke us with work, or the Rt
+        // is shutting down.  Check shutdown before looping.
+        if sc.shutdown.load(Acquire) {
+            return None;
+        }
+        // Woken up by startm; P has been (re-)attached.  Try again.
     }
 }
 
@@ -309,12 +339,16 @@ unsafe fn stopm() {
         let surrendered_p = unsafe { (*m).p };
 
         // ── Pre-surrender check: any goroutines on M's local P queue? ─────
-        // findrunnable already checked but a concurrent goready may have
-        // pushed (via runqput) between findrunnable and here.  If so, bail
-        // out without surrendering — we'd otherwise orphan the work, since
-        // with GOMAXPROCS=1 there are no other Ms to work-steal it.
         if !surrendered_p.is_null() && unsafe { (*surrendered_p).runq_size() } > 0 {
-            return; // skip park — goto top of findrunnable, will pop from local
+            return; // skip park — goto top of findrunnable
+        }
+
+        // ── Shutdown check (while holding lock) ───────────────────────────
+        // If the Rt is already shutting down, return without adding ourselves
+        // to the idle list.  This prevents the lost-wakeup scenario where
+        // shutdown fires between the two lock acquisitions.
+        if sc.shutdown.load(Acquire) {
+            return;
         }
 
         if !surrendered_p.is_null() {
@@ -333,13 +367,9 @@ unsafe fn stopm() {
         }
 
         // ── Re-check global queue (lost-wakeup avoidance) ─────────────────
-        // Still holding `inner.lock`.  If goready raced with our earlier
-        // queue check and pushed work between findrunnable and here, we
-        // would otherwise park forever — startm has nothing to pop because
-        // either (a) the goready ran before we added ourselves to idle_m
-        // (so its startm found idle_m empty) or (b) it's running right now
-        // waiting for inner.lock.  Either way, observing work-on-queue here
-        // means we should not park.
+        // Still holding `inner.lock`.  If goready raced with our queue check
+        // and pushed work between findrunnable and here, we would otherwise
+        // park forever.
         if sc.global_run_q.len() > 0 {
             // Pop ourselves back off idle_m, reclaim a P, and return.
             unsafe {
@@ -347,7 +377,6 @@ unsafe fn stopm() {
                 (*m).schedlink = ptr::null_mut();
                 inner.nmidle -= 1;
             }
-            // Re-claim an idle P (preferring the one we just surrendered).
             if !inner.idle_p.is_null() {
                 let p2 = inner.idle_p;
                 unsafe {
@@ -357,17 +386,27 @@ unsafe fn stopm() {
                     (*m).p = p2;
                 }
             }
-            return;    // skip park — goto top of findrunnable
+            return;
+        }
+
+        // ── Second shutdown check (still under lock) ──────────────────────
+        // If shutdown fired after we added ourselves to idle_m, remove from
+        // idle_m and return so we don't park indefinitely.
+        if sc.shutdown.load(Acquire) {
+            unsafe {
+                inner.idle_m  = (*m).schedlink;
+                (*m).schedlink = ptr::null_mut();
+                inner.nmidle -= 1;
+            }
+            return;
         }
     } // release lock before blocking
 
-    unsafe { (*m).park_m() }; // blocks until unpark()
+    unsafe { (*m).park_m() }; // blocks until startm or shutdown unparks us
 
-    // Woken by startm — it has already:
-    //   * removed us from idle_m
-    //   * decremented nmidle
-    //   * set (*m).p to a runnable P
-    // Nothing to do here except return.
+    // Woken by startm (which set (*m).p) or by the shutdown sequence (which
+    // cleared idle_m).  Either way, findrunnable() will check sc.shutdown
+    // after we return and act accordingly.
 }
 
 // ---------------------------------------------------------------------------
@@ -494,6 +533,15 @@ pub(crate) unsafe extern "C" fn goexit0(gp: *mut G) {
         set_current_g(ptr::null_mut());
     }
 
+    // Balance the raw `locks += 1` taken by goexit_trampoline /
+    // goexit0_handler.  mcall never returns there, so the trampoline cannot
+    // release the count itself; an RAII guard would leak one increment per
+    // goroutine exit and permanently disable async preemption on this M
+    // (sigurg_handler Guard 0 skips whenever m.locks > 0).  Decrementing is
+    // safe here: the G is GDEAD and current_g is null, so sigurg_handler
+    // cannot start a preemption on this M anyway.
+    unsafe { (*m).locks -= 1 };
+
     // Remove from the live-goroutine registry before freeing so that the
     // run_impl drain cannot observe a dangling pointer.
     {
@@ -512,8 +560,9 @@ pub(crate) unsafe extern "C" fn goexit0(gp: *mut G) {
     // this point; schedule() runs on g0's stack and never dereferences gp.
     unsafe { drop(Box::from_raw(gp)) };
 
-    // Re-enter the scheduler on g0's stack — never returns.
-    unsafe { schedule() }
+    // Re-enter the scheduler on g0's stack.  Returns only on Rt shutdown, in
+    // which case mcall_asm's m_thread_exit call terminates the OS thread.
+    unsafe { schedule() };
 }
 
 // ---------------------------------------------------------------------------
@@ -543,13 +592,14 @@ unsafe extern "C" fn gosched_m(gp: *mut G) {
         set_current_g(ptr::null_mut());
     }
 
-    // Push to global run queue (single element — schedlink already null from G::new).
     unsafe {
         (*gp).schedlink = ptr::null_mut();
         sched().global_run_q.push_batch(gp, gp, 1);
     }
 
     unsafe { schedule() };
+    // schedule() returns only on Rt shutdown; mcall_asm calls m_thread_exit
+    // after we return, so the OS thread exits cleanly.
 }
 
 // ---------------------------------------------------------------------------
@@ -729,18 +779,27 @@ fn pc_in_scheduler_asm(pc: usize) -> bool {
     }
 
     #[cfg(target_arch = "x86_64")]
-    let bases: [usize; 5] = [
+    let bases: [usize; 7] = [
         super::asm_amd64::async_preempt_trampoline as *const () as usize,
         super::asm_amd64::gogo                     as *const () as usize,
         super::asm_amd64::mcall                    as *const () as usize,
         super::asm_amd64::gogo_asm                 as *const () as usize,
         super::asm_amd64::mcall_asm                as *const () as usize,
+        // goexit path: RSP is still on the goroutine stack while m.locks is
+        // being acquired (TLS accessor has 3 instructions before incl 96(%rax)).
+        // Guard 0 (m.locks > 0) is not yet active in that window, so we protect
+        // both the naked trampoline and the handler with Guard 3.
+        goexit_trampoline                          as *const () as usize,
+        goexit0_handler                            as *const () as usize,
     ];
     #[cfg(target_arch = "aarch64")]
-    let bases: [usize; 3] = [
+    let bases: [usize; 4] = [
         super::asm_arm64::async_preempt_trampoline as *const () as usize,
         super::asm_arm64::gogo                     as *const () as usize,
         super::asm_arm64::mcall                    as *const () as usize,
+        // Same pre-lock window as AMD64: goexit_trampoline calls m_lock() but
+        // the TLS accessor runs before m.locks is incremented.
+        goexit_trampoline                          as *const () as usize,
     ];
 
     for b in bases {
@@ -972,9 +1031,7 @@ pub(crate) unsafe extern "C" fn async_preempt2() {
 unsafe extern "C" fn preemptm(gp: *mut G) {
     let m = current_m();
     unsafe {
-        // GRUNNING → GPREEMPTED: goroutine is at an async-safe preemption point.
         casgstatus(gp, GRUNNING, GPREEMPTED);
-        // GPREEMPTED → GRUNNABLE: immediately re-queue (no GC scanner yet).
         casgstatus(gp, GPREEMPTED, GRUNNABLE);
         (*gp).m   = ptr::null_mut();
         (*m).curg = ptr::null_mut();
@@ -983,6 +1040,7 @@ unsafe extern "C" fn preemptm(gp: *mut G) {
         sched().global_run_q.push_batch(gp, gp, 1);
     }
     unsafe { schedule() };
+    // Returns only on shutdown; mcall_asm exits the thread.
 }
 
 // ---------------------------------------------------------------------------
@@ -1062,6 +1120,18 @@ unsafe extern "C" fn sigbus_handler(
         unsafe { sig_write(&buf) };
     }
 
+    // Also print fault address and goroutine stack bounds for root-cause analysis.
+    if !info.is_null() {
+        let fault_addr = unsafe { (*info).si_addr() } as u64;
+        unsafe { sig_hex(b"[go-lib SIGBUS] fault_addr = ", fault_addr) };
+    }
+    let gp = super::g::current_g();
+    if !gp.is_null() {
+        let lo = unsafe { (*gp).stack.lo } as u64;
+        let hi = unsafe { (*gp).stack.hi } as u64;
+        unsafe { sig_hex(b"[go-lib SIGBUS] stack.lo = ", lo) };
+        unsafe { sig_hex(b"[go-lib SIGBUS] stack.hi = ", hi) };
+    }
     unsafe { sig_write(b"[go-lib SIGBUS] crash (non-stack fault)\n") };
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1103,7 +1173,64 @@ unsafe extern "C" fn sigbus_handler(
             let ss = &(*(*uc).uc_mcontext).__ss;
             sig_hex(b"[go-lib SIGBUS] RIP = ", ss.__rip);
             sig_hex(b"[go-lib SIGBUS] RSP = ", ss.__rsp);
+            sig_hex(b"[go-lib SIGBUS] RAX = ", ss.__rax);
+            sig_hex(b"[go-lib SIGBUS] RBX = ", ss.__rbx);
+            sig_hex(b"[go-lib SIGBUS] RCX = ", ss.__rcx);
+            sig_hex(b"[go-lib SIGBUS] RDX = ", ss.__rdx);
+            sig_hex(b"[go-lib SIGBUS] RSI = ", ss.__rsi);
+            sig_hex(b"[go-lib SIGBUS] RDI = ", ss.__rdi);
+            sig_hex(b"[go-lib SIGBUS] RBP = ", ss.__rbp);
+            sig_hex(b"[go-lib SIGBUS] R12 = ", ss.__r12);
+            sig_hex(b"[go-lib SIGBUS] R13 = ", ss.__r13);
+            sig_hex(b"[go-lib SIGBUS] R14 = ", ss.__r14);
+            sig_hex(b"[go-lib SIGBUS] R15 = ", ss.__r15);
+            // [RSP-8]: the word the CPU would have popped in a `ret` just
+            // before the fault.  If this equals RIP, the crash is a `ret`
+            // through a corrupted return address.
+            let rsp = ss.__rsp as usize;
+            if rsp >= 8 {
+                let below = *((rsp - 8) as *const u64);
+                sig_hex(b"[go-lib SIGBUS] [RSP-8] = ", below);
+            }
         }
+    }
+
+    // Print g0 stack bounds and current M pointer for context.
+    let mp = super::m::current_m();
+    if !mp.is_null() {
+        let g0 = unsafe { (*mp).g0 };
+        if !g0.is_null() {
+            let g0lo = unsafe { (*g0).stack.lo } as u64;
+            let g0hi = unsafe { (*g0).stack.hi } as u64;
+            unsafe { sig_hex(b"[go-lib SIGBUS] g0.stack.lo = ", g0lo) };
+            unsafe { sig_hex(b"[go-lib SIGBUS] g0.stack.hi = ", g0hi) };
+
+            // Scan the g0 stack from [RSP-8] up to g0.hi.  This reveals
+            // goexit0's entire saved-register frame and the slot below RSP,
+            // which is key to distinguishing a `ret`-through-corruption from
+            // a `jmpq *reg` crash.
+            #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+            if !ctx.is_null() {
+                unsafe {
+                    let uc  = ctx as *mut libc::ucontext_t;
+                    let ss  = &(*(*uc).uc_mcontext).__ss;
+                    let rsp = ss.__rsp as usize;
+                    let hi  = g0hi as usize;
+                    let start = if rsp >= 8 { rsp - 8 } else { rsp };
+                    let end   = hi.min(start + 20 * 8);
+                    let mut addr = start;
+                    sig_write(b"[go-lib SIGBUS] --- g0 stack scan (RSP-8 .. g0.hi) ---\n");
+                    while addr < end {
+                        sig_hex(b"[go-lib SIGBUS]  @", addr as u64);
+                        let val = *(addr as *const u64);
+                        sig_hex(b"[go-lib SIGBUS]  = ", val);
+                        addr += 8;
+                    }
+                }
+            }
+        }
+    } else {
+        unsafe { sig_write(b"[go-lib SIGBUS] current_m = NULL\n") };
     }
 
     unsafe { libc::abort() };
@@ -1460,6 +1587,50 @@ unsafe extern "system" fn windows_veh_handler(ep: *mut u8) -> i32 {
 }
 
 // ---------------------------------------------------------------------------
+// m_thread_exit — OS-thread termination for M-threads on Rt shutdown
+// ---------------------------------------------------------------------------
+
+/// Terminate the current OS thread.
+///
+/// Called by `mcall_asm` after an mcall target (e.g. `goexit0`, `gosched_m`,
+/// `park_fn`) returns — which only happens when the owning `Rt` has set
+/// `shutdown = true` and `schedule()` returned `()` instead of looping.
+///
+/// The `ud2` / `brk #1` that previously followed `call rcx` / `blr x3` in
+/// `mcall_asm` is replaced by `call m_thread_exit` / `bl m_thread_exit` so
+/// M-threads exit cleanly instead of crashing with SIGILL.
+///
+/// # Safety
+/// Must only be called when the Rt's shutdown flag is set and the M-thread
+/// has no more work to do.  The call terminates the OS thread immediately
+/// without unwinding the Rust stack; any `Drop` impls on live stack variables
+/// in the mcall-target frame are skipped.  This is safe because:
+/// * All goroutines have already been freed (Phase 2b drain ran before shutdown).
+/// * g0's stack variables at exit time are POD types with no meaningful `Drop`.
+/// * The `Box::leak`'d `Rt` and mmap'd g0 stack are process-lifetime allocations.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn m_thread_exit() -> ! {
+    #[cfg(not(windows))]
+    unsafe {
+        libc::pthread_exit(core::ptr::null_mut());
+    }
+    #[cfg(windows)]
+    unsafe {
+        m_thread_exit_sys::ExitThread(0);
+    }
+    #[allow(unreachable_code)]
+    loop {}
+}
+
+#[cfg(windows)]
+mod m_thread_exit_sys {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        pub fn ExitThread(dwExitCode: u32) -> !;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Goroutine creation — goroutine_entry, goexit_trampoline, new_goroutine
 // ---------------------------------------------------------------------------
 
@@ -1579,7 +1750,7 @@ pub fn set_gomaxprocs(n: usize) -> usize {
             // Spawn one M per new P (mirrors schedinit).
             for p_ptr in new_ps {
                 let id = NEXT_MID.fetch_add(1, Relaxed);
-                unsafe { spawn_m(id, p_ptr) };
+                unsafe { spawn_m(sc, id, p_ptr) };
             }
         } else {
             // Decrease: just update the counters.  Excess Ms self-park when
@@ -1605,8 +1776,8 @@ static NEXT_GOID: AtomicU64 = AtomicU64::new(1);
 /// Monotonically-increasing M ID counter.
 static NEXT_MID: AtomicI64 = AtomicI64::new(1);
 
-/// Guards `schedinit` so it runs at most once per process.
-static INITIALIZED: AtomicBool = AtomicBool::new(false);
+/// Guards signal handler installation so it happens at most once per process.
+static SIGNALS_INSTALLED: AtomicBool = AtomicBool::new(false);
 
 /// Entry point for every user goroutine.
 ///
@@ -1675,15 +1846,16 @@ unsafe extern "C" fn goexit_trampoline() -> ! {
 /// with correct stack alignment; switches to g0 via `mcall` and calls
 /// `goexit0`.
 ///
-/// This function genuinely never returns: `goexit0` calls `schedule()` which
-/// loops forever.  The `unreachable_unchecked` is sound because dying
-/// goroutines are never resumed via `gogo` — they are dropped in `goexit0`.
+/// This function genuinely never returns: in the normal path `goexit0` calls
+/// `schedule()` which loops forever; on Rt shutdown `schedule()` returns but
+/// mcall_asm's `call m_thread_exit` terminates the OS thread before returning
+/// here.  The `unreachable_unchecked` is sound in both cases.
 ///
-/// ## Why we hold `m_lock` here
+/// ## Why we bump `m.locks` here
 ///
-/// `m_lock` increments `(*m).locks`, which causes `sigurg_handler` (Guard 0)
-/// to skip async preemption.  Without this, SIGURG can fire between
-/// `goroutine_entry`'s `ret` and `goexit0`'s `casgstatus` → `schedule()`.
+/// Incrementing `(*m).locks` causes `sigurg_handler` (Guard 0) to skip async
+/// preemption.  Without this, SIGURG can fire between `goroutine_entry`'s
+/// `ret` and `goexit0`'s `casgstatus` → `schedule()`.
 ///
 /// If preemption fires inside the `mcall(gp, goexit0)` call here, the async
 /// preempt's own `mcall` OVERWRITES `gp.sched.pc` with the trampoline's
@@ -1693,11 +1865,11 @@ unsafe extern "C" fn goexit_trampoline() -> ! {
 /// aborting the process with "thread caused non-unwinding panic. aborting."
 #[cfg(target_arch = "x86_64")]
 unsafe extern "C" fn goexit0_handler() -> ! {
-    // Hold m_lock for the entire goexit path so SIGURG cannot preempt us.
-    // The guard is never dropped (this function never returns), but that is
-    // fine: the M's `locks` counter is irrelevant once the goroutine is dead
-    // and the M has re-entered `schedule()`.
-    let _lk = super::m::m_lock();
+    // Raw `locks += 1` (not an MLockGuard): mcall never returns here, so a
+    // guard's Drop would never run and the count would stay elevated for the
+    // rest of the M's life, permanently disabling async preemption on this M.
+    // goexit0 decrements once the G is GDEAD and current_g is cleared.
+    unsafe { (*current_m()).locks += 1 };
     let gp = current_g();
     unsafe { mcall(gp, goexit0) };
     // SAFETY: goexit0 → schedule() is an infinite loop; this is unreachable.
@@ -1711,9 +1883,10 @@ unsafe extern "C" fn goexit0_handler() -> ! {
 // function works with no naked-asm tricks.
 #[cfg(target_arch = "aarch64")]
 unsafe extern "C" fn goexit_trampoline() -> ! {
-    // Hold m_lock for the entire goexit path — see goexit0_handler's doc
-    // comment for the full explanation of why this is necessary.
-    let _lk = super::m::m_lock();
+    // Raw `locks += 1` for the entire goexit path; goexit0 decrements once
+    // the G is dead — see goexit0_handler's doc comment for the full
+    // explanation of why an RAII guard must not be used here.
+    unsafe { (*current_m()).locks += 1 };
     let gp = current_g();
     unsafe { mcall(gp, goexit0) };
     // SAFETY: goexit0 → schedule() is an infinite loop; this is unreachable.
@@ -1781,8 +1954,8 @@ pub(crate) fn new_goroutine(f: impl FnOnce() + Send + 'static) -> Box<G> {
 /// A `debug_assert` fires in debug builds if called before the scheduler starts.
 pub(crate) fn spawn_goroutine(f: impl FnOnce() + Send + 'static) {
     debug_assert!(
-        INITIALIZED.load(Acquire),
-        "spawn_goroutine called before schedinit; goroutine will never run"
+        !current_rt_ptr().is_null(),
+        "spawn_goroutine called without an active Rt; call run_impl first"
     );
     let g_ptr = Box::into_raw(new_goroutine(f));
     // SAFETY: g_ptr is a freshly-allocated, uniquely-owned G.  push_batch and
@@ -1810,39 +1983,36 @@ pub(crate) fn spawn_goroutine(f: impl FnOnce() + Send + 'static) {
 // schedinit — create Ps and spawn M threads
 // ---------------------------------------------------------------------------
 
-/// Initialise the scheduler: create `nprocs` Ps and spawn one M per P.
+/// Create a fresh `Rt`, wire it up for this `run_impl` invocation, and return
+/// a `'static` reference to it.  The `Rt` is heap-allocated and intentionally
+/// leaked; it is valid for the remainder of the process.
 ///
-/// Idempotent — subsequent calls are no-ops.
+/// Sets `CURRENT_RT` on the calling thread so that `spawn_goroutine` (called
+/// immediately after) can find the scheduler.
 ///
 /// Ported from `schedinit` + `procresize` + `mstart` in `runtime/proc.go`.
-pub(crate) fn schedinit(nprocs: i32) {
-    // Ensure we only initialise once even under concurrent callers.
-    if INITIALIZED.swap(true, AcqRel) {
-        return;
-    }
+fn schedinit(nprocs: i32) -> &'static Rt {
     assert!(nprocs >= 1, "schedinit: nprocs must be ≥ 1");
 
     // Install a panic hook that suppresses panics originating from goroutine
-    // threads.  Without this, Rust's test framework (libtest) marks the
-    // current test as failed the moment any goroutine panics — even when the
-    // panic is intentional (e.g. a scoped goroutine whose caller retrieves
-    // the payload via `ScopedJoinHandle::join`).
+    // threads — but only once per process so we don't stack hooks.
     //
     // Goroutine panics are caught by `goroutine_entry`'s `catch_unwind` which
     // always runs on the same OS thread as the goroutine (no cross-thread
     // unwind), so landing-pad lookup is always correct.  Forwarding them to
     // an external hook first would trigger a spurious test failure before
     // `catch_unwind` has had a chance to route the payload to the caller.
-    let prev_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        // `current_g()` reads a thread-local: non-null on a goroutine M-thread,
-        // null on g0 / the main thread / non-scheduler threads.
-        if current_g().is_null() {
-            prev_hook(info);
+    {
+        static PANIC_HOOK_INSTALLED: AtomicBool = AtomicBool::new(false);
+        if !PANIC_HOOK_INSTALLED.swap(true, AcqRel) {
+            let prev_hook = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                if current_g().is_null() {
+                    prev_hook(info);
+                }
+            }));
         }
-        // Goroutine thread: suppress — `goroutine_entry`'s catch_unwind will
-        // catch the panic and route it to the appropriate handler.
-    }));
+    }
 
     // Allow the GOMAXPROCS environment variable to override the caller's value.
     let nprocs = std::env::var("GOMAXPROCS")
@@ -1851,7 +2021,26 @@ pub(crate) fn schedinit(nprocs: i32) {
         .filter(|&n| (1..=256).contains(&n))
         .unwrap_or(nprocs);
 
-    let sc = sched();
+    // Allocate a fresh Rt for this run_impl invocation and leak it so that
+    // M-threads (which may outlive the run_impl stack frame) can hold
+    // `&'static Rt` references.
+    let rt: &'static Rt = Box::leak(Box::new(Rt {
+        global_run_q: GlobalRunQueue::new(),
+        nmspinning:   AtomicI32::new(0),
+        gomaxprocs:   AtomicI32::new(nprocs),
+        inner: Mutex::new(SchedInner {
+            idle_p:     ptr::null_mut(),
+            idle_m:     ptr::null_mut(),
+            nmidle:     0,
+            allp:       Vec::new(),
+            gomaxprocs: nprocs,
+        }),
+        allg:     Mutex::new(Vec::new()),
+        shutdown: AtomicBool::new(false),
+    }));
+
+    // Bind this Rt to the calling thread so spawn_goroutine can find it.
+    set_current_rt(rt as *const Rt);
 
     // Create all Ps.
     let ps: Vec<*mut P> = (0..nprocs)
@@ -1859,57 +2048,45 @@ pub(crate) fn schedinit(nprocs: i32) {
         .collect();
 
     {
-        let mut inner = sc.inner.lock().unwrap();
-        inner.gomaxprocs = nprocs;
-        inner.allp       = ps.clone();
+        let mut inner = rt.inner.lock().unwrap();
+        inner.allp = ps.clone();
     }
-    sc.gomaxprocs.store(nprocs, Relaxed);
 
-    // Spawn one M per P.  Each M thread calls schedule() and loops forever.
+    // Spawn one M per P.  Each M thread sets CURRENT_RT = rt on its thread.
     for p_ptr in ps {
         let id = NEXT_MID.fetch_add(1, Relaxed);
-        unsafe { spawn_m(id, p_ptr) };
+        unsafe { spawn_m(rt, id, p_ptr) };
     }
 
-    // Install SIGSEGV / SIGURG / SIGBUS handlers (Unix only — Windows has no
-    // POSIX signals; proactive growth and cooperative preemption are used there).
-    #[cfg(not(windows))]
-    unsafe { install_sigsegv_handler() };
-    #[cfg(not(windows))]
-    unsafe { install_sigurg_handler() };
-    // SIGBUS handler: print PC/SP/LR + backtrace before aborting, so crashes
-    // in background scheduler threads produce actionable diagnostics in CI.
-    #[cfg(not(windows))]
-    unsafe { install_sigbus_handler() };
-    // VEH: catch STATUS_ACCESS_VIOLATION on Windows and print diagnostics.
-    // This gives us the faulting RIP/RSP and a Rust backtrace so we can
-    // identify which scheduler path is crashing.
-    #[cfg(windows)]
-    install_windows_veh();
+    // Install signal handlers once per process.
+    if !SIGNALS_INSTALLED.swap(true, AcqRel) {
+        #[cfg(not(windows))]
+        unsafe { install_sigsegv_handler() };
+        #[cfg(not(windows))]
+        unsafe { install_sigurg_handler() };
+        #[cfg(not(windows))]
+        unsafe { install_sigbus_handler() };
+        #[cfg(windows)]
+        install_windows_veh();
+    }
 
-    // Initialise the netpoll backend *synchronously* on all platforms before
-    // any goroutines or M threads start.  Without this, there is a window
-    // where a goroutine calls park_on_fd / WSASocketW before sysmon has had
-    // a chance to run netpoll_init(), producing:
-    //   • Unix:    a gopark that is never woken (kqueue/epoll fd is -1)
-    //   • Windows: WSANOTINITIALISED (error 10093)
-    // netpoll_init is idempotent (atomic/OnceLock-guarded), so the later call
-    // from sysmon_loop is a cheap no-op.
+    // Initialise the netpoll backend synchronously before any goroutines start.
     super::netpoll::netpoll_init();
 
-    // Start the background monitor thread (sysmon).
-    start_sysmon();
-    // Start the background timer thread.
+    // Start per-Rt background threads.
+    start_sysmon(rt);
     start_timer_thread();
+
+    rt
 }
 
 /// Allocate a new M, wire it to `p`, and spawn an OS thread that runs the
 /// scheduler loop on that M.
 ///
 /// The raw pointers are transmitted across the thread boundary by casting to
-/// `usize` (which is `Send`); M and P are both designed to be exclusively
-/// owned by one OS thread at a time.
-unsafe fn spawn_m(id: i64, p: *mut P) {
+/// `usize` (which is `Send`); M, P, and Rt are all valid for the process
+/// lifetime once created.
+unsafe fn spawn_m(rt: &'static Rt, id: i64, p: *mut P) {
     let m = Box::into_raw(unsafe { M::new(id) });
 
     // Wire M ↔ P before the thread starts so schedule() sees a valid P.
@@ -1919,15 +2096,21 @@ unsafe fn spawn_m(id: i64, p: *mut P) {
         (*p).status.store(PRUNNING, Release);
     }
 
-    let m_addr = m as usize;
+    let m_addr  = m as usize;
+    let rt_addr = rt as *const Rt as usize;
 
     std::thread::spawn(move || {
-        let m = m_addr as *mut M;
+        let m  = m_addr  as *mut M;
+        let rt = rt_addr as *const Rt;
         unsafe {
+            // Bind this thread to its Rt so sched() works.
+            set_current_rt(rt);
             // Initialise CURRENT_M, G0_SCHED, CURRENT_G for this thread.
             (*m).start();
-            // Enter the scheduler loop — never returns.
+            // Enter the scheduler loop; returns when Rt signals shutdown.
             schedule();
+            // schedule() returned — Rt is shutting down.  The OS thread exits
+            // naturally as the closure returns.
         }
     });
 }
@@ -1975,8 +2158,8 @@ unsafe fn unregister_drained_g(gp: *mut G) {
             // SAFETY: the user-side Hchan<T> Arc is held by goroutines we
             // have just CAS'd to GDEAD, but the Arc allocation itself stays
             // mapped (closure-capture leak — see run_impl doc-comment).  No
-            // concurrent user code is running because ACTIVE_RUN_IMPLS holds
-            // the entry lock.
+            // concurrent user code in this Rt can be dereferencing this channel
+            // because all goroutines have been CAS'd to GDEAD.
             unsafe { (*mu).lock() };
             // SAFETY: `unlink_fn` is the monomorphised
             // `chan::unlink_sudog_for_drain::<T>` for the T of this channel,
@@ -2064,29 +2247,6 @@ unsafe fn unregister_drained_g(gp: *mut G) {
 /// even when the goroutine panics.
 ///
 /// Ported from the Go runtime bootstrap (`runtime·rt0_go` → `main.main`).
-/// Reference count of in-flight `run_impl` invocations.
-///
-/// Phase 2b's GWAITING-goroutine drain walks the global `Sched::allg` list
-/// and CASes each waiting goroutine to GDEAD before reclaiming its stack.
-/// `allg` is shared across all concurrent `run_impl` calls (the scheduler
-/// singleton is process-global), so an unconditional drain at every exit
-/// would reclaim goroutines spawned by **other** still-live `run_impl`
-/// invocations — the same trap that retired the original Phase 2a drain.
-///
-/// We dodge that by draining only when this counter drops to zero, i.e. when
-/// the currently-exiting `run_impl` is the last one in the process.  In the
-/// common single-run_impl-at-a-time case (production daemons, sequential
-/// tests with `--test-threads=1`) the drain runs at every exit and reclaims
-/// memory promptly; in the parallel-test case it runs only at the moment
-/// when all parallel tests have left `run_impl`, which is still enough to
-/// keep total memory bounded across the test session.
-///
-/// The Mutex provides both the counter and the serialisation between exit
-/// (decrement + drain decision) and any concurrent entry (increment): a new
-/// `run_impl` that wants to enter while a drain is running blocks on the
-/// lock, so the drain sees a stable count of zero throughout.
-static ACTIVE_RUN_IMPLS: Mutex<u32> = Mutex::new(0);
-
 /// Total number of goroutines transitioned `GWAITING → GDEAD` by Phase 2b
 /// drains across all `run_impl` exits.  Used by `phase_2b_drain_reclaims_gwaiting`
 /// to verify the drain code path executed at least once during the test run.
@@ -2102,12 +2262,9 @@ where
         .map(|n| n.get() as i32)
         .unwrap_or(1);
 
-    schedinit(nprocs);
-
-    // Register as an active run_impl so the Phase 2b drain (below) can detect
-    // whether it is safe to reclaim GWAITING goroutines.  See the doc-comment
-    // on `ACTIVE_RUN_IMPLS` for the full rationale.
-    *ACTIVE_RUN_IMPLS.lock().unwrap() += 1;
+    // Create a fresh, isolated Rt for this run_impl invocation.
+    // schedinit also sets CURRENT_RT on the calling thread.
+    let rt = schedinit(nprocs);
 
     // Drop guard: unparks the calling thread whether `f` returns or panics.
     struct UnparkOnDrop(std::thread::Thread);
@@ -2116,26 +2273,17 @@ where
     }
 
     // Slot shuttles either the return value or the panic payload from the
-    // goroutine back to the caller.  We catch the panic *inside* the wrapper
-    // (not relying on `goroutine_entry`'s catch_unwind alone) so the original
-    // payload reaches the test/user thread intact: `resume_unwind` here
-    // re-raises it with the correct file:line and writes via the test
-    // harness's stderr capture — invaluable for diagnosing intermittent
-    // failures where the panic message would otherwise be lost on an M
-    // thread's stderr.
+    // goroutine back to the caller.
     type Slot<R> = Result<R, Box<dyn std::any::Any + Send + 'static>>;
     let slot: Arc<Mutex<Option<Slot<R>>>> = Arc::new(Mutex::new(None));
     let slot2 = Arc::clone(&slot);
 
     let caller = std::thread::current();
     let wrapper = move || {
-        // `_guard` is the *last* local to drop, so it unparks the caller only
-        // after the result has been stored.
         let _guard = UnparkOnDrop(caller);
         let result =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
         *slot2.lock().unwrap() = Some(result);
-        // _guard drops here → caller.unpark()
     };
 
     spawn_goroutine(wrapper);
@@ -2143,156 +2291,90 @@ where
     // Block until the goroutine's drop-guard fires caller.unpark().
     std::thread::park();
 
-    // Purge stale netpoll registrations left by background goroutines that
-    // were still parked when the main closure exited.  Without this, a
-    // subsequent go_lib::run() call in the same process reuses the same
-    // global POLL_FD and REG, potentially receiving stale *mut G pointers
-    // from netpoll_wait → goready dereferences them → SIGSEGV on Linux/epoll
-    // or hang on Windows/IOCP.
-    //
-    // This must be called from this OS thread (outside any goroutine) after
-    // park() returns.  No M thread is executing netpoll_arm or netpoll_wait
-    // at this point: the main goroutine has exited, and no new goroutines can
-    // be spawned until the next go_lib::run() call.
+    // Purge stale netpoll registrations for this Rt.
     super::netpoll::netpoll_clear_reg();
-
-    // Phase 2a (drain GRUNNABLE goroutines from run queues) was removed.
-    //
-    // The global scheduler singleton is shared across all concurrent run_impl
-    // calls (e.g. parallel `cargo test` threads).  Draining "all GRUNNABLE
-    // goroutines" at exit popped goroutines belonging to OTHER concurrent
-    // run_impl calls and freed them before they executed, causing those calls
-    // to hang indefinitely waiting for their goroutines to complete.
-    //
-    // GRUNNABLE goroutines left in queues are safe: M-threads loop forever in
-    // schedule() and will eventually pop and execute every queued goroutine.
-    // When each goroutine completes, goexit0 (Phase 1) frees its stack and
-    // Box<G>.
 
     // ── Phase 2b: drain GWAITING goroutines ──────────────────────────────────
     //
-    // Reclaim every goroutine still parked in a channel, WaitGroup, Cond,
-    // timer, or netpoll wait queue.  We do this only when we are the *last*
-    // in-flight `run_impl` (see ACTIVE_RUN_IMPLS) so we don't reclaim
-    // goroutines spawned by other concurrent invocations.
+    // With per-Rt isolation, `rt.allg` contains only goroutines spawned by
+    // this run_impl — no need to guard against draining another run_impl's
+    // goroutines.  We can always drain here.
     //
-    // For each goroutine we drain we reclaim:
-    //   * The stack — the big mmap'd region (32 KiB – 1 GiB) — via stack_free.
-    //   * The Box<G> — the 128 B descriptor.
-    //   * Membership in `allg`.
-    //
-    // Safety of freeing the Box (Phase 2b's hard problem):
-    //
-    //   1. We CAS each GWAITING → GDEAD on `allg`, so any concurrent
-    //      `goready(gp)` already in flight observes GDEAD and returns early
-    //      via the guard added in PR #29.
-    //
-    //   2. We walk each drained gp's tracked wakers (G.waiting_sudogs /
-    //      G.waiting_wg / G.waiting_cond — added in this PR) and unregister
-    //      it from every channel waitq / WaitGroup / Cond that holds its
-    //      pointer.  Timer entries are dropped wholesale by
-    //      `drain_timer_heap_for_shutdown`; netpoll registrations were
-    //      cleared up-front by `netpoll_clear_reg`.  After this step **no
-    //      waker holds a stale `*mut G`** — any future `goready` invocation
-    //      cannot load one of our gp pointers, so cannot dereference it
-    //      after we free.
-    //
-    //   3. We hold a `DrainSync` (PR #32) across the actual frees.  That
-    //      blocks any new `goready` callers from entering their RCU
-    //      read-side CS and waits for any in-flight ones to finish.
-    //      Combined with step 2 this means no thread can be dereferencing
-    //      or about to dereference one of our gp pointers when we free.
-    //
-    // What still leaks (irreducible without compiler support):
-    //   * Closure captures on the freed stack (Arc<Hchan>, Arc<WaitGroup>,
-    //     boxed sudog elem, …) — we cannot enumerate stack-rooted values
-    //     without compiler-emitted stack maps, so their `Drop` impls don't
-    //     run.  The pointed-to allocations stay mapped until process exit.
-    //     The leak is bounded by the captures of every drained goroutine.
+    // Safety protocol is unchanged from before:
+    //   1. CAS GWAITING → GDEAD (goready guards see GDEAD and return early)
+    //   2. Unregister each gp from every waker (channel waitq, WG, Cond)
+    //   3. DrainSync barrier (blocks in-flight goready calls)
+    //   4. Free stacks and Box<G>
     {
-        let mut active = ACTIVE_RUN_IMPLS.lock().unwrap();
-        debug_assert!(*active >= 1, "ACTIVE_RUN_IMPLS underflow");
-        *active -= 1;
-        if *active == 0 {
-            // We're the last; safe to drain.
-            //
-            // Drain pending timers first so the timer thread cannot fire one
-            // of these GWAITING goroutines between our CAS and our stack
-            // free.  (The fire would observe GDEAD via the goready guard,
-            // but the diagnostic is cleaner if no fires happen at all.)
-            super::time::drain_timer_heap_for_shutdown();
+        // Drain pending timers for this Rt first so the timer thread cannot
+        // fire one of these GWAITING goroutines between CAS and stack free.
+        super::time::drain_timer_heap_for_shutdown();
 
-            // Collect every gp that we can transition GWAITING → GDEAD.
-            // A goroutine that races us (e.g. a peer wakes it while we're
-            // looping) fails our CAS — we skip it; it will run normally.
-            let drained: Vec<*mut G> = {
-                let allg = sched().allg.lock().unwrap();
-                allg.iter()
-                    .filter_map(|&gp| {
-                        let ok = unsafe {
-                            (*gp).atomicstatus
-                                .compare_exchange(
-                                    super::g::GWAITING,
-                                    GDEAD,
-                                    AcqRel,
-                                    Relaxed,
-                                )
-                                .is_ok()
-                        };
-                        if ok { Some(gp) } else { None }
-                    })
-                    .collect()
-            };
+        let drained: Vec<*mut G> = {
+            let allg = rt.allg.lock().unwrap();
+            allg.iter()
+                .filter_map(|&gp| {
+                    let ok = unsafe {
+                        (*gp).atomicstatus
+                            .compare_exchange(
+                                super::g::GWAITING,
+                                GDEAD,
+                                AcqRel,
+                                Relaxed,
+                            )
+                            .is_ok()
+                    };
+                    if ok { Some(gp) } else { None }
+                })
+                .collect()
+        };
 
-            if !drained.is_empty() {
-                // Step 2: unregister each drained gp from every waker that
-                // holds its pointer.  After this loop, no Sudog in any
-                // channel waitq has `sudog.g == gp`, no WaitGroup.waiters
-                // contains gp, no Cond.waitq contains gp.
-                for &gp in &drained {
-                    unsafe { unregister_drained_g(gp) };
-                }
-
-                // Step 3: barrier — block new RCU read-side CSes and wait
-                // for in-flight ones to finish.  Combined with step 2 this
-                // means no thread can dereference one of our gps now.
-                let _sync = super::rcu::DrainSync::new();
-
-                // Step 4: reclaim stacks and Box<G> descriptors.
-                for &gp in &drained {
-                    let stack = unsafe { (*gp).stack };
-                    unsafe { super::stack::stack_free(&stack) };
-                    // SAFETY: gp came from `Box::into_raw` in `new_goroutine`
-                    // (PR #29).  Step 2 cleared every reference to gp; step 3
-                    // ensured no in-flight dereference is pending.  We are
-                    // now the sole owner — drop the Box.
-                    unsafe { drop(Box::from_raw(gp)) };
-                }
-
-                // Remove drained goroutines from `allg`.
-                //
-                // Done with raw pointer equality (the Boxes are freed, so
-                // `contains` is the same pattern as everywhere else — we
-                // only use the addresses, not load through them).
-                let mut allg = sched().allg.lock().unwrap();
-                allg.retain(|gp| !drained.contains(gp));
-
-                // Telemetry: tests read this to verify the drain ran.
-                #[cfg(test)]
-                PHASE_2B_DRAINED_COUNT
-                    .fetch_add(drained.len() as u64, Relaxed);
+        if !drained.is_empty() {
+            for &gp in &drained {
+                unsafe { unregister_drained_g(gp) };
             }
+
+            let _sync = super::rcu::DrainSync::new();
+
+            for &gp in &drained {
+                let stack = unsafe { (*gp).stack };
+                unsafe { super::stack::stack_free(&stack) };
+                unsafe { drop(Box::from_raw(gp)) };
+            }
+
+            let mut allg = rt.allg.lock().unwrap();
+            allg.retain(|gp| !drained.contains(gp));
+
+            #[cfg(test)]
+            PHASE_2B_DRAINED_COUNT
+                .fetch_add(drained.len() as u64, Relaxed);
         }
     }
 
+    // ── Signal shutdown and wake all idle M-threads ───────────────────────────
+    //
+    // After this point the M-threads will exit `schedule()` and terminate.
+    // We do NOT wait for them here — the Rt is Box::leak'd and remains valid
+    // for the process lifetime, so there is no use-after-free risk.
+    {
+        rt.shutdown.store(true, Release);
+        let inner = rt.inner.lock().unwrap();
+        let mut m = inner.idle_m;
+        while !m.is_null() {
+            let next = unsafe { (*m).schedlink };
+            unsafe { (*m).unpark() };
+            m = next;
+        }
+        // idle_m list stays as-is; each M will remove itself when it wakes.
+    }
+
+    // Reset CURRENT_RT on the calling thread so a subsequent run_impl call
+    // gets a fresh Rt rather than inheriting the old (shutting-down) one.
+    set_current_rt(ptr::null());
+
     match slot.lock().unwrap().take() {
-        Some(Ok(v))       => v,
+        Some(Ok(v))        => v,
         Some(Err(payload)) => {
-            // Re-raise the panic on the caller's thread.  Use `panic_any`
-            // (which invokes the standard panic hook so the failure message
-            // appears in `cargo test`'s captured output) rather than
-            // `resume_unwind` (which skips the hook entirely — the failure
-            // would still be marked FAILED, but with no diagnostic).
             let msg = extract_panic_msg(payload.as_ref());
             std::panic::panic_any(format!("goroutine panicked: {msg}"))
         }
@@ -2308,15 +2390,6 @@ where
 mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
-
-    // ── Singleton tests ───────────────────────────────────────────────────
-
-    #[test]
-    fn sched_singleton() {
-        let s1 = sched() as *const Sched;
-        let s2 = sched() as *const Sched;
-        assert_eq!(s1, s2, "sched() must return the same singleton");
-    }
 
     // ── Global run-queue round-trip ───────────────────────────────────────
 

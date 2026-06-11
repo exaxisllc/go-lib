@@ -32,6 +32,7 @@ use std::time::{Duration, Instant};
 use super::g::{current_g, WaitReason};
 use super::park::{gopark, goready};
 use super::g::G;
+use super::sched::{current_rt_ptr, set_current_rt, Rt};
 
 // ---------------------------------------------------------------------------
 // Monotonic clock helper
@@ -55,10 +56,15 @@ fn mono_ns() -> u64 {
 #[derive(Eq, PartialEq)]
 struct TimerEntry {
     /// Expiry time in monotonic nanoseconds.
-    when: u64,
+    when:   u64,
     /// Goroutine to wake when the timer fires.  Raw pointer valid because
     /// the goroutine is parked (GWAITING) for the entire duration.
-    gp:   *mut G,
+    gp:     *mut G,
+    /// The `Rt` that owns this goroutine (as a raw usize).  Used by
+    /// `fire_expired` to set `CURRENT_RT` before calling `goready`, and by
+    /// `drain_timer_heap_for_shutdown` to filter entries belonging to the
+    /// shutting-down Rt.
+    rt_ptr: usize,
 }
 
 // SAFETY: TimerEntry is only touched under TIMER_HEAP's Mutex.
@@ -115,11 +121,18 @@ pub(crate) fn start_timer_thread() {
 /// thread across the lifetime of the process and is shared between
 /// `run_impl` invocations.
 pub(crate) fn drain_timer_heap_for_shutdown() {
+    let my_rt = current_rt_ptr() as usize;
     let mut heap = TIMER_HEAP.lock().unwrap();
-    heap.clear();
+    // Retain only entries that belong to other (still-live) Rts.
+    let retained: BinaryHeap<TimerEntry> =
+        std::mem::take(&mut *heap)
+            .into_iter()
+            .filter(|e| e.rt_ptr != my_rt)
+            .collect();
+    *heap = retained;
     // The thread may currently be sleeping with a stale deadline; that is
     // fine — when it wakes (no later than 1 s; see `timer_thread_body`) it
-    // observes the empty heap and re-sleeps.
+    // re-evaluates the heap.
 }
 
 /// Main body of the background timer thread.
@@ -174,15 +187,15 @@ fn fire_expired() {
     use super::g::{readgstatus, GWAITING};
 
     let now = mono_ns();
-    let mut to_wake:  Vec<*mut G> = Vec::new();
-    let mut to_retry: Vec<*mut G> = Vec::new();
+    struct WakeEntry { gp: *mut G, rt_ptr: usize }
+    let mut to_wake: Vec<WakeEntry> = Vec::new();
 
     {
         let mut heap = TIMER_HEAP.lock().unwrap();
         while let Some(entry) = heap.peek() {
             if entry.when <= now {
                 let entry = heap.pop().unwrap();
-                to_wake.push(entry.gp);
+                to_wake.push(WakeEntry { gp: entry.gp, rt_ptr: entry.rt_ptr });
             } else {
                 break;
             }
@@ -196,25 +209,32 @@ fn fire_expired() {
     // pointers while we are using them.
     let _cs = super::rcu::RcuGuard::new();
 
-    for gp in to_wake {
+    let mut to_retry: Vec<WakeEntry> = Vec::new();
+
+    for entry in to_wake {
+        // Bind CURRENT_RT to the entry's Rt so goready → sched() works on the
+        // timer thread (which has no inherent Rt affinity).
+        set_current_rt(entry.rt_ptr as *const Rt);
+
         // Check the goroutine's status before calling goready.  If the
         // goroutine is still GRUNNABLE (preempted mid-sleep before gopark),
         // re-insert a near-immediate timer rather than spinning or asserting.
-        let s = unsafe { readgstatus(gp) };
+        let s = unsafe { readgstatus(entry.gp) };
         if s == GWAITING {
-            unsafe { goready(gp) };
+            unsafe { goready(entry.gp) };
         } else {
-            // Goroutine is not yet parked.  Schedule a retry 5 ms from now;
-            // by then the goroutine will have called gopark and be GWAITING.
-            to_retry.push(gp);
+            to_retry.push(entry);
         }
     }
+
+    // Reset CURRENT_RT on the timer thread to null when done.
+    set_current_rt(std::ptr::null());
 
     if !to_retry.is_empty() {
         let retry_when = mono_ns().saturating_add(5_000_000); // +5 ms
         let mut heap = TIMER_HEAP.lock().unwrap();
-        for gp in to_retry {
-            heap.push(TimerEntry { when: retry_when, gp });
+        for entry in to_retry {
+            heap.push(TimerEntry { when: retry_when, gp: entry.gp, rt_ptr: entry.rt_ptr });
         }
     }
 }
@@ -243,10 +263,11 @@ pub(crate) unsafe fn sleep(d: Duration) {
 
     // Insert the timer.  If it is the earliest, wake the timer thread so it
     // re-evaluates its sleep deadline.
+    let rt_ptr = current_rt_ptr() as usize;
     let need_unpark = {
         let mut heap = TIMER_HEAP.lock().unwrap();
         let was_earliest = heap.peek().map(|e| e.when > when).unwrap_or(true);
-        heap.push(TimerEntry { when, gp });
+        heap.push(TimerEntry { when, gp, rt_ptr });
         was_earliest
     };
 

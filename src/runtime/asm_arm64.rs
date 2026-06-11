@@ -131,14 +131,15 @@ unsafe extern "C" fn mcall_asm(
         // x3 = fn_ptr
         "blr  x3",
 
-        // fn_ptr must never return.  If it does, execute an explicit trap
-        // so the failure is obvious rather than silently corrupt.
-        "brk  #0x1",
+        // If fn_ptr returns (shutdown path: schedule() returned), exit this
+        // OS thread cleanly rather than hitting a breakpoint trap.
+        "bl   {m_exit}",
 
-        pc = const GOBUF_PC_OFFSET,
-        sp = const GOBUF_SP_OFFSET,
-        bp = const GOBUF_BP_OFFSET,
-        g  = const GOBUF_G_OFFSET,
+        pc     = const GOBUF_PC_OFFSET,
+        sp     = const GOBUF_SP_OFFSET,
+        bp     = const GOBUF_BP_OFFSET,
+        g      = const GOBUF_G_OFFSET,
+        m_exit = sym crate::runtime::sched::m_thread_exit,
     )
 }
 
