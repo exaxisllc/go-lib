@@ -348,9 +348,12 @@ pub(crate) unsafe fn systemstack<F: FnOnce()>(f: F) {
 /// by LLVM) on Darwin, Windows, Android, and Fuchsia, so clobbering it on
 /// macOS is guaranteed safe.  Go avoids this with its dedicated REGTMP (x27),
 /// which its own compiler never keeps live at preemption points — a luxury
-/// Rust code does not have.  On `aarch64-unknown-linux-gnu` x18 is
-/// allocatable, so a (very unlikely) interrupt with live x18 could corrupt
-/// it; tracked as a follow-up if Linux/aarch64 becomes a supported target.
+/// Rust code does not have.  On `aarch64-unknown-linux-gnu` x18 IS
+/// allocatable, so this trampoline would corrupt a live x18 there; for that
+/// reason `preemptone` (sysmon.rs) never sends SIGURG on Linux/aarch64 —
+/// preemption is cooperative-only on that target, and this trampoline is
+/// unreachable.  Re-enable once builds can require
+/// `-Ctarget-feature=+reserve-x18`.
 ///
 /// Ported from the auto-generated `asyncPreempt` in `runtime/preempt_arm64.s`
 /// plus `sigctxt.pushCall` in `runtime/signal_arm64.go`.

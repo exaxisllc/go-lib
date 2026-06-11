@@ -286,6 +286,9 @@ unsafe fn overlapped_recv(s: Socket, buf: &mut [u8]) -> io::Result<usize> {
     // Allocate the per-operation state on the heap so it outlives the park.
     let mut op: Box<IocpOp> = Box::new(unsafe { std::mem::zeroed() });
     op.gp = gp;
+    // Tag the op with the owning Rt: the IOCP is process-wide, so the
+    // completion may be harvested by another Rt's sysmon/findrunnable.
+    op.rt_ptr = crate::runtime::sched::current_rt_ptr() as usize;
     let op_ptr = Box::into_raw(op);
 
     let mut wsa_buf = WsaBuf {
@@ -343,6 +346,8 @@ unsafe fn overlapped_send(s: Socket, buf: &[u8]) -> io::Result<usize> {
 
     let mut op: Box<IocpOp> = Box::new(unsafe { std::mem::zeroed() });
     op.gp = gp;
+    // Tag the op with the owning Rt — see overlapped_recv.
+    op.rt_ptr = crate::runtime::sched::current_rt_ptr() as usize;
     let op_ptr = Box::into_raw(op);
 
     let mut wsa_buf = WsaBuf {
