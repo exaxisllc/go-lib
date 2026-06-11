@@ -601,7 +601,70 @@ unsafe extern "C" fn sigsegv_handler(
         return; // handler return → OS retries the faulting instruction
     }
 
-    // Not a stack fault — chain to the previous handler.
+    // Not a stack fault — print async-signal-safe diagnostics, then chain.
+    // Mirrors the SIGBUS handler in sched.rs: write(2) only, no allocation.
+    {
+        #[inline(always)]
+        unsafe fn sig_write(msg: &[u8]) {
+            unsafe { libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len()) };
+        }
+        #[inline(always)]
+        unsafe fn sig_hex(label: &[u8], val: u64) {
+            unsafe { sig_write(label) };
+            const H: &[u8] = b"0123456789abcdef";
+            let mut buf = [b'0'; 19];
+            buf[0] = b'0'; buf[1] = b'x';
+            for i in 0..16usize { buf[17 - i] = H[((val >> (i * 4)) & 0xf) as usize]; }
+            buf[18] = b'\n';
+            unsafe { sig_write(&buf) };
+        }
+        unsafe {
+            sig_write(b"[go-lib SIGSEGV] non-stack fault\n");
+            sig_hex(b"[go-lib SIGSEGV] fault_addr = ", fault_addr as u64);
+        }
+        let gp = current_g();
+        if !gp.is_null() {
+            unsafe {
+                sig_hex(b"[go-lib SIGSEGV] g.stack.lo = ", (*gp).stack.lo as u64);
+                sig_hex(b"[go-lib SIGSEGV] g.stack.hi = ", (*gp).stack.hi as u64);
+            }
+        }
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if !ctx.is_null() {
+            unsafe {
+                let uc = ctx as *mut libc::ucontext_t;
+                let ss = &(*(*uc).uc_mcontext).__ss;
+                sig_hex(b"[go-lib SIGSEGV] PC = ", ss.__pc);
+                sig_hex(b"[go-lib SIGSEGV] LR = ", ss.__lr);
+                sig_hex(b"[go-lib SIGSEGV] SP = ", ss.__sp);
+                sig_hex(b"[go-lib SIGSEGV] FP = ", ss.__fp);
+                sig_hex(b"[go-lib SIGSEGV] x19 = ", ss.__x[19]);
+                sig_hex(b"[go-lib SIGSEGV] x20 = ", ss.__x[20]);
+                sig_hex(b"[go-lib SIGSEGV] x21 = ", ss.__x[21]);
+                sig_hex(b"[go-lib SIGSEGV] x22 = ", ss.__x[22]);
+            }
+        }
+        #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+        if !ctx.is_null() {
+            unsafe {
+                let uc = ctx as *mut libc::ucontext_t;
+                let ss = &(*(*uc).uc_mcontext).__ss;
+                sig_hex(b"[go-lib SIGSEGV] RIP = ", ss.__rip);
+                sig_hex(b"[go-lib SIGSEGV] RSP = ", ss.__rsp);
+            }
+        }
+        let mp = super::m::current_m();
+        if !mp.is_null() {
+            let g0 = unsafe { (*mp).g0 };
+            if !g0.is_null() {
+                unsafe {
+                    sig_hex(b"[go-lib SIGSEGV] g0.stack.lo = ", (*g0).stack.lo as u64);
+                    sig_hex(b"[go-lib SIGSEGV] g0.stack.hi = ", (*g0).stack.hi as u64);
+                }
+            }
+        }
+    }
+
     let prev = *PREV_SIGSEGV.lock().unwrap();
     match prev {
         Some(old) if old.sa_sigaction != libc::SIG_DFL

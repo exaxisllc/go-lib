@@ -2557,19 +2557,28 @@ mod tests {
 
         const N: usize = 64;
 
-        let exited    = Arc::new(AtomicUsize::new(0));
-        let checked   = Arc::new(AtomicUsize::new(0));
-        let max_locks = Arc::new(AtomicI32::new(0));
+        let exited     = Arc::new(AtomicUsize::new(0));
+        let checked    = Arc::new(AtomicUsize::new(0));
+        // Maximum `m.locks` observed at goroutine entry, per batch.  Batch 1
+        // samples BEFORE any goroutine has exited (a nonzero value there
+        // means the stray count predates the goexit path — spawn/ready side);
+        // batch 2 samples after 64 exits (nonzero only here ⇒ exit-path leak).
+        let max_locks1 = Arc::new(AtomicI32::new(0));
+        let max_locks2 = Arc::new(AtomicI32::new(0));
 
-        let exited_w    = Arc::clone(&exited);
-        let checked_w   = Arc::clone(&checked);
-        let max_locks_w = Arc::clone(&max_locks);
+        let exited_w     = Arc::clone(&exited);
+        let checked_w    = Arc::clone(&checked);
+        let max_locks1_w = Arc::clone(&max_locks1);
+        let max_locks2_w = Arc::clone(&max_locks2);
 
         run_impl(move || {
-            // Batch 1: N goroutines that immediately exit.
+            // Batch 1: N goroutines that record their M's `locks` and exit.
             for _ in 0..N {
-                let exited = Arc::clone(&exited_w);
+                let exited     = Arc::clone(&exited_w);
+                let max_locks1 = Arc::clone(&max_locks1_w);
                 spawn_goroutine(move || {
+                    let locks = unsafe { (*current_m()).locks };
+                    max_locks1.fetch_max(locks, Ordering::AcqRel);
                     exited.fetch_add(1, Ordering::AcqRel);
                 });
             }
@@ -2577,13 +2586,14 @@ mod tests {
                 unsafe { gosched() };
             }
 
-            // Batch 2: N checkers recording their M's `locks` at entry.
+            // Batch 2: N checkers recording their M's `locks` at entry,
+            // after every batch-1 goroutine has run the goexit path.
             for _ in 0..N {
-                let checked   = Arc::clone(&checked_w);
-                let max_locks = Arc::clone(&max_locks_w);
+                let checked    = Arc::clone(&checked_w);
+                let max_locks2 = Arc::clone(&max_locks2_w);
                 spawn_goroutine(move || {
                     let locks = unsafe { (*current_m()).locks };
-                    max_locks.fetch_max(locks, Ordering::AcqRel);
+                    max_locks2.fetch_max(locks, Ordering::AcqRel);
                     checked.fetch_add(1, Ordering::AcqRel);
                 });
             }
@@ -2592,11 +2602,14 @@ mod tests {
             }
         });
 
-        assert_eq!(
-            max_locks.load(Ordering::Acquire),
-            0,
-            "m.locks did not return to 0 after goroutine exits — the goexit \
-             path leaked an increment, permanently disabling async preemption"
+        let m1 = max_locks1.load(Ordering::Acquire);
+        let m2 = max_locks2.load(Ordering::Acquire);
+        assert!(
+            m1 == 0 && m2 == 0,
+            "m.locks nonzero at goroutine entry (batch1 max = {m1}, batch2 \
+             max = {m2}) — batch1 > 0 means the stray count predates any \
+             goroutine exit (spawn/ready side); batch2-only means the goexit \
+             path leaked an increment"
         );
     }
 
