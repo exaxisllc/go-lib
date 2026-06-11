@@ -287,16 +287,10 @@ pub(crate) fn netpoll_clear_reg() {
 /// # Safety
 /// Must not be called concurrently with itself on the same poll handle.
 pub(crate) unsafe fn netpoll_wait(timeout_ms: i32) -> Vec<(*mut G, usize)> {
-    // Windows: drain the IOCP.  IOCP ops are not yet Rt-tagged; attribute
-    // wakeups to the polling thread's Rt (the pre-existing behaviour).
+    // Windows: drain the IOCP.  Each IocpOp carries the Rt captured when the
+    // operation was submitted on the goroutine's own M.
     #[cfg(windows)]
-    {
-        let rt_ptr = super::sched::current_rt_ptr() as usize;
-        return unsafe { iocp_win_wait(timeout_ms) }
-            .into_iter()
-            .map(|gp| (gp, rt_ptr))
-            .collect();
-    }
+    return unsafe { iocp_win_wait(timeout_ms) };
 
     // Unix: drain epoll / kqueue.
     #[cfg(not(windows))]
@@ -535,6 +529,11 @@ pub(crate) struct IocpOp {
     pub overlapped:        WinOverlapped,
     /// Goroutine waiting for this operation.
     pub gp:                *mut G,
+    /// The `Rt` that owns `gp`, captured at submission time (the op is
+    /// created on the goroutine's own M).  The IOCP handle is process-wide
+    /// and shared between concurrent `run_impl` invocations, so completions
+    /// must carry their owner — same rationale as the Unix `REG` rt tagging.
+    pub rt_ptr:            usize,
     /// Bytes transferred; written by `netpoll_wait` on completion.
     pub bytes_transferred: u32,
     /// NTSTATUS completion code (0 = STATUS_SUCCESS).
@@ -649,11 +648,12 @@ pub(crate) fn netpoll_iocp_associate(socket: usize) -> bool {
 
 // ── Completion drain ────────────────────────────────────────────────────────
 
-/// Drain the IOCP and return all goroutines whose operations completed.
+/// Drain the IOCP and return `(goroutine, owning rt_ptr)` pairs for every
+/// completed operation.
 ///
 /// Follows the same `timeout_ms` convention as `netpoll_wait`.
 #[cfg(windows)]
-unsafe fn iocp_win_wait(timeout_ms: i32) -> Vec<*mut G> {
+unsafe fn iocp_win_wait(timeout_ms: i32) -> Vec<(*mut G, usize)> {
     let iocp = netpoll_iocp_handle();
     if iocp.is_null() {
         return Vec::new();
@@ -691,7 +691,7 @@ unsafe fn iocp_win_wait(timeout_ms: i32) -> Vec<*mut G> {
         unsafe {
             (*op).bytes_transferred = entries[i].bytes_transferred;
             (*op).ntstatus          = entries[i].internal as u32;
-            goroutines.push((*op).gp);
+            goroutines.push(((*op).gp, (*op).rt_ptr));
         }
     }
     goroutines

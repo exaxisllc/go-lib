@@ -321,8 +321,19 @@ unsafe fn preemptone(pp: *mut super::p::P) {
 
     // Unix only: send SIGURG to the M's OS thread.  Windows has no pthread_kill;
     // the preempt flag is set above and the goroutine will yield cooperatively.
-    #[cfg(not(windows))]
+    //
+    // Linux/aarch64 is ALSO cooperative-only: the async-preempt trampoline's
+    // final branch needs a scratch register the interrupted code can afford
+    // to lose, and we use x18 — reserved (never register-allocated) on
+    // Darwin/Windows/Android/Fuchsia, but allocatable on
+    // aarch64-unknown-linux-gnu, where an interrupt with live x18 would be
+    // silently corrupted.  Re-enable once builds can require
+    // `-Ctarget-feature=+reserve-x18` (or a REGTMP-style scheme exists).
+    // See `async_preempt_trampoline` in asm_arm64.rs.
+    #[cfg(all(not(windows), not(all(target_os = "linux", target_arch = "aarch64"))))]
     unsafe { libc::pthread_kill(pthread_id as libc::pthread_t, libc::SIGURG) };
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    let _ = pthread_id;
 }
 
 // ---------------------------------------------------------------------------
