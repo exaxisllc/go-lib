@@ -278,8 +278,15 @@ pub(crate) unsafe fn findrunnable() -> Option<*mut G> {
         {
             let ready = unsafe { super::netpoll::netpoll_wait(0) };
             let _cs = super::rcu::RcuGuard::new();
-            for gp in ready {
-                unsafe { super::park::goready(gp) };
+            let my_rt = current_rt_ptr() as usize;
+            for (gp, rt_ptr) in ready {
+                if rt_ptr == my_rt {
+                    unsafe { super::park::goready(gp) };
+                } else {
+                    // The poll fd is shared between concurrent run_impls —
+                    // this readiness event belongs to another Rt's goroutine.
+                    unsafe { super::park::goready_remote(gp, rt_ptr as *const Rt) };
+                }
             }
         }
 

@@ -140,8 +140,16 @@ fn sysmon_loop(rt_addr: usize) {
             if !ready.is_empty() {
                 idle = 0;
                 let _cs = super::rcu::RcuGuard::new();
-                for gp in ready {
-                    unsafe { super::park::goready(gp) };
+                let my_rt = rt as *const Rt as usize;
+                for (gp, rt_ptr) in ready {
+                    if rt_ptr == my_rt {
+                        unsafe { super::park::goready(gp) };
+                    } else {
+                        // Shared poll fd: this wakeup belongs to a different
+                        // Rt (another concurrent run_impl).  Route it to the
+                        // owner's global run queue.
+                        unsafe { super::park::goready_remote(gp, rt_ptr as *const Rt) };
+                    }
                 }
             }
         }
