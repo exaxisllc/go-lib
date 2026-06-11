@@ -177,6 +177,17 @@ pub(crate) unsafe fn gogo(g: *mut G) -> ! {
 /// debug builds if it has not been set yet.
 ///
 /// Ported from `runtime·mcall` in `runtime/proc.go` + `runtime/asm_arm64.s`.
+///
+/// ## Why `#[inline(never)]` is load-bearing
+///
+/// Same reason as the x86-64 `mcall` (see `asm_amd64.rs`): if this function
+/// is inlined into a caller that yields more than once, LLVM CSEs the
+/// `G0_SCHED` TLS accessor and carries the slot address across the
+/// suspension in a callee-saved register.  After a cross-thread resume the
+/// next yield then switches onto the *old* thread's g0 stack, corrupting
+/// that M's live scheduler frames.  Out-of-lining forces the TLS read to be
+/// re-derived on the current thread at every suspension point.
+#[inline(never)]
 pub(crate) unsafe fn mcall(g: *mut G, fn_ptr: unsafe extern "C" fn(*mut G)) {
     unsafe {
         let g_sched  = addr_of_mut!((*g).sched);

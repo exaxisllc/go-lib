@@ -363,6 +363,24 @@ pub(crate) unsafe fn gogo(g: *mut G) -> ! {
 /// debug builds if it has not been set yet.
 ///
 /// Ported from `runtime·mcall` in `runtime/proc.go` + `runtime/asm_amd64.s`.
+///
+/// ## Why `#[inline(never)]` is load-bearing
+///
+/// `mcall` reads the thread-local `G0_SCHED` and passes the resulting gobuf
+/// pointer to `mcall_asm`, which switches RSP onto that g0 stack.  The call
+/// to `mcall_asm` is a *suspension point*: the goroutine may resume on a
+/// different OS thread (another M `gogo`s it).  If `mcall` is inlined into a
+/// caller that yields more than once (e.g. a `gosched()` loop), LLVM CSEs the
+/// `G0_SCHED` TLS accessor and keeps the **slot address** in a callee-saved
+/// register across the suspension.  After a cross-thread resume that cached
+/// address still points at the *old* thread's slot, so the next yield runs
+/// the scheduler on the old M's g0 stack — corrupting the live scheduler
+/// frames of whatever that M is doing (observed as SIGBUS `ret`-to-heap in
+/// release builds with GOMAXPROCS ≥ 2).  Keeping `mcall` out-of-line forces
+/// the TLS slot address to be re-derived on the current thread at every
+/// suspension, the same rule Go enforces by forbidding TLS caching across
+/// `mcall`/`gopark` in its compiler.
+#[inline(never)]
 pub(crate) unsafe fn mcall(g: *mut G, fn_ptr: unsafe extern "C" fn(*mut G)) {
     unsafe {
         let g_sched  = addr_of_mut!((*g).sched);
