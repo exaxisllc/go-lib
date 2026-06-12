@@ -5,16 +5,13 @@
 //! ## Why a separate test file
 //!
 //! go-lib's netpoll backend (kqueue on macOS, epoll on Linux) is a
-//! process-global singleton: it stores raw goroutine pointers keyed to fds.
-//! When two `go_lib::run()` calls execute concurrently in the same process,
-//! goroutine pointers from one scheduler can collide with those of another on
-//! the shared netpoll, leaving goroutines permanently parked.
-//!
-//! Placing the networking tests in their own integration test file causes
-//! Cargo to compile them into a separate binary that runs in its own OS
-//! process.  That process has an independent scheduler and netpoll instance,
-//! completely isolated from `tests/integration.rs` (which includes the
-//! `many_goroutines` test that spawns 75,000 goroutines).
+//! process-global part of the singleton scheduler.  Since the singleton-Rt
+//! refactor, concurrent `go_lib::run()` calls share one scheduler and tag
+//! netpoll registrations per invocation, so cross-run pointer collisions are
+//! no longer possible — but keeping the networking tests in their own binary
+//! (and thus their own OS process) still isolates them from the resource
+//! pressure of `tests/integration.rs` (whose `many_goroutines` test spawns
+//! 75,000 goroutines) and keeps port usage independent.
 //!
 //! Within this binary the tests still run concurrently (one thread per CPU),
 //! which is fine: all tests use a single `go_lib::run()` that drives the
@@ -30,11 +27,11 @@ use go_lib::{
     sync::WaitGroup,
 };
 
-// go-lib's netpoll backend is a process-global singleton that stores raw
-// goroutine pointers keyed to fds.  If two `go_lib::run()` calls run
-// concurrently in the same process (the default: one OS thread per CPU),
-// goroutine pointers from different schedulers collide on the shared netpoll
-// and leave goroutines permanently parked.
+// Historical note: NET_LOCK predates the singleton-Rt refactor, when
+// concurrent `go_lib::run()` calls had separate schedulers whose goroutine
+// pointers could collide on the shared netpoll.  That hazard is gone; the
+// lock is kept because serialising network tests also avoids port/fd
+// contention flakiness and costs little.
 //
 // Every test in this file is a network test, so serialising them all with
 // NET_LOCK is correct and complete — no non-networking test exists here that

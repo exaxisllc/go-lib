@@ -2844,16 +2844,12 @@ mod tests {
     /// returns.  After `run_impl` returns, the drain should have
     /// transitioned them to GDEAD and reclaimed their stacks.
     ///
-    /// Because `cargo test` runs tests in parallel by default and Phase 2b
-    /// only fires when *no other* `run_impl` is in flight, the drain may
-    /// not run on every invocation of this test.  Instead of asserting on
-    /// `allg` (which is shared and noisy), we observe a global counter
-    /// (`PHASE_2B_DRAINED_COUNT`) that increments by the number of
-    /// goroutines drained on each successful drain.  We repeat the
-    /// test body in a loop until the counter has advanced, with a
-    /// generous deadline — every test in this binary spawns its own
-    /// goroutines, so a drain firing somewhere is overwhelmingly likely
-    /// within the deadline.
+    /// With the singleton scheduler and per-invocation tagging, the drain
+    /// fires for this invocation's goroutines on every `run_impl` exit —
+    /// concurrent tests no longer suppress it.  We still observe the global
+    /// `PHASE_2B_DRAINED_COUNT` counter (rather than `allg`, which is
+    /// shared and noisy) and keep the retry loop as belt-and-braces; it
+    /// normally succeeds on the first iteration.
     #[test]
     fn phase_2b_drain_reclaims_gwaiting() {
         use crate::chan::chan;
