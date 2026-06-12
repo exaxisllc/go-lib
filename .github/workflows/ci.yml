@@ -156,7 +156,9 @@ jobs:
         env:
           RUSTFLAGS: "--cfg loom"
           LOOM_MAX_PERMUTATIONS: "10000"
-        run: cargo test -- --test-threads 1
+        # --nocapture: surface the async-signal-safe SIGSEGV handler dump
+        # in the job log if a test crashes (otherwise libtest swallows it).
+        run: cargo test -- --test-threads 1 --nocapture
 
   coverage:
     name: Coverage
