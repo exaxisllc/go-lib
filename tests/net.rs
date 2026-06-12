@@ -27,23 +27,12 @@ use go_lib::{
     sync::WaitGroup,
 };
 
-// Historical note: NET_LOCK predates the singleton-Rt refactor, when
-// concurrent `go_lib::run()` calls had separate schedulers whose goroutine
-// pointers could collide on the shared netpoll.  That hazard is gone; the
-// lock is kept because serialising network tests also avoids port/fd
-// contention flakiness and costs little.
-//
-// Every test in this file is a network test, so serialising them all with
-// NET_LOCK is correct and complete — no non-networking test exists here that
-// might interleave without holding the lock.
-static NET_LOCK: Mutex<()> = Mutex::new(());
 
 // ---------------------------------------------------------------------------
 // 1. TcpListener::local_addr — bind to port 0, confirm OS assigned a port
 // ---------------------------------------------------------------------------
 #[test]
 fn net_listener_local_addr() {
-    let _g = NET_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     go_lib::run(|| {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind failed");
         let addr = listener.local_addr().expect("local_addr failed");
@@ -59,7 +48,6 @@ fn net_listener_local_addr() {
 // ---------------------------------------------------------------------------
 #[test]
 fn net_read_write_mut_ref() {
-    let _g = NET_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     go_lib::run(|| {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr     = listener.local_addr().unwrap();
@@ -93,7 +81,6 @@ fn net_read_write_mut_ref() {
 // ---------------------------------------------------------------------------
 #[test]
 fn net_read_write_shared_ref() {
-    let _g = NET_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     go_lib::run(|| {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr     = listener.local_addr().unwrap();
@@ -127,7 +114,6 @@ fn net_read_write_shared_ref() {
 // ---------------------------------------------------------------------------
 #[test]
 fn net_try_clone_split_halves() {
-    let _g = NET_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     go_lib::run(|| {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr     = listener.local_addr().unwrap();
@@ -162,7 +148,6 @@ fn net_try_clone_split_halves() {
 // ---------------------------------------------------------------------------
 #[test]
 fn net_try_clone_separate_goroutines() {
-    let _g = NET_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     go_lib::run(|| {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr     = listener.local_addr().unwrap();
@@ -208,7 +193,6 @@ fn net_try_clone_separate_goroutines() {
 // ---------------------------------------------------------------------------
 #[test]
 fn net_peer_and_local_addr() {
-    let _g = NET_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     go_lib::run(|| {
         let listener    = TcpListener::bind("127.0.0.1:0").unwrap();
         let listen_addr = listener.local_addr().unwrap();
@@ -244,7 +228,6 @@ fn net_peer_and_local_addr() {
 // ---------------------------------------------------------------------------
 #[test]
 fn net_bufreader_adapter() {
-    let _g = NET_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     go_lib::run(|| {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr     = listener.local_addr().unwrap();
@@ -283,7 +266,6 @@ fn net_bufreader_adapter() {
 // ---------------------------------------------------------------------------
 #[test]
 fn net_concurrent_connections() {
-    let _g = NET_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     const N: usize = 8;
 
     go_lib::run(|| {
@@ -344,7 +326,6 @@ fn net_concurrent_connections() {
 // ---------------------------------------------------------------------------
 #[test]
 fn net_large_payload() {
-    let _g = NET_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     go_lib::run(|| {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr     = listener.local_addr().unwrap();

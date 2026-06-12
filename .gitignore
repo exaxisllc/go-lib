@@ -1,1 +1,4 @@
 /target
+core
+loom_linux_fail*.log
+loom_linux_bins/

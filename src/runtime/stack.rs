@@ -653,6 +653,21 @@ unsafe extern "C" fn sigsegv_handler(
                 sig_hex(b"[go-lib SIGSEGV] RSP = ", ss.__rsp);
             }
         }
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        if !ctx.is_null() {
+            unsafe {
+                let uc = ctx as *mut libc::ucontext_t;
+                let gregs = &(*uc).uc_mcontext.gregs;
+                sig_hex(b"[go-lib SIGSEGV] RIP = ", gregs[libc::REG_RIP as usize] as u64);
+                sig_hex(b"[go-lib SIGSEGV] RSP = ", gregs[libc::REG_RSP as usize] as u64);
+                sig_hex(b"[go-lib SIGSEGV] RBP = ", gregs[libc::REG_RBP as usize] as u64);
+                sig_hex(b"[go-lib SIGSEGV] RBX = ", gregs[libc::REG_RBX as usize] as u64);
+                sig_hex(b"[go-lib SIGSEGV] R12 = ", gregs[libc::REG_R12 as usize] as u64);
+                sig_hex(b"[go-lib SIGSEGV] R13 = ", gregs[libc::REG_R13 as usize] as u64);
+                sig_hex(b"[go-lib SIGSEGV] R14 = ", gregs[libc::REG_R14 as usize] as u64);
+                sig_hex(b"[go-lib SIGSEGV] R15 = ", gregs[libc::REG_R15 as usize] as u64);
+            }
+        }
         let mp = super::m::current_m();
         if !mp.is_null() {
             let g0 = unsafe { (*mp).g0 };
