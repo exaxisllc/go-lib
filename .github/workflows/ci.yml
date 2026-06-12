@@ -92,14 +92,13 @@ jobs:
         # entries — see examples/stress_drain_timer.rs).  On the buggy
         # runtime this crashes (malloc abort / NULL deref in chanrecv) or
         # hangs within seconds; the job timeout converts a hang into a
-        # failure.  Bounded both by wall clock (15 s) and by per-worker
-        # iteration cap (300): every run_impl leaks its Rt by design, so an
-        # unbounded loop on a fast runner exhausts address space
-        # (VirtualAlloc failures on Windows at ~2 000 Rts/s) — a resource
-        # limit, not a scheduler bug.
+        # failure.  With the singleton scheduler each run_impl leaks only a
+        # 16-byte InvState, so the canary can run tens of thousands of
+        # iterations in its 15-second window; the per-worker cap just bounds
+        # runtime on very fast runners.
         timeout-minutes: 3
         shell: bash
-        run: cargo run --release --example stress_drain_timer 15 300
+        run: cargo run --release --example stress_drain_timer 15 100000
 
       - name: cargo doc (no deps, no-run)
         run: cargo doc --no-deps
@@ -157,7 +156,9 @@ jobs:
         env:
           RUSTFLAGS: "--cfg loom"
           LOOM_MAX_PERMUTATIONS: "10000"
-        run: cargo test -- --test-threads 1
+        # --nocapture: surface the async-signal-safe SIGSEGV handler dump
+        # in the job log if a test crashes (otherwise libtest swallows it).
+        run: cargo test -- --test-threads 1 --nocapture
 
   coverage:
     name: Coverage

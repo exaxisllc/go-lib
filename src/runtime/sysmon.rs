@@ -146,16 +146,11 @@ fn sysmon_loop(rt_addr: usize) {
             let ready = unsafe { super::netpoll::netpoll_wait(0) };
             if !ready.is_empty() {
                 idle = 0;
-                let my_rt = rt as *const Rt as usize;
-                for (gp, rt_ptr) in ready {
-                    if rt_ptr == my_rt {
-                        unsafe { super::park::goready(gp) };
-                    } else {
-                        // Shared poll fd: this wakeup belongs to a different
-                        // Rt (another concurrent run_impl).  Route it to the
-                        // owner's global run queue.
-                        unsafe { super::park::goready_remote(gp, rt_ptr as *const Rt) };
-                    }
+                // Singleton scheduler: every harvested goroutine belongs to
+                // this Rt; plain goready is always correct (its GDEAD check
+                // handles already-drained invocations).
+                for (gp, _inv) in ready {
+                    unsafe { super::park::goready(gp) };
                 }
             }
         }

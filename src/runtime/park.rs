@@ -25,7 +25,7 @@ use std::ptr;
 
 use super::g::{casgstatus, current_g, readgstatus, set_current_g, G, GPREEMPTED, GRUNNABLE, GRUNNING, GWAITING, WaitReason};
 use super::m::current_m;
-use super::sched::{current_rt_ptr, sched, schedule, set_current_rt, startm};
+use super::sched::{sched, schedule, startm};
 
 #[cfg(target_arch = "x86_64")]
 use super::asm_amd64::mcall;
@@ -64,6 +64,23 @@ pub(crate) fn gopark(reason: WaitReason) {
 /// Sets G status to `Gwaiting`, unlinks G from the M, and enters `schedule`.
 unsafe extern "C" fn park_fn(gp: *mut G) {
     let m = current_m();
+
+    // Dead-invocation check MUST come before the GWAITING transition, while
+    // this M still exclusively owns gp.  The moment the status becomes
+    // GWAITING, a waker can make the G runnable, another M can run it to
+    // completion, and goexit0 frees the Box<G> — making any later deref of
+    // gp here a use-after-free (observed on macOS arm64 CI as a garbage
+    // `(*gp).inv` dereference inside the reaper).  reap_parking_if_dead
+    // transitions GRUNNING → GDEAD directly, so no waker can ever claim the
+    // G and this M retains exclusive ownership throughout.
+    if unsafe { super::sched::reap_parking_if_dead(gp) } {
+        unsafe {
+            (*m).curg = ptr::null_mut();
+            set_current_g(ptr::null_mut());
+            schedule()
+        };
+        return;
+    }
 
     unsafe {
         casgstatus(gp, GRUNNING, GWAITING);
@@ -200,68 +217,6 @@ pub(crate) unsafe fn goready(gp: *mut G) {
     }
 }
 
-/// Wake a parked goroutine that belongs to a **different `Rt`** than the
-/// calling thread.
-///
-/// Netpoll shares one process-wide poll fd between every concurrent
-/// `run_impl` invocation, so an M-thread (or sysmon) of Rt-B can harvest a
-/// readiness event for a goroutine owned by Rt-A.  Calling plain [`goready`]
-/// there would enqueue A's goroutine on B's local P — B's scheduler would
-/// then execute a foreign G against the wrong run queues, `allg`, and
-/// shutdown flag.  This variant always takes the **global-queue path of the
-/// owning `Rt`**, temporarily binding `CURRENT_RT` so `startm` wakes one of
-/// the owner's M-threads.
-///
-/// The status-spin protocol mirrors [`goready`]; see its doc-comment.
-pub(crate) unsafe fn goready_remote(gp: *mut G, rt: *const super::sched::Rt) {
-    use super::g::GDEAD;
-
-    // RCU read-side — same pairing as goready (Phase 2b drainer's DrainSync).
-    let _cs = super::rcu::RcuGuard::new();
-
-    loop {
-        let s = unsafe { readgstatus(gp) };
-        if s == GWAITING || s == GPREEMPTED {
-            // Single CAS attempt, re-inspect on failure — same rationale as
-            // goready: a racing Phase 2b drain can CAS GWAITING → GDEAD, and
-            // a spinning `casgstatus` here would deadlock holding the
-            // RcuGuard.
-            let won = unsafe {
-                (*gp).atomicstatus
-                    .compare_exchange(s, GRUNNABLE, std::sync::atomic::Ordering::AcqRel,
-                                      std::sync::atomic::Ordering::Relaxed)
-                    .is_ok()
-            };
-            if won {
-                break;
-            }
-            continue; // lost a status race — re-inspect
-        }
-        if s == GRUNNABLE || s == GDEAD {
-            return; // already queued / cancelled by the owner's drain
-        }
-        debug_assert!(
-            s == GRUNNING,
-            "goready_remote: unexpected status {s}"
-        );
-        std::hint::spin_loop();
-    }
-
-    // Suppress async preemption across the foreign Mutex critical section
-    // (same rationale as goready's m_lock guard).
-    let _lk = super::m::m_lock();
-
-    // Bind CURRENT_RT to the owner so startm operates on its idle lists,
-    // then restore the caller's binding.
-    let prev = current_rt_ptr();
-    set_current_rt(rt);
-    unsafe {
-        (*gp).schedlink = ptr::null_mut();
-        (*rt).global_run_q.push_batch(gp, gp, 1);
-        startm(ptr::null_mut());
-    }
-    set_current_rt(prev);
-}
 
 // ---------------------------------------------------------------------------
 // Tests

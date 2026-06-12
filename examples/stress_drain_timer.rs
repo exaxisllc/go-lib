@@ -18,18 +18,12 @@
 //!
 //! Run with: cargo run --release --example stress_drain_timer [seconds] [iters-per-worker]
 //!
-//! ## Why iterations are capped
-//!
-//! Every `run_impl` invocation intentionally leaks its `Rt` (and the g0
-//! stacks of its M-threads) — see the `Box::leak` note in `run_impl`.  An
-//! uncapped wall-clock loop therefore consumes address space linearly with
-//! iteration speed; fast CI runners (observed: Windows at ~2 000 Rts/s vs
-//! ~25/s on a loaded macOS runner) exhaust it within seconds and die with
-//! `VirtualAlloc failed` in `M::new` — a resource failure, not a scheduler
-//! bug.  The per-worker cap bounds the total leak regardless of how fast
-//! the machine is, while still being far more iterations than the
-//! drain/wake races ever needed to reproduce (the unfixed runtime fell
-//! over within ~10 iterations).
+//! With the singleton scheduler, each `run_impl` invocation leaks only a
+//! 16-byte `InvState` (the per-call Rt/M-thread leak is gone), so memory
+//! stays flat even at tens of thousands of iterations per run.  The
+//! per-worker iteration cap exists only to bound runtime on very fast
+//! machines; the drain/wake races this canary guards reproduce within ~10
+//! iterations on a buggy runtime.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
