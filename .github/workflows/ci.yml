@@ -92,10 +92,14 @@ jobs:
         # entries — see examples/stress_drain_timer.rs).  On the buggy
         # runtime this crashes (malloc abort / NULL deref in chanrecv) or
         # hangs within seconds; the job timeout converts a hang into a
-        # failure.
+        # failure.  Bounded both by wall clock (15 s) and by per-worker
+        # iteration cap (300): every run_impl leaks its Rt by design, so an
+        # unbounded loop on a fast runner exhausts address space
+        # (VirtualAlloc failures on Windows at ~2 000 Rts/s) — a resource
+        # limit, not a scheduler bug.
         timeout-minutes: 3
         shell: bash
-        run: cargo run --release --example stress_drain_timer 15
+        run: cargo run --release --example stress_drain_timer 15 300
 
       - name: cargo doc (no deps, no-run)
         run: cargo doc --no-deps
