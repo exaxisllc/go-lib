@@ -86,6 +86,17 @@ jobs:
           cargo run --release --example scope_channel
           cargo run --release --example select_fanin
 
+      - name: stress canary (drain/wake races)
+        # Regression canary for the cross-Rt drain/wake races (timer-heap
+        # TOCTOU, netpoll harvest, nested RcuGuard deadlock, stale timer
+        # entries — see examples/stress_drain_timer.rs).  On the buggy
+        # runtime this crashes (malloc abort / NULL deref in chanrecv) or
+        # hangs within seconds; the job timeout converts a hang into a
+        # failure.
+        timeout-minutes: 3
+        shell: bash
+        run: cargo run --release --example stress_drain_timer 15
+
       - name: cargo doc (no deps, no-run)
         run: cargo doc --no-deps
         

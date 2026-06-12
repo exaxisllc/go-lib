@@ -136,10 +136,16 @@ fn sysmon_loop(rt_addr: usize) {
         // `*mut G` pointers loaded from REG) through the goready calls.
         // Pairs with the run_impl Phase 2b drainer's `DrainSync`.
         {
+            // The guard must be acquired BEFORE netpoll_wait: the harvest
+            // consumes each fd's REG entry, so once an event is popped the
+            // owning Rt's `netpoll_clear_reg` can no longer see it.  If the
+            // guard came after the harvest, a run_impl Phase 2b drain could
+            // slip in between, free the harvested `Box<G>` pointers, and we
+            // would wake freed (possibly recycled) goroutines.
+            let _cs = super::rcu::RcuGuard::new();
             let ready = unsafe { super::netpoll::netpoll_wait(0) };
             if !ready.is_empty() {
                 idle = 0;
-                let _cs = super::rcu::RcuGuard::new();
                 let my_rt = rt as *const Rt as usize;
                 for (gp, rt_ptr) in ready {
                     if rt_ptr == my_rt {
