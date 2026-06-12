@@ -65,17 +65,29 @@ pub(crate) fn gopark(reason: WaitReason) {
 unsafe extern "C" fn park_fn(gp: *mut G) {
     let m = current_m();
 
+    // Dead-invocation check MUST come before the GWAITING transition, while
+    // this M still exclusively owns gp.  The moment the status becomes
+    // GWAITING, a waker can make the G runnable, another M can run it to
+    // completion, and goexit0 frees the Box<G> — making any later deref of
+    // gp here a use-after-free (observed on macOS arm64 CI as a garbage
+    // `(*gp).inv` dereference inside the reaper).  reap_parking_if_dead
+    // transitions GRUNNING → GDEAD directly, so no waker can ever claim the
+    // G and this M retains exclusive ownership throughout.
+    if unsafe { super::sched::reap_parking_if_dead(gp) } {
+        unsafe {
+            (*m).curg = ptr::null_mut();
+            set_current_g(ptr::null_mut());
+            schedule()
+        };
+        return;
+    }
+
     unsafe {
         casgstatus(gp, GRUNNING, GWAITING);
         (*gp).m   = ptr::null_mut();
         (*m).curg = ptr::null_mut();
         set_current_g(ptr::null_mut());
     }
-
-    // A goroutine of a dead invocation (its run_impl already exited) has no
-    // waker coming — retire it now rather than leaking it as GWAITING.
-    // Safe here: the G is fully off-CPU (we are on g0) and off every queue.
-    unsafe { super::sched::reap_parked_if_dead(gp) };
 
     unsafe { schedule() };
 }

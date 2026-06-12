@@ -295,28 +295,29 @@ pub(crate) unsafe fn reap_if_dead_invocation(gp: *mut G) -> bool {
     true
 }
 
-/// Park-time variant of the reaper, called by `park_fn` after the
-/// `GRUNNING → GWAITING` transition.  A goroutine of a dead invocation that
-/// was still running when its `run_impl` exited (so the exit drain's CAS
-/// missed it) is caught here the moment it parks, instead of waiting
+/// Park-time variant of the reaper, called by `park_fn` BEFORE the
+/// `GRUNNING → GWAITING` transition — i.e. while the parking M still has
+/// exclusive ownership of `gp`.  A goroutine of a dead invocation that was
+/// still running when its `run_impl` exited (so the exit drain's CAS missed
+/// it) is caught here the moment it tries to park, instead of waiting
 /// forever for a waker that will never come.
 ///
-/// Racing a concurrent waker is fine: if `goready`'s `GWAITING → GRUNNABLE`
-/// CAS wins, ours fails and the G goes back through the run queue, where
-/// [`reap_if_dead_invocation`] catches it; if ours wins, the waker observes
-/// `GDEAD` and returns.
-pub(crate) unsafe fn reap_parked_if_dead(gp: *mut G) -> bool {
+/// The pre-transition placement is load-bearing: once the G is GWAITING, a
+/// waker can resume it on another M and `goexit0` can free it, so any later
+/// dereference of `gp` on this M would be a use-after-free (observed on
+/// macOS arm64 CI as a garbage `(*gp).inv` value inside the reaper).
+/// Going `GRUNNING → GDEAD` directly means no waker can ever claim the G
+/// (`goready`'s status loop returns on GDEAD), and ownership never leaves
+/// this M until the G is safely in the graveyard.
+pub(crate) unsafe fn reap_parking_if_dead(gp: *mut G) -> bool {
     let inv = unsafe { (*gp).inv };
     if inv.is_null() || !unsafe { (*inv).dead.load(Acquire) } {
         return false;
     }
-    let claimed = unsafe {
-        (*gp).atomicstatus
-            .compare_exchange(super::g::GWAITING, GDEAD, AcqRel, Relaxed)
-            .is_ok()
-    };
-    if !claimed {
-        return false;
+    // We own the G (GRUNNING) — the transition cannot be contended.
+    unsafe {
+        casgstatus(gp, GRUNNING, GDEAD);
+        (*gp).m = ptr::null_mut();
     }
     // See reap_if_dead_invocation: graveyard ∩ allg must be empty.
     {
