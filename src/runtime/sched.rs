@@ -47,7 +47,7 @@ use std::any::Any;
 use std::cell::Cell;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, Ordering::*};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use super::g::{casgstatus, current_g, readgstatus, set_current_g, G, Stack, GDEAD, GPREEMPTED, GRUNNABLE, GRUNNING, STACK_GUARD};
 use super::m::{current_m, M};
@@ -88,11 +88,12 @@ pub(crate) struct SchedInner {
 // SAFETY: All raw pointer access inside SchedInner is guarded by the Mutex.
 unsafe impl Send for SchedInner {}
 
-/// Per-`run_impl` scheduler state.  One instance is created (and leaked) for
-/// every `run_impl` call; each has its own run queues, M-threads, Ps, and
-/// goroutine registry, so concurrent `run_impl` invocations are fully isolated.
-///
-/// Replaces the old process-global `static SCHED: OnceLock<Sched>` singleton.
+/// The scheduler.  A single instance is created (and leaked) by the first
+/// `run_impl` call and serves the whole process — mirroring Go, where one
+/// runtime instance is never torn down.  Concurrent `run_impl` invocations
+/// share its run queues, M-threads, and Ps; they are isolated from each
+/// other by per-invocation `InvState` tagging on their goroutines, not by
+/// separate schedulers.
 pub(crate) struct Rt {
     /// Global run queue — goroutines that are runnable but not yet on any P.
     pub global_run_q: GlobalRunQueue,
@@ -104,12 +105,14 @@ pub(crate) struct Rt {
     pub inner:        Mutex<SchedInner>,
     /// Registry of every live goroutine (matches Go's `allgs`).
     pub allg:         Mutex<Vec<*mut G>>,
-    /// Set to `true` by `run_impl` after Phase 2b drain; causes idle M-threads
-    /// to exit their `schedule()` loops and terminate.
+    /// Never set in singleton mode — the process-wide scheduler is not torn
+    /// down (M-threads live for the process lifetime, like Go's).  The flag
+    /// and the M-exit paths that check it are kept as infrastructure for a
+    /// potential future full-teardown mode.
     pub shutdown:     AtomicBool,
 }
 
-// SAFETY: Rt is created once per run_impl and leaked for its lifetime.  All
+// SAFETY: Rt is created once per process and leaked for its lifetime.  All
 // fields carry their own synchronisation.  Raw-pointer access through allg and
 // the run queues is serialised by the scheduler's ownership invariants.
 unsafe impl Sync for Rt {}
@@ -125,7 +128,38 @@ thread_local! {
     /// `run_impl` calling thread (via `schedinit`).  Never set on bare OS
     /// threads that have no scheduler role.
     static CURRENT_RT: Cell<*const Rt> = Cell::new(ptr::null());
+
+    /// The `InvState` of the `run_impl` invocation owned by this thread.
+    /// Set by `run_impl` on the calling thread so that `spawn_goroutine`
+    /// can tag the wrapper goroutine (which has no parent G to inherit
+    /// from); goroutine-to-goroutine spawns inherit `G::inv` instead.
+    static CURRENT_INV: Cell<*const super::g::InvState> = Cell::new(ptr::null());
 }
+
+/// The process-wide singleton scheduler.  Initialised by the first
+/// `run_impl` call (which runs `schedinit`); every later call attaches to
+/// it by binding `CURRENT_RT`.  Mirrors Go, where one runtime instance
+/// serves the whole process and is never torn down.
+static GLOBAL_RT: OnceLock<&'static Rt> = OnceLock::new();
+
+/// Raw pointer to the singleton `Rt`, or null before the first `run_impl`.
+/// Used by process-shared threads (the timer thread) to bind `CURRENT_RT`
+/// lazily.
+#[inline]
+pub(crate) fn global_rt_ptr() -> *const Rt {
+    GLOBAL_RT.get().map_or(ptr::null(), |rt| *rt as *const Rt)
+}
+
+/// Counter backing `InvState.id`.
+static INV_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Goroutines reaped by the scheduler (runnable Gs of dead invocations, or
+/// zombies caught parking).  They are already `GDEAD` and unregistered from
+/// every waker; their stacks and `Box<G>`s are freed by the next `run_impl`
+/// exit drain under its `DrainSync` (freeing requires excluding in-flight
+/// RCU readers, which the scheduler hot path must not wait for).  Stored as
+/// `usize` because `*mut G` is not `Send`.
+static GRAVEYARD: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
 /// Return a reference to the calling thread's `Rt`.
 ///
@@ -188,6 +222,9 @@ pub(crate) unsafe fn schedule() {
         if tick % 61 == 0 && sched().global_run_q.len() > 0 {
             let gp = unsafe { sched().global_run_q.pop() };
             if !gp.is_null() {
+                if unsafe { reap_if_dead_invocation(gp) } {
+                    continue;
+                }
                 unsafe { execute(gp) }; // -> !, never returns
             }
         }
@@ -205,8 +242,92 @@ pub(crate) unsafe fn schedule() {
             }
         };
 
+        if unsafe { reap_if_dead_invocation(gp) } {
+            continue;
+        }
         unsafe { execute(gp) }; // -> !, never returns
     }
+}
+
+// ---------------------------------------------------------------------------
+// Dead-invocation reaper
+// ---------------------------------------------------------------------------
+
+/// If `gp` belongs to a `run_impl` invocation that has already exited,
+/// retire it instead of executing it: transition `GRUNNABLE → GDEAD`,
+/// unregister it from every waker, and push it onto the [`GRAVEYARD`] for
+/// the next exit drain to free.  Returns `true` if the G was reaped (the
+/// caller must not execute it).
+///
+/// Called by `schedule()` with exclusive ownership of the popped `gp` (it
+/// is off every run queue), so the status CAS cannot race another executor.
+/// It can race a `goready`-style waker only if the G were GWAITING — it is
+/// not — so a failed CAS means an unexpected state and we conservatively
+/// fall through to `execute` (its own `casgstatus` asserts).
+pub(crate) unsafe fn reap_if_dead_invocation(gp: *mut G) -> bool {
+    let inv = unsafe { (*gp).inv };
+    if inv.is_null() || !unsafe { (*inv).dead.load(Acquire) } {
+        return false;
+    }
+    let claimed = unsafe {
+        (*gp).atomicstatus
+            .compare_exchange(GRUNNABLE, GDEAD, AcqRel, Relaxed)
+            .is_ok()
+    };
+    if !claimed {
+        return false;
+    }
+    // Remove from the shared `allg` BEFORE pushing to the graveyard: a
+    // concurrent run_impl exit drain iterates `allg` and dereferences every
+    // entry — a graveyard G it could free must never still be visible
+    // there (invariant: graveyard ∩ allg = ∅).
+    {
+        let mut allg = sched().allg.lock().unwrap();
+        if let Some(pos) = allg.iter().position(|&p| p == gp) {
+            allg.swap_remove(pos);
+        }
+    }
+    // A woken-then-reaped G may still have select-loser sudogs enqueued on
+    // channels (selectgo cleans those up after resuming — which this G
+    // never will).  unregister_drained_g unlinks and releases them.
+    unsafe { unregister_drained_g(gp) };
+    GRAVEYARD.lock().unwrap().push(gp as usize);
+    true
+}
+
+/// Park-time variant of the reaper, called by `park_fn` after the
+/// `GRUNNING → GWAITING` transition.  A goroutine of a dead invocation that
+/// was still running when its `run_impl` exited (so the exit drain's CAS
+/// missed it) is caught here the moment it parks, instead of waiting
+/// forever for a waker that will never come.
+///
+/// Racing a concurrent waker is fine: if `goready`'s `GWAITING → GRUNNABLE`
+/// CAS wins, ours fails and the G goes back through the run queue, where
+/// [`reap_if_dead_invocation`] catches it; if ours wins, the waker observes
+/// `GDEAD` and returns.
+pub(crate) unsafe fn reap_parked_if_dead(gp: *mut G) -> bool {
+    let inv = unsafe { (*gp).inv };
+    if inv.is_null() || !unsafe { (*inv).dead.load(Acquire) } {
+        return false;
+    }
+    let claimed = unsafe {
+        (*gp).atomicstatus
+            .compare_exchange(super::g::GWAITING, GDEAD, AcqRel, Relaxed)
+            .is_ok()
+    };
+    if !claimed {
+        return false;
+    }
+    // See reap_if_dead_invocation: graveyard ∩ allg must be empty.
+    {
+        let mut allg = sched().allg.lock().unwrap();
+        if let Some(pos) = allg.iter().position(|&p| p == gp) {
+            allg.swap_remove(pos);
+        }
+    }
+    unsafe { unregister_drained_g(gp) };
+    GRAVEYARD.lock().unwrap().push(gp as usize);
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -283,15 +404,11 @@ pub(crate) unsafe fn findrunnable() -> Option<*mut G> {
             // before the goready calls below.
             let _cs = super::rcu::RcuGuard::new();
             let ready = unsafe { super::netpoll::netpoll_wait(0) };
-            let my_rt = current_rt_ptr() as usize;
-            for (gp, rt_ptr) in ready {
-                if rt_ptr == my_rt {
-                    unsafe { super::park::goready(gp) };
-                } else {
-                    // The poll fd is shared between concurrent run_impls —
-                    // this readiness event belongs to another Rt's goroutine.
-                    unsafe { super::park::goready_remote(gp, rt_ptr as *const Rt) };
-                }
+            // Singleton scheduler: every harvested goroutine belongs to this
+            // Rt, so plain goready is always correct (goready's GDEAD check
+            // handles entries whose invocation has already been drained).
+            for (gp, _inv) in ready {
+                unsafe { super::park::goready(gp) };
             }
         }
 
@@ -1994,6 +2111,17 @@ pub(crate) fn spawn_goroutine(f: impl FnOnce() + Send + 'static) {
         "spawn_goroutine called without an active Rt; call run_impl first"
     );
     let g_ptr = Box::into_raw(new_goroutine(f));
+    // Tag the new G with its invocation: inherit from the spawning
+    // goroutine, or — when spawned from the run_impl calling thread (the
+    // wrapper goroutine) — from the thread-local set by run_impl.
+    unsafe {
+        let parent = current_g();
+        (*g_ptr).inv = if !parent.is_null() {
+            (*parent).inv
+        } else {
+            CURRENT_INV.with(|c| c.get())
+        };
+    }
     // SAFETY: g_ptr is a freshly-allocated, uniquely-owned G.  push_batch and
     // startm are unsafe because they manipulate the scheduler's internal queues
     // without a typed lock; their preconditions (non-null pointer, valid G
@@ -2019,9 +2147,11 @@ pub(crate) fn spawn_goroutine(f: impl FnOnce() + Send + 'static) {
 // schedinit — create Ps and spawn M threads
 // ---------------------------------------------------------------------------
 
-/// Create a fresh `Rt`, wire it up for this `run_impl` invocation, and return
-/// a `'static` reference to it.  The `Rt` is heap-allocated and intentionally
-/// leaked; it is valid for the remainder of the process.
+/// Create the process-wide singleton `Rt` and return a `'static` reference
+/// to it.  Called exactly once, by the first `run_impl`, via `GLOBAL_RT`'s
+/// `get_or_init`.  The `Rt` is heap-allocated and intentionally leaked; it
+/// is valid for the remainder of the process.  GOMAXPROCS is fixed here by
+/// the first caller (or the `GOMAXPROCS` env var).
 ///
 /// Sets `CURRENT_RT` on the calling thread so that `spawn_goroutine` (called
 /// immediately after) can find the scheduler.
@@ -2057,9 +2187,9 @@ fn schedinit(nprocs: i32) -> &'static Rt {
         .filter(|&n| (1..=256).contains(&n))
         .unwrap_or(nprocs);
 
-    // Allocate a fresh Rt for this run_impl invocation and leak it so that
-    // M-threads (which may outlive the run_impl stack frame) can hold
-    // `&'static Rt` references.
+    // Allocate the process-wide Rt and leak it so that M-threads (which
+    // outlive any single run_impl stack frame) can hold `&'static Rt`
+    // references.
     let rt: &'static Rt = Box::leak(Box::new(Rt {
         global_run_q: GlobalRunQueue::new(),
         nmspinning:   AtomicI32::new(0),
@@ -2251,6 +2381,16 @@ unsafe fn unregister_drained_g(gp: *mut G) {
         unsafe { (*cond).remove_waiter(gp) };
         unsafe { (*gp).waiting_cond = std::ptr::null_mut() };
     }
+
+    // ── Timer heap & netpoll ────────────────────────────────────────────────
+    //
+    // A zombie goroutine (dead invocation, still running) can push a timer
+    // entry or arm netpoll AFTER its invocation's bulk filters
+    // (`drain_timer_heap_for_shutdown` / `netpoll_clear_reg`) ran, and only
+    // then hit the park-time reaper.  Scrub by-G so no waker entry can
+    // outlive the `Box<G>` free that follows this call.
+    super::time::remove_timer_entries_for(gp);
+    super::netpoll::netpoll_remove_entries_for(gp);
 }
 
 // ---------------------------------------------------------------------------
@@ -2298,9 +2438,21 @@ where
         .map(|n| n.get() as i32)
         .unwrap_or(1);
 
-    // Create a fresh, isolated Rt for this run_impl invocation.
-    // schedinit also sets CURRENT_RT on the calling thread.
-    let rt = schedinit(nprocs);
+    // Attach to the process-wide singleton Rt, creating it on first use.
+    // GOMAXPROCS is fixed by the first caller (or the env var); later calls
+    // share the same Ps and M-threads — invocations are isolated by
+    // `InvState` tagging, not by separate schedulers.
+    let rt: &'static Rt = *GLOBAL_RT.get_or_init(|| schedinit(nprocs));
+    set_current_rt(rt as *const Rt);
+
+    // Identity for this invocation.  Leaked (16 bytes) because reaped
+    // zombie goroutines may check `inv.dead` long after this call returns.
+    let inv: &'static super::g::InvState = Box::leak(Box::new(super::g::InvState {
+        id:   INV_COUNTER.fetch_add(1, Relaxed) + 1,
+        dead: AtomicBool::new(false),
+    }));
+    let inv_ptr = inv as *const super::g::InvState;
+    CURRENT_INV.with(|c| c.set(inv_ptr));
 
     // Drop guard: unparks the calling thread whether `f` returns or panics.
     struct UnparkOnDrop(std::thread::Thread);
@@ -2327,14 +2479,23 @@ where
     // Block until the goroutine's drop-guard fires caller.unpark().
     std::thread::park();
 
-    // Purge stale netpoll registrations for this Rt.
-    super::netpoll::netpoll_clear_reg();
+    // Mark this invocation dead BEFORE the drain: from here on, the
+    // scheduler's reaper retires this invocation's runnable goroutines
+    // instead of executing them, and `park_fn` retires any of its
+    // still-running goroutines the moment they park.
+    inv.dead.store(true, Release);
+
+    // Purge stale netpoll registrations for this invocation.
+    super::netpoll::netpoll_clear_reg(inv_ptr as usize);
 
     // ── Phase 2b: drain GWAITING goroutines ──────────────────────────────────
     //
-    // With per-Rt isolation, `rt.allg` contains only goroutines spawned by
-    // this run_impl — no need to guard against draining another run_impl's
-    // goroutines.  We can always drain here.
+    // The singleton `rt.allg` holds every invocation's goroutines, so the
+    // CAS pass filters by invocation.  Two categories are reclaimed:
+    //   * this invocation's parked goroutines, and
+    //   * parked goroutines of any OTHER invocation already marked dead
+    //     (zombies that parked after their own exit drain ran) — making
+    //     leaks self-healing across invocations.
     //
     // Safety protocol is unchanged from before:
     //   1. CAS GWAITING → GDEAD (goready guards see GDEAD and return early)
@@ -2342,23 +2503,39 @@ where
     //   3. DrainSync barrier (blocks in-flight goready calls)
     //   4. Free stacks and Box<G>
     {
+        // Claim (CAS) and remove from `allg` in one locked pass.  Removal
+        // must happen BEFORE the frees below: `allg` is shared by every
+        // invocation, and a concurrent exit drain iterating it dereferences
+        // each entry — it must never observe a G we are about to free.
         let drained: Vec<*mut G> = {
-            let allg = rt.allg.lock().unwrap();
-            allg.iter()
-                .filter_map(|&gp| {
-                    let ok = unsafe {
-                        (*gp).atomicstatus
-                            .compare_exchange(
-                                super::g::GWAITING,
-                                GDEAD,
-                                AcqRel,
-                                Relaxed,
-                            )
-                            .is_ok()
-                    };
-                    if ok { Some(gp) } else { None }
-                })
-                .collect()
+            let mut drained = Vec::new();
+            let mut allg = rt.allg.lock().unwrap();
+            allg.retain(|&gp| {
+                let g_inv = unsafe { (*gp).inv };
+                let mine = g_inv == inv_ptr;
+                let orphaned = !g_inv.is_null()
+                    && unsafe { (*g_inv).dead.load(Acquire) };
+                if !mine && !orphaned {
+                    return true;
+                }
+                let ok = unsafe {
+                    (*gp).atomicstatus
+                        .compare_exchange(
+                            super::g::GWAITING,
+                            GDEAD,
+                            AcqRel,
+                            Relaxed,
+                        )
+                        .is_ok()
+                };
+                if ok {
+                    drained.push(gp);
+                    false // claimed — drop from allg now
+                } else {
+                    true
+                }
+            });
+            drained
         };
 
         // Drain pending timers for this Rt AFTER the CAS pass, not before.
@@ -2375,9 +2552,14 @@ where
         // in-flight entry cannot escape the filter either (the filter blocks
         // until the fire completes; the G's status is GDEAD by then and the
         // fire drops it without waking).
-        super::time::drain_timer_heap_for_shutdown();
+        super::time::drain_timer_heap_for_shutdown(inv_ptr as usize);
 
-        if !drained.is_empty() {
+        // Collect scheduler-reaped zombies (any invocation's).  They are
+        // already GDEAD and unregistered; they only need freeing, which
+        // must happen under the DrainSync below.
+        let graveyard: Vec<usize> = std::mem::take(&mut *GRAVEYARD.lock().unwrap());
+
+        if !drained.is_empty() || !graveyard.is_empty() {
             for &gp in &drained {
                 unsafe { unregister_drained_g(gp) };
             }
@@ -2389,36 +2571,26 @@ where
                 unsafe { super::stack::stack_free(&stack) };
                 unsafe { drop(Box::from_raw(gp)) };
             }
-
-            let mut allg = rt.allg.lock().unwrap();
-            allg.retain(|gp| !drained.contains(gp));
+            for &gp_addr in &graveyard {
+                let gp = gp_addr as *mut G;
+                let stack = unsafe { (*gp).stack };
+                unsafe { super::stack::stack_free(&stack) };
+                unsafe { drop(Box::from_raw(gp)) };
+            }
+            // No allg cleanup needed here: drained Gs were removed during
+            // the claim pass above, and graveyard Gs were removed by the
+            // reaper before they entered the graveyard.
 
             #[cfg(test)]
             PHASE_2B_DRAINED_COUNT
-                .fetch_add(drained.len() as u64, Relaxed);
+                .fetch_add((drained.len() + graveyard.len()) as u64, Relaxed);
         }
     }
 
-    // ── Signal shutdown and wake all idle M-threads ───────────────────────────
-    //
-    // After this point the M-threads will exit `schedule()` and terminate.
-    // We do NOT wait for them here — the Rt is Box::leak'd and remains valid
-    // for the process lifetime, so there is no use-after-free risk.
-    {
-        rt.shutdown.store(true, Release);
-        let inner = rt.inner.lock().unwrap();
-        let mut m = inner.idle_m;
-        while !m.is_null() {
-            let next = unsafe { (*m).schedlink };
-            unsafe { (*m).unpark() };
-            m = next;
-        }
-        // idle_m list stays as-is; each M will remove itself when it wakes.
-    }
-
-    // Reset CURRENT_RT on the calling thread so a subsequent run_impl call
-    // gets a fresh Rt rather than inheriting the old (shutting-down) one.
-    set_current_rt(ptr::null());
+    // The singleton Rt, its Ps, and its M-threads stay alive for the
+    // process lifetime (mirroring Go's never-torn-down runtime); there is
+    // no shutdown signal.  Only this invocation's identity is retired.
+    CURRENT_INV.with(|c| c.set(ptr::null()));
 
     match slot.lock().unwrap().take() {
         Some(Ok(v))        => v,
