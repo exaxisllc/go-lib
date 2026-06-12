@@ -99,13 +99,18 @@ static TIMER_THREAD: OnceLock<std::thread::Thread>  = OnceLock::new();
 /// Idempotent — the thread is started at most once per process.  Called from
 /// `schedinit` (step 9).
 pub(crate) fn start_timer_thread() {
-    // If already started, do nothing.
-    if TIMER_THREAD.get().is_some() { return; }
-
-    std::thread::Builder::new()
-        .name("go-timer".into())
-        .spawn(timer_thread_body)
-        .expect("time: failed to spawn timer thread");
+    // `TIMER_THREAD` is set inside `timer_thread_body`, so checking it here
+    // races with concurrent `schedinit` calls (concurrent run_impls) — both
+    // see `None` and both spawn, leaving TWO timer threads firing
+    // concurrently for the lifetime of the process.  `Once` serialises the
+    // spawn itself.
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        std::thread::Builder::new()
+            .name("go-timer".into())
+            .spawn(timer_thread_body)
+            .expect("time: failed to spawn timer thread");
+    });
 }
 
 /// Drop every pending timer from the global heap and discard them.
@@ -184,59 +189,70 @@ fn timer_thread_body() {
 /// larger than the typical preemption-to-resume latency so the goroutine is
 /// almost certainly in `GWAITING` by the time the re-inserted timer fires.
 fn fire_expired() {
-    use super::g::{readgstatus, GWAITING};
+    use super::g::{readgstatus, GDEAD, GWAITING};
 
     let now = mono_ns();
     struct WakeEntry { gp: *mut G, rt_ptr: usize }
-    let mut to_wake: Vec<WakeEntry> = Vec::new();
 
-    {
-        let mut heap = TIMER_HEAP.lock().unwrap();
-        while let Some(entry) = heap.peek() {
-            if entry.when <= now {
-                let entry = heap.pop().unwrap();
-                to_wake.push(WakeEntry { gp: entry.gp, rt_ptr: entry.rt_ptr });
-            } else {
-                break;
-            }
+    // Hold the TIMER_HEAP lock across the ENTIRE pop → status-check →
+    // goready → retry-re-push sequence.  `drain_timer_heap_for_shutdown`
+    // takes the same lock, so a run_impl Phase 2b drain can never run its
+    // heap filter while we are holding popped entries: either the filter
+    // runs first (and removes that Rt's entries before we can pop them),
+    // or it blocks until every entry we popped has been consumed or
+    // re-pushed into the heap (where the filter will see it).
+    //
+    // Without this serialisation an in-flight entry escapes the filter:
+    // the drain frees the sleeping G's Box while we still hold its
+    // pointer, and our later `readgstatus`/`goready` dereferences freed
+    // memory.  If the allocation has been reused for a new G parked on a
+    // channel, the spurious wake resumes it with `(*gp).param == null`
+    // and it crashes with a NULL dereference in chanrecv/selectgo's
+    // resumed path (observed as the intermittent macOS arm64 CI SIGSEGV).
+    //
+    // Holding the lock across `goready` is safe: goready never touches
+    // TIMER_HEAP, and its GRUNNING→GWAITING spin completes independently
+    // (the parking goroutine does not need this lock to finish gopark).
+    // `sleep` callers pushing new timers simply block for the duration of
+    // this wake batch.
+    let mut heap = TIMER_HEAP.lock().unwrap();
+
+    let mut to_wake: Vec<WakeEntry> = Vec::new();
+    while let Some(entry) = heap.peek() {
+        if entry.when <= now {
+            let entry = heap.pop().unwrap();
+            to_wake.push(WakeEntry { gp: entry.gp, rt_ptr: entry.rt_ptr });
+        } else {
+            break;
         }
     }
 
-    // RCU read-side covers both the status check and the `goready` calls
-    // below.  The `to_wake` Vec holds `*mut G` pointers we loaded from
-    // TIMER_HEAP above.  Pairs with the run_impl Phase 2b drainer's
-    // `DrainSync` so a concurrent drain cannot free any of these `gp`
-    // pointers while we are using them.
-    let _cs = super::rcu::RcuGuard::new();
-
-    let mut to_retry: Vec<WakeEntry> = Vec::new();
-
+    let retry_when = now.saturating_add(5_000_000); // +5 ms
     for entry in to_wake {
         // Bind CURRENT_RT to the entry's Rt so goready → sched() works on the
         // timer thread (which has no inherent Rt affinity).
         set_current_rt(entry.rt_ptr as *const Rt);
 
-        // Check the goroutine's status before calling goready.  If the
-        // goroutine is still GRUNNABLE (preempted mid-sleep before gopark),
-        // re-insert a near-immediate timer rather than spinning or asserting.
+        // Check the goroutine's status before calling goready.
         let s = unsafe { readgstatus(entry.gp) };
         if s == GWAITING {
             unsafe { goready(entry.gp) };
-        } else {
-            to_retry.push(entry);
+        } else if s != GDEAD {
+            // GRUNNABLE/GRUNNING: preempted between timer insertion and its
+            // gopark call.  Re-insert a near-immediate timer rather than
+            // spinning or asserting; the retry delay (5 ms) is larger than
+            // the typical preemption-to-resume latency so the goroutine is
+            // almost certainly GWAITING by the time it fires.  The re-push
+            // happens under the heap lock, so a concurrent shutdown drain's
+            // heap filter is guaranteed to see (and remove) the entry.
+            heap.push(TimerEntry { when: retry_when, gp: entry.gp, rt_ptr: entry.rt_ptr });
         }
+        // GDEAD: the goroutine was cancelled by a run_impl shutdown drain —
+        // drop the entry, never wake or retry.
     }
 
     // Reset CURRENT_RT on the timer thread to null when done.
     set_current_rt(std::ptr::null());
-
-    if !to_retry.is_empty() {
-        let retry_when = mono_ns().saturating_add(5_000_000); // +5 ms
-        let mut heap = TIMER_HEAP.lock().unwrap();
-        for entry in to_retry {
-            heap.push(TimerEntry { when: retry_when, gp: entry.gp, rt_ptr: entry.rt_ptr });
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------

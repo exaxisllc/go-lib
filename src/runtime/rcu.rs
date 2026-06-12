@@ -104,21 +104,84 @@ static DRAIN_BLOCK: AtomicI64 = AtomicI64::new(0);
 /// The guard does **not** block other goroutines or impose ordering between
 /// concurrent `goready` calls — only between readers and the (rare)
 /// drainer.
-pub(crate) struct RcuGuard;
+///
+/// ## Why the guard suppresses async preemption
+///
+/// The guard embeds an [`MLockGuard`](super::m::MLockGuard), so SIGURG
+/// preemption is disabled for as long as the guard is alive.  Without
+/// this, a goroutine could be preempted *while holding the guard*: the
+/// `RcuGuard` lives on the goroutine's stack, so `RCU_IN_CS` stays
+/// elevated until the goroutine is rescheduled.  If its `Rt` shuts down
+/// first (run_impl leaks runnable goroutines at exit), the count never
+/// drains — every subsequent `DrainSync::new()` spins forever with
+/// `DRAIN_BLOCK` raised, which in turn blocks every `RcuGuard::new()` in
+/// the process: a process-wide livelock (observed via `sample` as dozens
+/// of threads spinning in the acquisition back-off with no thread inside
+/// a critical section).
+///
+/// This works because no read-side section parks: every `RcuGuard` scope
+/// is a short, non-blocking load-and-wake sequence.  Do NOT hold an
+/// `RcuGuard` across `gopark`/`gosched` — the embedded m-lock would leak
+/// onto whatever goroutine runs next on the M.
+///
+/// ## Reentrancy
+///
+/// Read-side sections nest: e.g. `chansend` takes a guard covering its
+/// sudog/G dereferences and then calls `goready`, which takes its own
+/// guard.  The guard is therefore **reentrant per OS thread** via a
+/// thread-local depth counter: only the outermost guard performs the
+/// `RCU_IN_CS` / `DRAIN_BLOCK` handshake.  Without this, a nested
+/// acquisition that observes an active drainer backs off and waits for
+/// `DRAIN_BLOCK == 0` — but the drainer is waiting for *our outer
+/// guard's* `RCU_IN_CS` contribution to drain: a deadlock that freezes
+/// every Rt in the process (observed: chansend → goready back-off vs
+/// run_impl DrainSync spin).  Skipping the handshake on nested entry is
+/// sound because the outer guard already excludes the drainer's free
+/// phase.
+///
+/// The thread-local is sound (a goroutine cannot migrate Ms mid-section)
+/// because the embedded m-lock suppresses preemption and no section
+/// parks.
+pub(crate) struct RcuGuard {
+    /// Suppresses SIGURG preemption for the guard's lifetime (dropped
+    /// after `Drop::drop` decrements `RCU_IN_CS`).
+    _lk: super::m::MLockGuard,
+}
+
+thread_local! {
+    /// Nesting depth of RcuGuards on this OS thread.  Only the
+    /// depth 0 → 1 transition touches the global counters.
+    static RCU_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
 
 impl RcuGuard {
     /// Enter a read-side critical section.  Spins briefly while a drainer
-    /// is active.
+    /// is active (outermost entry only — nested entries are free).
     #[inline]
     pub(crate) fn new() -> Self {
-        // Fast path: increment the in-CS counter unconditionally, then
+        // Disable async preemption FIRST so we cannot be descheduled
+        // between the counter increment and the guard landing on the
+        // stack (see struct doc-comment).
+        let _lk = super::m::m_lock();
+
+        let prev_depth = RCU_DEPTH.with(|d| {
+            let v = d.get();
+            d.set(v + 1);
+            v
+        });
+        if prev_depth > 0 {
+            // Nested: the outer guard already holds RCU_IN_CS.
+            return RcuGuard { _lk };
+        }
+
+        // Outermost: increment the in-CS counter unconditionally, then
         // verify the drainer isn't holding us out.  This pattern (commit
         // first, validate, back out) avoids a race where the drainer raises
         // DRAIN_BLOCK between our check and our increment.
         loop {
             RCU_IN_CS.fetch_add(1, Ordering::SeqCst);
             if DRAIN_BLOCK.load(Ordering::SeqCst) == 0 {
-                return RcuGuard;
+                return RcuGuard { _lk };
             }
             // Drainer active — back out and wait for it to finish.
             RCU_IN_CS.fetch_sub(1, Ordering::SeqCst);
@@ -132,7 +195,14 @@ impl RcuGuard {
 impl Drop for RcuGuard {
     #[inline]
     fn drop(&mut self) {
-        RCU_IN_CS.fetch_sub(1, Ordering::Release);
+        let depth = RCU_DEPTH.with(|d| {
+            let v = d.get() - 1;
+            d.set(v);
+            v
+        });
+        if depth == 0 {
+            RCU_IN_CS.fetch_sub(1, Ordering::Release);
+        }
     }
 }
 

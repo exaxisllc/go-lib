@@ -121,10 +121,27 @@ pub(crate) unsafe fn goready(gp: *mut G) {
     // We spin briefly on GRUNNING because channel operations release their
     // lock *before* calling gopark, so there is a tiny window where the G
     // is still GRUNNING even though its sudog has been dequeued.
-    let old_status = loop {
+    loop {
         let s = unsafe { readgstatus(gp) };
         if s == GWAITING || s == GPREEMPTED {
-            break s;
+            // GWAITING / GPREEMPTED → GRUNNABLE.  Use a single
+            // compare_exchange rather than `casgstatus` (which retries until
+            // it wins): between our status read and the CAS, the run_impl
+            // Phase 2b drain can CAS GWAITING → GDEAD.  `casgstatus` would
+            // then spin forever waiting for GWAITING to come back — while
+            // holding the RcuGuard, which blocks the drainer's DrainSync and
+            // deadlocks the whole process.  On CAS failure simply re-inspect
+            // the status; the GDEAD/GRUNNABLE arms below handle the rest.
+            let won = unsafe {
+                (*gp).atomicstatus
+                    .compare_exchange(s, GRUNNABLE, std::sync::atomic::Ordering::AcqRel,
+                                      std::sync::atomic::Ordering::Relaxed)
+                    .is_ok()
+            };
+            if won {
+                break;
+            }
+            continue; // lost a status race — re-inspect
         }
         // Transient states: spin until the goroutine settles.
         //   GRUNNING   — channel ops release lock before gopark; the goroutine
@@ -153,10 +170,7 @@ pub(crate) unsafe fn goready(gp: *mut G) {
             "goready: unexpected status {s} — expected GRUNNING, GWAITING, GPREEMPTED, or GDEAD"
         );
         std::hint::spin_loop();
-    };
-
-    // GWAITING / GPREEMPTED → GRUNNABLE.
-    unsafe { casgstatus(gp, old_status, GRUNNABLE) };
+    }
 
     let sc = sched();
     let m  = current_m();
@@ -205,10 +219,23 @@ pub(crate) unsafe fn goready_remote(gp: *mut G, rt: *const super::sched::Rt) {
     // RCU read-side — same pairing as goready (Phase 2b drainer's DrainSync).
     let _cs = super::rcu::RcuGuard::new();
 
-    let old_status = loop {
+    loop {
         let s = unsafe { readgstatus(gp) };
         if s == GWAITING || s == GPREEMPTED {
-            break s;
+            // Single CAS attempt, re-inspect on failure — same rationale as
+            // goready: a racing Phase 2b drain can CAS GWAITING → GDEAD, and
+            // a spinning `casgstatus` here would deadlock holding the
+            // RcuGuard.
+            let won = unsafe {
+                (*gp).atomicstatus
+                    .compare_exchange(s, GRUNNABLE, std::sync::atomic::Ordering::AcqRel,
+                                      std::sync::atomic::Ordering::Relaxed)
+                    .is_ok()
+            };
+            if won {
+                break;
+            }
+            continue; // lost a status race — re-inspect
         }
         if s == GRUNNABLE || s == GDEAD {
             return; // already queued / cancelled by the owner's drain
@@ -218,9 +245,7 @@ pub(crate) unsafe fn goready_remote(gp: *mut G, rt: *const super::sched::Rt) {
             "goready_remote: unexpected status {s}"
         );
         std::hint::spin_loop();
-    };
-
-    unsafe { casgstatus(gp, old_status, GRUNNABLE) };
+    }
 
     // Suppress async preemption across the foreign Mutex critical section
     // (same rationale as goready's m_lock guard).

@@ -276,8 +276,13 @@ pub(crate) unsafe fn findrunnable() -> Option<*mut G> {
 
         // ── 4. Non-blocking netpoll: check if any I/O goroutines are ready ──
         {
-            let ready = unsafe { super::netpoll::netpoll_wait(0) };
+            // Guard BEFORE the harvest: netpoll_wait consumes REG entries,
+            // so a harvested event is invisible to the owning Rt's
+            // `netpoll_clear_reg`.  Acquiring the RCU guard first ensures a
+            // concurrent Phase 2b drain cannot free the harvested `*mut G`s
+            // before the goready calls below.
             let _cs = super::rcu::RcuGuard::new();
+            let ready = unsafe { super::netpoll::netpoll_wait(0) };
             let my_rt = current_rt_ptr() as usize;
             for (gp, rt_ptr) in ready {
                 if rt_ptr == my_rt {
@@ -2337,10 +2342,6 @@ where
     //   3. DrainSync barrier (blocks in-flight goready calls)
     //   4. Free stacks and Box<G>
     {
-        // Drain pending timers for this Rt first so the timer thread cannot
-        // fire one of these GWAITING goroutines between CAS and stack free.
-        super::time::drain_timer_heap_for_shutdown();
-
         let drained: Vec<*mut G> = {
             let allg = rt.allg.lock().unwrap();
             allg.iter()
@@ -2359,6 +2360,22 @@ where
                 })
                 .collect()
         };
+
+        // Drain pending timers for this Rt AFTER the CAS pass, not before.
+        // A goroutine that is still GRUNNING inside `sleep()` while the
+        // filter runs can push its timer entry and gopark immediately
+        // afterwards; a pre-CAS filter misses that entry, the CAS then
+        // drains (and frees) the goroutine, and the stale entry left in
+        // TIMER_HEAP makes a later `fire_expired` dereference a freed G
+        // (caught by guard-malloc as a fault inside the timer thread).
+        // Running the filter after the CAS is sufficient: any entry whose G
+        // we just drained was pushed *before* that G reached GWAITING, so it
+        // is in the heap by the time the CAS succeeds — and `fire_expired`
+        // holds the heap lock across its whole pop→wake sequence, so an
+        // in-flight entry cannot escape the filter either (the filter blocks
+        // until the fire completes; the G's status is GDEAD by then and the
+        // fire drops it without waking).
+        super::time::drain_timer_heap_for_shutdown();
 
         if !drained.is_empty() {
             for &gp in &drained {
