@@ -38,17 +38,29 @@
 //! An internal wait queue (`waitq`) stores raw `*mut G` pointers of parked
 //! goroutines.  `notify_one` / `notify_all` call `goready` on them.
 //!
-//! The GRUNNING → GWAITING race is handled by `goready`'s built-in spin loop:
-//! even if a notifier calls `goready` between the moment a goroutine pushes
-//! itself onto `waitq` and the moment `gopark` actually sets `GWAITING`, the
-//! spin safely serialises the two.
+//! ### Commit-park protocol
+//!
+//! `waitq` is protected by a [`RawMutex`] (not `std::sync::Mutex`) so that
+//! `wait` can hold the queue lock ACROSS the park via
+//! [`gopark_commit`][crate::runtime::park::gopark_commit] — the lock is
+//! released on g0 only after the waiter has reached `GWAITING`.  Releasing
+//! the queue lock *before* `gopark` (the original design) left a lost-wakeup
+//! window: an async preemption (SIGURG) landing between the unlock and the
+//! park made the registered waiter `GRUNNABLE`; a concurrent
+//! `notify_one`/`notify_all` then popped the waiter and called `goready`,
+//! which saw a non-`GWAITING` status and dropped the wake on the floor — the
+//! waiter parked forever.  Holding `waitq`'s lock until `park_fn` has
+//! committed the goroutine to `GWAITING` closes the window: no notifier can
+//! pop the waiter (the pop needs the queue lock) until the park is committed.
 
 use std::collections::VecDeque;
-use std::sync::Mutex;
+use std::cell::UnsafeCell;
+use std::sync::Mutex; // the user's external lock passed to `wait`
 
 use crate::runtime::g::{current_g, WaitReason};
-use crate::runtime::park::{gopark, goready};
+use crate::runtime::park::{gopark_commit, goready};
 use crate::runtime::g::G;
+use crate::runtime::rawmutex::RawMutex;
 
 // ---------------------------------------------------------------------------
 // Cond
@@ -62,19 +74,25 @@ use crate::runtime::g::G;
 ///
 /// Must be used from within a [`go_lib::run`] context.
 pub struct Cond {
-    /// Queue of goroutines waiting on this condition.
-    waitq: Mutex<VecDeque<*mut G>>,
+    /// Spinlock protecting `waitq`.  A `RawMutex` (not `std::sync::Mutex`) so
+    /// the goroutine `wait()` path can hold the queue lock ACROSS the park via
+    /// `gopark_commit` — released on g0 only after the waiter is `GWAITING`
+    /// (see the module-level "Commit-park protocol" note).
+    mu:    RawMutex,
+    /// Queue of goroutines waiting on this condition — always accessed under
+    /// `mu`.
+    waitq: UnsafeCell<VecDeque<*mut G>>,
 }
 
-// SAFETY: *mut G pointers are only read under the waitq Mutex and are valid
-// for the lifetime of the process (goroutines are never freed, only recycled).
+// SAFETY: *mut G pointers are only read under `mu` and are valid for the
+// lifetime of the process (goroutines are never freed, only recycled).
 unsafe impl Send for Cond {}
 unsafe impl Sync for Cond {}
 
 impl Cond {
     /// Create a new `Cond`.
     pub fn new() -> Self {
-        Self { waitq: Mutex::new(VecDeque::new()) }
+        Self { mu: RawMutex::new(), waitq: UnsafeCell::new(VecDeque::new()) }
     }
 
     /// Release `guard`, park the current goroutine until notified, then
@@ -104,22 +122,42 @@ impl Cond {
         let gp = current_g();
         assert!(!gp.is_null(), "Cond::wait called outside a goroutine context");
 
-        // Enqueue ourselves before releasing the mutex so that any concurrent
-        // notify_one / notify_all sees us in the queue.
-        self.waitq.lock().unwrap().push_back(gp);
+        // m_lock suppresses async preemption while we hold `mu` AND across the
+        // `gopark_commit` below — the increment is transferred to `park_fn`,
+        // which balances it on the same M (see gopark_commit's contract).
+        let _lk = crate::runtime::m::m_lock();
+        self.mu.lock();
+
+        // Enqueue ourselves under `mu` so that any concurrent
+        // notify_one / notify_all sees us in the queue.  The queue lock stays
+        // held until park_fn has committed this goroutine to GWAITING
+        // (commit-park protocol), so a notifier cannot pop us and call
+        // goready until the park is guaranteed to find us parked.
+        // SAFETY: `mu` is held.
+        unsafe { (*self.waitq.get()).push_back(gp) };
 
         // Phase 2b: tag gp with this Cond so the run_impl drain can find and
         // remove the stale `*mut G` from `self.waitq` if gp is reclaimed
         // while parked.  Cleared by the waker (notify_one / notify_all) and
-        // again below after gopark returns.
+        // again below after the park returns.
         unsafe { (*gp).waiting_cond = self as *const Cond as *mut u8 };
 
-        // Release the user's mutex.  After this point a notifier may call
-        // goready(gp); goready's spin loop handles the GRUNNING→GWAITING race.
+        // Release the user's mutex *before* parking (Go semantics).  The
+        // rendezvous with notifiers is protected by `mu`, which is held across
+        // the park, so releasing the user lock here cannot lose a wakeup.
         drop(guard);
 
-        // Park until goready transitions us back to GRUNNABLE.
-        gopark(WaitReason::CondVar);
+        // Transfer the m.locks increment to park_fn, then park.  The queue
+        // lock (`mu`) is released on g0 by `unlock_cond_mutex` only after this
+        // goroutine is GWAITING.
+        std::mem::forget(_lk);
+        unsafe {
+            gopark_commit(
+                WaitReason::CondVar,
+                unlock_cond_mutex,
+                &self.mu as *const RawMutex as *mut u8,
+            );
+        }
 
         // Phase 2b: clear the tag now that we have been woken (defence in
         // depth — the notify path also clears it).
@@ -131,16 +169,28 @@ impl Cond {
 
     /// Wake one waiting goroutine.  No-op if there are no waiters.
     pub fn notify_one(&self) {
+        // m_lock suppresses async preemption across the `mu` critical section
+        // (same rationale as WaitGroup::add); without it a SIGURG between
+        // acquiring and releasing the spinlock could deschedule us while the
+        // lock is held, deadlocking the next goroutine on this M.
+        let _lk = crate::runtime::m::m_lock();
         // RCU read-side covers the pop from `waitq` and the goready call.
         // Pairs with the run_impl Phase 2b drainer's `DrainSync` so a
         // concurrent drain cannot free `gp` while we are using it.
         let _cs = crate::runtime::rcu::RcuGuard::new();
-        let gp = self.waitq.lock().unwrap().pop_front();
+        self.mu.lock();
+        // SAFETY: `mu` is held.
+        let gp = unsafe { (*self.waitq.get()).pop_front() };
         if let Some(gp) = gp {
             // Phase 2b: clear the gp.waiting_cond tag — the wake removes gp
             // from our waitq, so the Phase 2b drain no longer needs to touch
             // us for this gp.
             unsafe { (*gp).waiting_cond = std::ptr::null_mut() };
+        }
+        unsafe { self.mu.unlock() };
+        // Wake outside the lock so we don't hold the spinlock across the
+        // goready spin (which waits for GRUNNING → GWAITING).
+        if let Some(gp) = gp {
             // SAFETY: gp is a valid goroutine pointer (see module safety comment).
             unsafe { goready(gp) };
         }
@@ -148,13 +198,20 @@ impl Cond {
 
     /// Wake all waiting goroutines.
     pub fn notify_all(&self) {
+        let _lk = crate::runtime::m::m_lock();
         // RCU read-side covers the drain of `waitq` and every goready call.
         // Pairs with the run_impl Phase 2b drainer's `DrainSync`.
         let _cs = crate::runtime::rcu::RcuGuard::new();
-        let waiters: Vec<*mut G> = self.waitq.lock().unwrap().drain(..).collect();
-        for gp in waiters {
+        self.mu.lock();
+        // SAFETY: `mu` is held.
+        let waiters: Vec<*mut G> = unsafe { (*self.waitq.get()).drain(..).collect() };
+        for &gp in &waiters {
             // Phase 2b: clear each waiter's tag (see notify_one).
             unsafe { (*gp).waiting_cond = std::ptr::null_mut() };
+        }
+        unsafe { self.mu.unlock() };
+        // Wake outside the lock (see notify_one).
+        for gp in waiters {
             // SAFETY: same as notify_one.
             unsafe { goready(gp) };
         }
@@ -169,13 +226,26 @@ impl Cond {
     /// `gp` must be a `*mut G` that this `Cond` may have stored in its
     /// `waitq`.
     pub(crate) unsafe fn remove_waiter(&self, gp: *mut G) {
-        let mut waitq = self.waitq.lock().unwrap();
-        waitq.retain(|&g| g != gp);
+        let _lk = crate::runtime::m::m_lock();
+        self.mu.lock();
+        // SAFETY: `mu` is held.
+        unsafe { (*self.waitq.get()).retain(|&g| g != gp) };
+        unsafe { self.mu.unlock() };
     }
 }
 
 impl Default for Cond {
     fn default() -> Self { Self::new() }
+}
+
+/// `gopark_commit` unlock shim: release the `Cond`'s `RawMutex` from g0 after
+/// the parking goroutine has reached `GWAITING`.
+///
+/// # Safety
+/// `arg` must be the `&RawMutex` of a `Cond` whose queue lock is held by the
+/// parking goroutine.
+unsafe fn unlock_cond_mutex(arg: *mut u8) {
+    unsafe { (*(arg as *const RawMutex)).unlock() }
 }
 
 // ---------------------------------------------------------------------------

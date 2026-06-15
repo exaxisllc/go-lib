@@ -568,6 +568,155 @@ fn many_goroutines() {
     });
 }
 
+// ---------------------------------------------------------------------------
+// 18. select under an async-preemption storm — commit-park lost-wakeup guard
+//
+// Mirrors `many_goroutines`: thousands of CPU-bound goroutines so sysmon's
+// SIGURG async preemption fires inside the blocking `select` park window.
+//
+// Each worker pair shares an unbuffered channel: a producer computes a value
+// and sends it; a consumer blocks in a two-case `select!` (no default → it
+// parks via `selectgo`'s commit-park path) and must receive exactly that
+// value.  The second case is a channel that is never written, so the only way
+// `select` can return is the real rendezvous — if a wakeup were lost (the bug
+// this test guards), the consumer would park forever and `scope`'s implicit
+// join would hang instead of completing.
+//
+// The CPU-bound loops on both sides create async-safe points so the SIGURG
+// preemption lands in the unlock→park window that the commit-park protocol
+// closes.  Before the conversion this hung intermittently in debug builds.
+// ---------------------------------------------------------------------------
+#[test]
+fn select_preemption_storm() {
+    const WORKERS: i64 = 5_000;
+    let done  = Arc::new(AtomicI64::new(0));
+    let done2 = Arc::clone(&done);
+
+    go_lib::run(move || {
+        scope(|s| {
+            for i in 0..WORKERS {
+                let (tx, rx)            = chan::<i64>(0);
+                // A channel whose sender is never used: its recv case in the
+                // select below is never ready, so it cannot satisfy the
+                // select.  Keep the sender alive (no close) by moving it into
+                // the consumer so the channel is never reported closed.
+                let (idle_tx, idle_rx)  = chan::<i64>(0);
+                let done = Arc::clone(&done2);
+
+                // Producer: CPU-bound work, then send the triangular number.
+                s.go(move || {
+                    let mut acc = 0_i64;
+                    for k in 0..=i { acc = acc.wrapping_add(k); }
+                    tx.send(acc);
+                });
+
+                // Consumer: CPU-bound work, then block in a 2-case select.
+                s.go(move || {
+                    let _keep = idle_tx; // hold the idle sender; never send/close
+                    let mut acc = 0_i64;
+                    for k in 0..=i { acc = acc.wrapping_add(k); }
+                    let got = select! {
+                        recv(rx) -> v => { v.expect("rx closed unexpectedly") }
+                        recv(idle_rx) -> _v => { -1_i64 }
+                    };
+                    assert_eq!(got, acc, "select worker {i}: wrong value (lost wakeup?)");
+                    done.fetch_add(1, Ordering::Relaxed);
+                });
+            }
+        });
+    });
+
+    assert_eq!(
+        done.load(Ordering::Acquire),
+        WORKERS,
+        "every select consumer must complete (no lost wakeups)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 19. Cond under an async-preemption storm — commit-park lost-wakeup guard
+//
+// Thousands of CPU-bound goroutine *pairs*, each with its own `(Mutex, Cond)`:
+// a waiter parks in `Cond::wait`, and a notifier sets the predicate and fires
+// exactly ONE `notify_one`.  Both sides do CPU-bound work first so SIGURG
+// async preemption lands in the waiter's release-lock→park window that the
+// commit-park protocol closes.
+//
+// Why per-pair (not one shared Cond + a re-notifying broadcaster):
+//   * A single shared `std::sync::Mutex` hammered by thousands of goroutines
+//     triggers an UNRELATED, pre-existing hazard — a goroutine preempted while
+//     holding the pthread mutex blocks every M that then calls `lock()`,
+//     starving the scheduler of an M to resume the holder (a contended-mutex
+//     deadlock, not a lost wakeup).  Per-pair mutexes keep contention at two
+//     goroutines, so a preempted holder only ever blocks its single partner.
+//   * Firing exactly ONE `notify_one` per waiter makes this a STRICT test of
+//     commit-park: a re-notifying broadcaster would paper over a dropped
+//     `goready`.  Here, if the single wake is lost (waiter observed by the
+//     notifier before it committed to GWAITING), that waiter parks forever and
+//     `scope`'s implicit join hangs.
+//
+// Correctness of a single notify_one: the predicate is set under the same
+// per-pair mutex the waiter checks it under, and `Cond::wait` enqueues on the
+// cond's queue *before* releasing that mutex — so by the time the notifier
+// acquires the mutex to set the predicate, either the waiter already parked
+// (notify_one wakes it) or it has not yet read the predicate (it will see
+// `true` and never park).  Commit-park guarantees the enqueued waiter is
+// GWAITING before notify_one can pop it.
+// ---------------------------------------------------------------------------
+#[test]
+fn cond_preemption_storm() {
+    use go_lib::sync::Cond;
+    use std::sync::Mutex;
+
+    const WORKERS: i64 = 5_000;
+    let woke  = Arc::new(AtomicI64::new(0));
+    let woke2 = Arc::clone(&woke);
+
+    go_lib::run(move || {
+        scope(|s| {
+            for i in 0..WORKERS {
+                let mu  = Arc::new(Mutex::new(false));
+                let cnd = Arc::new(Cond::new());
+
+                // Waiter: CPU-bound work, then park until the predicate holds.
+                {
+                    let mu   = Arc::clone(&mu);
+                    let cnd  = Arc::clone(&cnd);
+                    let woke = Arc::clone(&woke2);
+                    s.go(move || {
+                        let mut acc = 0_i64;
+                        for k in 0..=(i % 512) { acc = acc.wrapping_add(k); }
+                        std::hint::black_box(acc);
+
+                        let mut guard = mu.lock().unwrap();
+                        while !*guard {
+                            guard = cnd.wait(&mu, guard);
+                        }
+                        drop(guard);
+                        woke.fetch_add(1, Ordering::Relaxed);
+                    });
+                }
+
+                // Notifier: CPU-bound work, set predicate, one notify_one.
+                s.go(move || {
+                    let mut acc = 0_i64;
+                    for k in 0..=(i % 512) { acc = acc.wrapping_add(k); }
+                    std::hint::black_box(acc);
+
+                    *mu.lock().unwrap() = true;
+                    cnd.notify_one();
+                });
+            }
+        });
+    });
+
+    assert_eq!(
+        woke.load(Ordering::Acquire),
+        WORKERS,
+        "every cond waiter must wake (no lost wakeups)"
+    );
+}
+
 // TCP networking tests live in tests/net.rs — a separate integration test
 // binary with its own process and scheduler/netpoll instance, avoiding
 // interference with the many_goroutines test above.

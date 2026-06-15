@@ -21,8 +21,9 @@
 //! 6. Blocking path:
 //!    a. For every case, allocate a sudog (is_select=true) and enqueue it.
 //!    b. Reset G.selectdone to 0 and G.param to null.
-//!    c. Release all locks.
-//!    d. gopark(Select).
+//!    c. gopark_commit(Select) — park while still holding ALL channel locks;
+//!       they are released on g0 only after the goroutine reaches GWAITING
+//!       (commit-park protocol, closes the SIGURG lost-wakeup window).
 //! 7. On wakeup (winner wrote G.param = winning sudog):
 //!    a. Acquire all locks in lockorder.
 //!    b. Dequeue all *losing* sudogs (dequeue_sudog is a no-op if a racing
@@ -61,7 +62,7 @@ use std::sync::Arc;
 
 use crate::chan::{Hchan, Receiver, Sender};
 use crate::runtime::g::{current_g, G, WaitReason};
-use crate::runtime::park::{gopark, goready};
+use crate::runtime::park::{gopark_commit, goready};
 use crate::runtime::sudog::{acquire_sudog, release_sudog, Sudog};
 
 // ---------------------------------------------------------------------------
@@ -186,6 +187,45 @@ impl Lehmer {
 }
 
 // ---------------------------------------------------------------------------
+// Commit-park unlock shim
+// ---------------------------------------------------------------------------
+
+/// Everything `unlock_select_chans` needs to release every channel lock held
+/// by a parked `selectgo`, from g0, after the goroutine is `GWAITING`.
+///
+/// Lives on the selecting goroutine's stack across the park.  That stack stays
+/// mapped while the goroutine is `GWAITING` (and, in the dead-invocation reap
+/// path, until `park_fn` finishes and releases the locks here), so the raw
+/// pointers remain valid for the single shim call.
+struct SelectParkCtx {
+    /// `cases.as_ptr()` — the select's case slice base.
+    cases:     *const SCase,
+    /// `cases.len()`.
+    n:         usize,
+    /// `lockorder.as_ptr()` — address-sorted, deduped case indices.
+    lockorder: *const usize,
+    /// `lockorder.len()`.
+    nlock:     usize,
+}
+
+/// `gopark_commit` unlock shim for `selectgo`: release ALL of the select's
+/// channel locks (in lockorder) from g0 after the parking goroutine has
+/// reached `GWAITING`.  Each `unlock_fn` is `unlock_chan`, which also drops
+/// the `m.locks` increment that the matching `lock_chan` left held.
+///
+/// # Safety
+/// `arg` must point to a live [`SelectParkCtx`] whose channel locks are all
+/// held by the parking goroutine.
+unsafe fn unlock_select_chans(arg: *mut u8) {
+    let ctx       = unsafe { &*(arg as *const SelectParkCtx) };
+    let cases     = unsafe { std::slice::from_raw_parts(ctx.cases, ctx.n) };
+    let lockorder = unsafe { std::slice::from_raw_parts(ctx.lockorder, ctx.nlock) };
+    for &i in lockorder {
+        unsafe { (cases[i].unlock_fn)(cases[i].chan_ptr) };
+    }
+}
+
+// ---------------------------------------------------------------------------
 // selectgo
 // ---------------------------------------------------------------------------
 
@@ -306,12 +346,39 @@ pub fn selectgo(cases: &mut [SCase], has_default: bool) -> (usize, bool) {
     unsafe { (*gp).selectdone.store(0, Ordering::Release) };
     unsafe { (*gp).param = ptr::null_mut() };
 
-    // ── 6c. Release all locks and park ────────────────────────────────────────
-    for &i in &lockorder {
-        unsafe { (cases[i].unlock_fn)(cases[i].chan_ptr) };
+    // ── 6c. Commit-park: hold all channel locks across the park ───────────────
+    //
+    // Releasing the locks *before* gopark (the old design) opened a
+    // lost-wakeup window: between the unlock loop and the park an async
+    // preemption (SIGURG) could move this selecting goroutine to
+    // GRUNNABLE+queued; a peer completing one of our cases would then call
+    // goready, see the non-GWAITING status and return early, so when we
+    // finally parked (GWAITING) nobody would wake us → hang.  Instead we keep
+    // every channel lock held across the `mcall` and release them all on g0,
+    // via `unlock_select_chans`, only after `park_fn` has committed us to
+    // GWAITING.  A peer cannot dequeue our sudog (that needs the channel
+    // lock) until the park is committed.
+    //
+    // m.locks accounting: each `lock_chan` left one `m.locks` increment held
+    // (it `mem::forget`s its MLockGuard), so `m.locks` is currently elevated
+    // by `lockorder.len()`; the shim's matching `unlock_chan` calls remove
+    // exactly those.  `gopark_commit`/`park_fn` additionally do one
+    // unconditional `m.locks -= 1` for the handoff, so we add one extra
+    // increment here for park_fn to balance.
+    let ctx = SelectParkCtx {
+        cases:     cases.as_ptr(),
+        n:         cases.len(),
+        lockorder: lockorder.as_ptr(),
+        nlock:     lockorder.len(),
+    };
+    std::mem::forget(crate::runtime::m::m_lock());
+    unsafe {
+        gopark_commit(
+            WaitReason::Select,
+            unlock_select_chans,
+            &ctx as *const SelectParkCtx as *mut u8,
+        );
     }
-
-    gopark(WaitReason::Select);
 
     // ── 7. Woken: find winner, clean up losers ────────────────────────────────
     //
