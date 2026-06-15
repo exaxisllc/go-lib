@@ -102,6 +102,22 @@ impl Drop for LockGuard<'_> {
 }
 
 impl<'a> LockGuard<'a> {
+    /// Dissolve the guard WITHOUT releasing the spinlock, returning the raw
+    /// mutex pointer so the caller can hand the release to `gopark_commit`
+    /// (which unlocks on g0 only after the parking goroutine is `GWAITING`).
+    ///
+    /// Both the spinlock AND the `m.locks` increment stay held: async
+    /// preemption remains suppressed from here through the `mcall` into
+    /// `park_fn`, so the goroutine cannot be descheduled while it owns the
+    /// lock.  `park_fn` balances the `m.locks` increment on the same M (the
+    /// `gopark_commit` contract) before entering the scheduler.
+    pub(crate) fn into_locked_raw(self) -> *const RawMutex {
+        let this = std::mem::ManuallyDrop::new(self);
+        // Suppresses both our Drop (spinlock release) and the MLockGuard's
+        // Drop (m.locks decrement).  park_fn performs both, in order.
+        this.m as *const RawMutex
+    }
+
     /// Acquire `m` and return a guard that releases it on drop.
     pub(crate) fn new(m: &'a RawMutex) -> Self {
         // Bump m.locks *before* attempting to acquire so that SIGURG cannot

@@ -300,6 +300,33 @@ fn retake(sc: &'static Rt, now_ns: u64, ticks: &mut Vec<SysmonTick>) -> u32 {
 ///
 /// Ported from `preemptone` in `runtime/proc.go`.
 unsafe fn preemptone(pp: *mut super::p::P) {
+    // Kill switch (mirrors Go's `GODEBUG=asyncpreemptoff=1`): when
+    // `GOLIB_ASYNCPREEMPT_OFF=1`, sysmon never marks goroutines for async
+    // preemption and never sends SIGURG, so goroutines yield only
+    // cooperatively.  Useful for bisecting whether a crash involves the
+    // async-preempt machinery.
+    //
+    // KNOWN ISSUE: with preemption ON (the default), a residual,
+    // extremely-timing-sensitive race intermittently corrupts a resumed
+    // Gobuf under the `many_goroutines` preemption storm — surfaces as a rare
+    // SIGABRT/SIGSEGV on macOS x86-64 debug builds (caught by the debug
+    // `execute` Gobuf check).  Tracked as a follow-up.  With preemption OFF a
+    // separate latent stopm/findrunnable lost-wakeup can deadlock at low
+    // GOMAXPROCS, so OFF is NOT a blanket-safe default — it is a debugging
+    // aid.  (aarch64-linux is additionally cooperative-only for the x18
+    // reason documented below.)
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *OFF.get_or_init(|| std::env::var_os("GOLIB_ASYNCPREEMPT_OFF").is_some_and(|v| v == "1")) {
+        return;
+    }
+    unsafe { preempt_mark_and_signal(pp) };
+}
+
+/// Mark `pp`'s running goroutine for preemption and deliver `SIGURG`.
+///
+/// Split out from [`preemptone`] so the enable-gate lives in one place and the
+/// unit test can exercise the mark/signal logic directly.
+unsafe fn preempt_mark_and_signal(pp: *mut super::p::P) {
     let mp = unsafe { (*pp).m };
     if mp.is_null() {
         return;
@@ -434,10 +461,13 @@ mod tests {
             "stackguard0 must not be STACK_PREEMPT before preemptone"
         );
 
-        unsafe { preemptone(p) };
+        // Call the mark/signal body directly: async preemption is gated OFF
+        // by default in `preemptone`, but this test verifies the underlying
+        // flag-setting + SIGURG mechanism regardless of the gate.
+        unsafe { preempt_mark_and_signal(p) };
 
-        // preemptone set the flags and sent SIGURG.  The flags are set
-        // synchronously before pthread_kill, so we can check immediately.
+        // The flags are set synchronously before pthread_kill, so we can
+        // check immediately.
         assert!(unsafe { (*gp).preempt },       "preempt must be true after preemptone");
         assert_eq!(
             unsafe { (*gp).stackguard0 }, STACK_PREEMPT,

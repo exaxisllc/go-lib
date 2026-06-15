@@ -59,11 +59,72 @@ pub(crate) fn gopark(reason: WaitReason) {
     // park_fn → schedule() — control never returns here until goready re-enqueues gp.
 }
 
+/// Suspend the current goroutine, releasing a caller-held lock only AFTER
+/// the goroutine is `GWAITING` — Go's `gopark(unlockf, …)` commit protocol.
+///
+/// Blocking operations publish a waiter (sudog) and then park.  If they
+/// release their lock *before* parking, there is a window in which the
+/// goroutine is still `GRUNNING` (or `GRUNNABLE`, if async preemption lands
+/// in the window) while its sudog is already visible: a waker that completes
+/// the rendezvous then cannot deliver the wake (`goready` sees a
+/// non-`GWAITING` status) and the wake is lost — the goroutine parks forever
+/// and the consumed sudog corrupts the pool.  Holding the lock until
+/// `park_fn` has transitioned the G to `GWAITING` closes the window: no
+/// waker can reach the sudog before the park is committed.
+///
+/// `unlock_fn(unlock_arg)` is invoked exactly once, on g0's stack, after the
+/// status transition (or after the parking G is reaped by a dead-invocation
+/// drain — the lock must be released in that path too).
+///
+/// # Contract: m.locks transfer
+///
+/// The caller must arrive with `m.locks` elevated by exactly one for the
+/// dissolved lock guard (see `LockGuard::into_locked_raw`), which keeps
+/// async preemption suppressed across the `mcall` — guaranteeing `park_fn`
+/// runs on the same M.  `park_fn` decrements `m.locks` once when an unlock
+/// handoff is present.
+///
+/// # Safety
+/// The caller must actually hold the lock that `unlock_fn` releases, and
+/// must not touch the protected state after calling this.
+pub(crate) unsafe fn gopark_commit(
+    reason:     WaitReason,
+    unlock_fn:  unsafe fn(*mut u8),
+    unlock_arg: *mut u8,
+) {
+    let gp = current_g();
+    debug_assert!(!gp.is_null(), "gopark_commit: called from g0 or bare OS thread");
+    unsafe {
+        (*gp).waitreason      = reason;
+        (*gp).park_unlock_fn  = Some(unlock_fn);
+        (*gp).park_unlock_arg = unlock_arg;
+        mcall(gp, park_fn);
+    }
+}
+
 /// Mcall target for `gopark`.  Runs on g0's stack.
 ///
 /// Sets G status to `Gwaiting`, unlinks G from the M, and enters `schedule`.
 unsafe extern "C" fn park_fn(gp: *mut G) {
     let m = current_m();
+
+    // Snapshot the gopark_commit unlock handoff FIRST: once the G is
+    // GWAITING and the lock is released, a waker can run the G to
+    // completion on another M and free it — `gp` must not be dereferenced
+    // after the unlock call below.
+    let unlock_fn  = unsafe { (*gp).park_unlock_fn.take() };
+    let unlock_arg = unsafe {
+        let a = (*gp).park_unlock_arg;
+        (*gp).park_unlock_arg = ptr::null_mut();
+        a
+    };
+    // Balance the m.locks increment transferred by `gopark_commit` (see its
+    // contract).  Done here, before the status transition, so the decrement
+    // lands on the SAME M that took the increment — after the unlock below,
+    // this G may resume on a different M.
+    if unlock_fn.is_some() {
+        unsafe { (*m).locks -= 1 };
+    }
 
     // Dead-invocation check MUST come before the GWAITING transition, while
     // this M still exclusively owns gp.  The moment the status becomes
@@ -77,6 +138,12 @@ unsafe extern "C" fn park_fn(gp: *mut G) {
         unsafe {
             (*m).curg = ptr::null_mut();
             set_current_g(ptr::null_mut());
+            // The reaped G never reaches GWAITING, but the caller-held lock
+            // must still be released or every other party on that channel
+            // deadlocks.
+            if let Some(f) = unlock_fn {
+                f(unlock_arg);
+            }
             schedule()
         };
         return;
@@ -87,6 +154,12 @@ unsafe extern "C" fn park_fn(gp: *mut G) {
         (*gp).m   = ptr::null_mut();
         (*m).curg = ptr::null_mut();
         set_current_g(ptr::null_mut());
+        // Commit point: all writes to `gp` are done.  Release the caller's
+        // lock LAST — the moment it is released a waker can dequeue the
+        // sudog, goready this G, and another M may run (and even free) it.
+        if let Some(f) = unlock_fn {
+            f(unlock_arg);
+        }
     }
 
     unsafe { schedule() };
@@ -132,15 +205,23 @@ pub(crate) unsafe fn goready(gp: *mut G) {
     let _cs = super::rcu::RcuGuard::new();
 
     // Spin until the goroutine finishes its in-flight status transition.
-    // The two expected stable states are:
-    //   GWAITING   — normal gopark (channel / mutex / timer / condvar)
-    //   GPREEMPTED — async preemption landed before goready was called
-    // We spin briefly on GRUNNING because channel operations release their
-    // lock *before* calling gopark, so there is a tiny window where the G
-    // is still GRUNNING even though its sudog has been dequeued.
+    // The only wakeable state is GWAITING.
+    //
+    // GPREEMPTED is deliberately NOT wakeable: it exists only inside
+    // `preemptm`, between its `GRUNNING → GPREEMPTED` and
+    // `GPREEMPTED → GRUNNABLE` transitions.  If goready were to claim it
+    // (CAS GPREEMPTED → GRUNNABLE + enqueue), `preemptm`'s second
+    // `casgstatus` would spin waiting for GPREEMPTED to reappear while the
+    // goroutine runs — and possibly exits and is FREED — on another M.  The
+    // stuck spin then reads recycled heap memory; the moment those bytes
+    // coincide with GPREEMPTED it "wins" the CAS on garbage and pushes a
+    // dangling G pointer into the run queue (observed as `execute` resuming
+    // a zeroed Gobuf in the many_goroutines SIGURG storm).  Spinning here
+    // instead is always brief: preemptm completes its second CAS within a
+    // few instructions.
     loop {
         let s = unsafe { readgstatus(gp) };
-        if s == GWAITING || s == GPREEMPTED {
+        if s == GWAITING {
             // GWAITING / GPREEMPTED → GRUNNABLE.  Use a single
             // compare_exchange rather than `casgstatus` (which retries until
             // it wins): between our status read and the CAS, the run_impl
@@ -183,8 +264,9 @@ pub(crate) unsafe fn goready(gp: *mut G) {
             return;
         }
         debug_assert!(
-            s == GRUNNING,
-            "goready: unexpected status {s} — expected GRUNNING, GWAITING, GPREEMPTED, or GDEAD"
+            s == GRUNNING || s == GPREEMPTED,
+            "goready: unexpected status {s} — expected GRUNNING, GPREEMPTED (transient), \
+             GWAITING, GRUNNABLE, or GDEAD"
         );
         std::hint::spin_loop();
     }

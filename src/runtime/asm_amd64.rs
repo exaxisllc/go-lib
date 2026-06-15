@@ -564,7 +564,12 @@ pub(crate) unsafe fn systemstack<F: FnOnce()>(f: F) {
 ///
 /// ## Register layout on entry
 /// - `[RSP]`   = original `RIP` (the preemption point; serves as the return address)
-/// - `RSP+8..` = goroutine's live stack at the moment of preemption
+/// - `RSP+8 .. RSP+136` = the interrupted function's System V red zone,
+///   preserved untouched (redirect_to_async_preempt stores the resume PC at
+///   `rsp − 136`, not `rsp − 8`, so this frame cannot clobber red-zone
+///   locals of an interrupted leaf function; the final `ret 128` undoes the
+///   displacement)
+/// - `RSP+136..` = goroutine's live stack at the moment of preemption
 /// - All other registers: unchanged (intact from the interrupted state)
 ///
 /// ## Frame layout (built by this function)
@@ -660,8 +665,26 @@ pub(crate) unsafe extern "C" fn async_preempt_trampoline() {
         "movdqu [rsp + 240], xmm15",
 
         // ── call async_preempt2 (yields via mcall → schedule) ───────────────
-        // RSP is 16-byte aligned here; `call` pushes 8 → RSP%16==8 in callee.
+        //
+        // The interrupted RSP is NOT guaranteed to be ≡ 8 (mod 16): an async
+        // signal can land at any instruction boundary — mid-argument-push,
+        // in a prologue, in a leaf function — where RSP may be at either
+        // parity.  The System V ABI requires RSP%16 == 0 at every `call`
+        // site; violating it makes any aligned SSE spill (`movaps`) in
+        // async_preempt2 or its callees fault or corrupt.  Align dynamically
+        // and stash the pre-alignment RSP in STACK memory (not a register):
+        // stack words survive a copystack relocation because the conservative
+        // scan adjusts them, whereas a callee-saved register carried across
+        // the mcall suspension would go stale if the stack grows while the
+        // goroutine is parked.
+        "mov rax, rsp",     // rax = frame base (user RAX already saved above)
+        "and rsp, -16",     // drop 0 or 8 bytes — RSP%16 == 0
+        "push rax",         // save frame base on the aligned stack (RSP%16 == 8)
+        "sub rsp, 8",       // restore call-site alignment   (RSP%16 == 0)
         "call {ap2}",
+        "add rsp, 8",
+        "pop rax",          // frame base back (adjusted by copystack if grown)
+        "mov rsp, rax",     // undo the alignment — RSP = frame base
 
         // ── restore XMM registers ────────────────────────────────────────────
         "movdqu xmm0,  [rsp + 0]",
@@ -708,7 +731,14 @@ pub(crate) unsafe extern "C" fn async_preempt_trampoline() {
 
         // ── return to the original interrupted PC ─────────────────────────────
         // [RSP] holds the original RIP (placed there by the SIGURG handler).
-        "ret",
+        //
+        // `ret 128` (RET imm16) pops the return address and THEN adds 128 to
+        // RSP, undoing the red-zone skip applied by redirect_to_async_preempt
+        // (which stored the resume PC at rsp − 128 − 8 instead of rsp − 8 so
+        // that this trampoline's 392-byte frame cannot clobber the System V
+        // red zone of an interrupted leaf function).  After the pop + add,
+        // RSP is exactly the interrupted RSP.
+        "ret 128",
 
         ap2 = sym crate::runtime::sched::async_preempt2,
     )
