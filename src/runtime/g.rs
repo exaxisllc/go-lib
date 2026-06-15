@@ -331,11 +331,12 @@ const _: () = {
     //                                        (7 GPRs + 10 × 128-bit XMM6–15)
     //   AArch64 (all OS):                    18 callee-save regs → Gobuf 200 B → G 296 B
     //
-    // The 104-byte non-Gobuf portion is the same on every platform: the
+    // The 120-byte non-Gobuf portion is the same on every platform: the
     // original 72, plus the three Phase 2b waiter-tracking fields
     // (`waiting_sudogs`, `waiting_wg`, `waiting_cond` — 24 bytes), plus the
-    // invocation tag (`inv` — 8 bytes).
-    const NON_GOBUF: usize = 104;
+    // invocation tag (`inv` — 8 bytes), plus the gopark_commit unlock
+    // handoff (`park_unlock_fn` + `park_unlock_arg` — 16 bytes).
+    const NON_GOBUF: usize = 120;
     const GOBUF: usize = 56 + CALLEE_SAVED_GPR_COUNT * 8;
     assert!(size_of::<G>() == NON_GOBUF + GOBUF,
         "G struct size changed — update layout table and this assertion");
@@ -432,6 +433,26 @@ pub(crate) struct G {
     /// scheduler's reaper discards runnable goroutines of dead invocations
     /// instead of executing them.
     pub inv: *const InvState,
+
+    // ── gopark_commit unlock handoff ──────────────────────────────────────
+    //
+    // Set by `gopark_commit` before its `mcall`; consumed by `park_fn` on
+    // g0, which calls `park_unlock_fn(park_unlock_arg)` AFTER the GWAITING
+    // transition.  This is the Go `gopark(unlockf, …)` commit protocol:
+    // blocking operations keep their lock held across the park so a waker
+    // can never observe the published sudog while the G is still
+    // GRUNNING/GRUNNABLE (a window in which `goready`'s wake would be lost
+    // — observed as channel lost-wakeups and sudog-pool corruption under
+    // async-preemption storms).  Carried in the G (not a thread-local) so
+    // the handoff survives an async preemption between `gopark_commit` and
+    // the actual park, which can migrate the goroutine to another M.
+
+    /// Unlock callback invoked on g0 after this G is GWAITING; `None` for a
+    /// plain `gopark`.
+    pub park_unlock_fn: Option<unsafe fn(*mut u8)>,
+    /// Opaque argument for `park_unlock_fn`.  If it points into the
+    /// goroutine's own stack, `copystack` adjusts it during stack growth.
+    pub park_unlock_arg: *mut u8,
 }
 
 /// Identity of one `run_impl` invocation on the process-wide singleton `Rt`.
@@ -465,8 +486,23 @@ impl G {
     /// and `sched.pc` are left zeroed; the caller must initialise them (via
     /// `runtime::sched`) before making the G runnable.
     pub(crate) fn new(stack: Stack, goid: u64) -> Box<G> {
+        let mut g = Box::new(G::value(stack, goid));
+        // Box<G> has a stable heap address — moving the Box moves only the
+        // pointer, not the allocation — so this self-referential pointer is
+        // valid for the lifetime of the allocation.
+        g.sched.g = std::ptr::addr_of_mut!(*g);
+        g
+    }
+
+    /// Construct a fresh `G` value (all fields reset) for `stack`/`goid`.
+    ///
+    /// `sched.g` is left null; the caller must point it at the value's final
+    /// resting address (see [`G::new`], and the G free-pool reuse path in
+    /// `runtime::sched::new_goroutine`, which `ptr::write`s this value over
+    /// a retired descriptor).
+    pub(crate) fn value(stack: Stack, goid: u64) -> G {
         let stackguard0 = stack.lo + STACK_GUARD;
-        let mut g = Box::new(G {
+        G {
             stack,
             stackguard0,
             m:            std::ptr::null_mut(),
@@ -482,12 +518,9 @@ impl G {
             waiting_wg:     std::ptr::null_mut(),
             waiting_cond:   std::ptr::null_mut(),
             inv:            std::ptr::null(),
-        });
-        // Box<G> has a stable heap address — moving the Box moves only the
-        // pointer, not the allocation — so this self-referential pointer is
-        // valid for the lifetime of the allocation.
-        g.sched.g = std::ptr::addr_of_mut!(*g);
-        g
+            park_unlock_fn:  None,
+            park_unlock_arg: std::ptr::null_mut(),
+        }
     }
 }
 

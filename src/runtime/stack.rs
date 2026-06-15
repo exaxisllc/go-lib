@@ -478,6 +478,12 @@ unsafe fn copystack(gp: *mut G, old_stack: &Stack, new_stack: &Stack) -> isize {
         if bp >= old_lo && bp < old_hi {
             (*gp).sched.bp = ((bp as isize) + delta) as usize;
         }
+        // gopark_commit's unlock argument may point into the goroutine's own
+        // stack (e.g. a select unlock descriptor); relocate it like sp/bp.
+        let pua = (*gp).park_unlock_arg as usize;
+        if pua >= old_lo && pua < old_hi {
+            (*gp).park_unlock_arg = ((pua as isize) + delta) as *mut u8;
+        }
     }
 
     // Restore the original status: GCOPYSTACK → old_status.

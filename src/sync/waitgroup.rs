@@ -31,9 +31,12 @@
 //!
 //! Ported from `sync/waitgroup.go`.
 
+use std::cell::UnsafeCell;
+
 use crate::loom_shim::{Condvar, Mutex};
 use crate::runtime::g::{current_g, WaitReason, G};
-use crate::runtime::park::{gopark, goready};
+use crate::runtime::park::{gopark_commit, goready};
+use crate::runtime::rawmutex::RawMutex;
 
 // ---------------------------------------------------------------------------
 // Internal state
@@ -77,17 +80,36 @@ unsafe impl Send for WgState {}
 /// // wg.wait();  // blocks until all Done() calls have been made
 /// ```
 pub struct WaitGroup {
-    state: Mutex<WgState>,
+    /// Spinlock protecting `state`.  A `RawMutex` (not `std::sync::Mutex`)
+    /// so that the goroutine `wait()` path can hold the lock ACROSS the park
+    /// via `gopark_commit` — the lock is released on g0 only after the
+    /// waiter is `GWAITING`.  With a guard-based Mutex released before
+    /// `gopark`, an async preemption in the release-to-park window made the
+    /// registered waiter `GRUNNABLE`; `add()`'s `goready` then dropped the
+    /// wake on the floor and the waiter parked forever.
+    mu:    RawMutex,
+    /// Interior state — always accessed under `mu`.
+    state: UnsafeCell<WgState>,
+    /// Companion lock for `cond` — used only by the non-goroutine fallback
+    /// path (bare OS threads / loom model threads).
+    cond_lock: Mutex<()>,
     /// Condvar used only on the non-goroutine fallback path.
     cond:  Condvar,
 }
+
+// SAFETY: `state` is only accessed while `mu` is held; the `*mut G` waiters
+// are scheduler-owned and dereferenced only under RCU (see `add`).
+unsafe impl Send for WaitGroup {}
+unsafe impl Sync for WaitGroup {}
 
 impl WaitGroup {
     /// Create a new `WaitGroup` with a counter of zero.
     pub fn new() -> Self {
         Self {
-            state: Mutex::new(WgState { count: 0, waiters: Vec::new() }),
-            cond:  Condvar::new(),
+            mu:        RawMutex::new(),
+            state:     UnsafeCell::new(WgState { count: 0, waiters: Vec::new() }),
+            cond_lock: Mutex::new(()),
+            cond:      Condvar::new(),
         }
     }
 
@@ -116,22 +138,26 @@ impl WaitGroup {
         let _cs = crate::runtime::rcu::RcuGuard::new();
         // Collect goroutine waiters to wake (if counter reaches zero).
         let goroutine_waiters: Vec<*mut G> = {
-            let mut state = self.state.lock().unwrap();
+            self.mu.lock();
+            // SAFETY: `mu` is held.
+            let state = unsafe { &mut *self.state.get() };
             state.count += delta;
             if state.count < 0 {
-                drop(state);
+                unsafe { self.mu.unlock() };
                 panic!("sync: negative WaitGroup counter");
             }
-            if state.count == 0 {
-                // Wake condvar waiters (non-goroutine / loom path).
-                // Drain goroutine waiters to wake via goready below.
-                let w = std::mem::take(&mut state.waiters);
-                drop(state);
+            let zero = state.count == 0;
+            let w = if zero { std::mem::take(&mut state.waiters) } else { Vec::new() };
+            unsafe { self.mu.unlock() };
+            if zero {
+                // Wake condvar waiters (non-goroutine / loom path).  Taking
+                // `cond_lock` between the count update and the notify pairs
+                // with the re-check the bare-thread `wait` does under
+                // `cond_lock`, so the notify cannot be missed.
+                let _g = self.cond_lock.lock().unwrap();
                 self.cond.notify_all();
-                w
-            } else {
-                Vec::new()
             }
+            w
         };
 
         // Wake goroutine waiters outside the lock so we don't hold it during
@@ -155,8 +181,10 @@ impl WaitGroup {
     /// waiters list.
     pub(crate) unsafe fn remove_waiter(&self, gp: *mut G) {
         let _lk = crate::runtime::m::m_lock();
-        let mut state = self.state.lock().unwrap();
-        state.waiters.retain(|&g| g != gp);
+        self.mu.lock();
+        // SAFETY: `mu` is held.
+        unsafe { (*self.state.get()).waiters.retain(|&g| g != gp) };
+        unsafe { self.mu.unlock() };
     }
 
     /// Decrement the counter by one.
@@ -182,48 +210,63 @@ impl WaitGroup {
         // (including whoever will call done() to reach count == 0).
         let gp = current_g();
         if !gp.is_null() {
-            // Critical section guarded by `m_lock` — see matching comment in
-            // `add()`.  Scope the guard so it is dropped *before* `gopark`:
-            // we must not hold `m.locks` across the yield (other goroutines
-            // scheduled on this M would inherit suppressed preemption until
-            // this goroutine wakes again, which can be milliseconds away).
-            {
-                let _lk = crate::runtime::m::m_lock();
-                let mut state = self.state.lock().unwrap();
-                if state.count == 0 {
-                    return; // fast path: already done
-                }
-                // Register as a waiter *before* releasing the lock so that any
-                // concurrent add() that drives count to zero will see us and
-                // call goready.  goready itself spins until our status reaches
-                // GWAITING, which closes the window between drop(state) and
-                // gopark().
-                state.waiters.push(gp);
-                // Phase 2b: tag gp with the WaitGroup it is parked on so the
-                // run_impl drain can remove the stale `*mut G` from `state.waiters`
-                // if gp is reclaimed while parked.  Cleared in two places: by
-                // `add()` when it drains us via goready, and below right after
-                // gopark resumes.
-                unsafe { (*gp).waiting_wg = self as *const WaitGroup as *mut u8 };
-                drop(state);
+            // m_lock suppresses async preemption while we hold `mu` AND
+            // across the `gopark_commit` below — the increment is
+            // transferred to `park_fn`, which balances it on the same M
+            // (see gopark_commit's contract).
+            let _lk = crate::runtime::m::m_lock();
+            self.mu.lock();
+            // SAFETY: `mu` is held.
+            let state = unsafe { &mut *self.state.get() };
+            if state.count == 0 {
+                unsafe { self.mu.unlock() };
+                return; // fast path: already done (`_lk` drops normally)
             }
-            // Suspend this goroutine.  Execution resumes here after add()
-            // calls goready(gp) once the counter reaches zero.
-            gopark(WaitReason::Semacquire);
+            // Register as a waiter; the lock stays held until park_fn has
+            // committed this goroutine to GWAITING (commit-park protocol),
+            // so add() can only observe the registration once goready is
+            // guaranteed to find us parked.  Releasing before the park left
+            // a window where preemption made us GRUNNABLE and add()'s wake
+            // was silently dropped — the waiter then parked forever.
+            state.waiters.push(gp);
+            // Phase 2b: tag gp with the WaitGroup it is parked on so the
+            // run_impl drain can remove the stale `*mut G` from
+            // `state.waiters` if gp is reclaimed while parked.  Cleared by
+            // `add()` when it wakes us, and below as a defensive measure.
+            unsafe { (*gp).waiting_wg = self as *const WaitGroup as *mut u8 };
+            // Transfer the m.locks increment to park_fn.
+            std::mem::forget(_lk);
+            unsafe {
+                gopark_commit(
+                    WaitReason::Semacquire,
+                    unlock_wg_mutex,
+                    &self.mu as *const RawMutex as *mut u8,
+                );
+            }
             // Phase 2b: clear the tag now that we have been woken.  (The
-            // waker — `add()` below — clears it too, but doing it here as
-            // well is defensive against a future code path that wakes without
-            // going through add()).
+            // waker — `add()` above — clears it too; doing it here as well is
+            // defensive against a future code path that wakes without going
+            // through add()).
             unsafe { (*gp).waiting_wg = std::ptr::null_mut() };
             return;
         }
 
         // ── Non-goroutine / loom path ───────────────────────────────────────
         // Block the calling OS thread on the condvar.  Used by tests that call
-        // wait() from a bare thread and by loom model threads.
-        let mut state = self.state.lock().unwrap();
-        while state.count > 0 {
-            state = self.cond.wait(state).unwrap();
+        // wait() from a bare thread and by loom model threads.  The count is
+        // re-checked under `cond_lock`, which `add()` acquires between
+        // setting count == 0 and notifying — so the notify cannot fall
+        // between our check and the `cond.wait`.
+        let mut guard = self.cond_lock.lock().unwrap();
+        loop {
+            self.mu.lock();
+            // SAFETY: `mu` is held.
+            let count = unsafe { (*self.state.get()).count };
+            unsafe { self.mu.unlock() };
+            if count == 0 {
+                return;
+            }
+            guard = self.cond.wait(guard).unwrap();
         }
     }
 }
@@ -232,6 +275,16 @@ impl Default for WaitGroup {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// `gopark_commit` unlock shim: release the WaitGroup's `RawMutex` from g0
+/// after the parking goroutine has reached `GWAITING`.
+///
+/// # Safety
+/// `arg` must be the `&RawMutex` of a `WaitGroup` whose lock is held by the
+/// parking goroutine.
+unsafe fn unlock_wg_mutex(arg: *mut u8) {
+    unsafe { (*(arg as *const RawMutex)).unlock() }
 }
 
 // ---------------------------------------------------------------------------

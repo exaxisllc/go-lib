@@ -58,7 +58,7 @@ use std::ptr;
 use std::sync::Arc;
 
 use crate::runtime::g::{current_g, WaitReason};
-use crate::runtime::park::{gopark, goready};
+use crate::runtime::park::{gopark_commit, goready};
 use crate::runtime::rawmutex::{LockGuard, RawMutex};
 use crate::runtime::sudog::{acquire_sudog, release_sudog, Sudog, WaitQ};
 
@@ -356,8 +356,13 @@ pub(crate) unsafe fn chansend<T: Send + 'static>(
         crate::runtime::g::push_waiting_sudog(gp, s);
     }
 
-    drop(_g); // release lock BEFORE parking
-    gopark(WaitReason::ChanSend);
+    // Commit-park protocol: keep the channel lock held until park_fn has
+    // transitioned this goroutine to GWAITING (released on g0).  Releasing
+    // before the park opens a window where a receiver consumes the sudog and
+    // calls goready while we are still GRUNNING/GRUNNABLE — the wake is then
+    // lost and this goroutine parks forever (observed under SIGURG storms).
+    let mutex_ptr = _g.into_locked_raw();
+    unsafe { gopark_commit(WaitReason::ChanSend, unlock_chan_mutex, mutex_ptr as *mut u8) };
 
     // ── Resumed: inspect outcome ─────────────────────────────────────────────
     let ok = unsafe {
@@ -456,8 +461,9 @@ pub(crate) unsafe fn chanrecv<T: Send + 'static>(
         crate::runtime::g::push_waiting_sudog(gp, s);
     }
 
-    drop(_g);
-    gopark(WaitReason::ChanReceive);
+    // Commit-park protocol — see chansend for the lost-wakeup rationale.
+    let mutex_ptr = _g.into_locked_raw();
+    unsafe { gopark_commit(WaitReason::ChanReceive, unlock_chan_mutex, mutex_ptr as *mut u8) };
 
     // ── Resumed: read outcome ─────────────────────────────────────────────────
     unsafe {
@@ -532,6 +538,16 @@ pub(crate) unsafe fn chanrecv_nb<T: Send + 'static>(
     }
 
     None
+}
+
+/// `gopark_commit` unlock shim: release a channel's `RawMutex` from g0 after
+/// the parking goroutine has reached `GWAITING`.
+///
+/// # Safety
+/// `arg` must be the channel's `&RawMutex` (as produced by
+/// `LockGuard::into_locked_raw`), currently held by the parking goroutine.
+unsafe fn unlock_chan_mutex(arg: *mut u8) {
+    unsafe { (*(arg as *const RawMutex)).unlock() }
 }
 
 /// Receive from a **dequeued** sender sudog and wake the sender.

@@ -626,6 +626,29 @@ pub(crate) unsafe fn execute(gp: *mut G) -> ! {
         unsafe { (*p).schedtick.fetch_add(1, Relaxed) };
     }
 
+    // Debug-build sanity check: catch a corrupted Gobuf at resume time with
+    // context, rather than letting gogo() restore garbage and detonate at an
+    // arbitrary point downstream.  `sched.sp`/`bp` must point into the G's own
+    // stack and `sp` must be 8-byte aligned; `pc` must be set.
+    #[cfg(debug_assertions)]
+    unsafe {
+        let sp = (*gp).sched.sp;
+        let bp = (*gp).sched.bp;
+        let pc = (*gp).sched.pc;
+        let (lo, hi) = ((*gp).stack.lo, (*gp).stack.hi);
+        let sp_ok = sp >= lo && sp <= hi && sp & 7 == 0;
+        let bp_ok = bp == 0 || (bp >= lo && bp <= hi);
+        if !sp_ok || !bp_ok || pc == 0 {
+            let status = (*gp).atomicstatus.load(std::sync::atomic::Ordering::Relaxed);
+            eprintln!(
+                "execute: corrupt gobuf: gp={gp:p} goid={} status={status} sp={sp:#x} \
+                 bp={bp:#x} pc={pc:#x} stack=[{lo:#x},{hi:#x}]",
+                (*gp).goid,
+            );
+            std::process::abort();
+        }
+    }
+
     // Checkpoint growth: proactively double the stack if the saved SP is
     // within 2×STACK_GUARD of the guard page.  Prevents a SIGSEGV on the
     // very first instruction of the next quantum.
@@ -686,9 +709,14 @@ pub(crate) unsafe extern "C" fn goexit0(gp: *mut G) {
     // Safe: gp is the only owner of this stack; it is GDEAD and off all queues.
     unsafe { stack_free(&stack) };
 
-    // Reclaim the heap-allocated G descriptor.  gp must not be touched after
-    // this point; schedule() runs on g0's stack and never dereferences gp.
-    unsafe { drop(Box::from_raw(gp)) };
+    // Retire the G descriptor to the free pool — the allocation is NEVER
+    // returned to the heap (see `gfree_put`): sysmon's `preemptone` reads
+    // `m.curg` and blindly writes `preempt`/`stackguard0` through it without
+    // any liveness synchronisation, exactly like Go — and Go is only sound
+    // because G structs are immortal (`gfree` lists).  Freeing the Box here
+    // let that write land in recycled heap memory (observed as corrupted
+    // sudogs/Gobufs under the many_goroutines SIGURG storm).
+    unsafe { gfree_put(gp) };
 
     // Re-enter the scheduler on g0's stack.  Returns only on Rt shutdown, in
     // which case mcall_asm's m_thread_exit call terminates the OS thread.
@@ -739,6 +767,25 @@ unsafe extern "C" fn gosched_m(gp: *mut G) {
 /// Previous SIGURG handler (chained if the signal is not a preemption).
 #[cfg(not(windows))]
 static PREV_SIGURG: Mutex<Option<libc::sigaction>> = Mutex::new(None);
+
+/// Minimum free stack (bytes) below the interrupted SP required before
+/// `sigurg_handler` will inject async preemption (Guard 2.5).
+///
+/// Budget for everything the preempt path pushes onto the goroutine stack
+/// before `mcall_asm` switches to g0:
+///
+/// - `redirect_to_async_preempt`: 8 B (x86-64 resume-PC push) or 16 B
+///   (AArch64 LR spill, 16-byte aligned)
+/// - `async_preempt_trampoline`: 392 B register-save frame (x86-64) /
+///   ~784 B (AArch64 GPRs + d0–d31) + the `call`/`bl` return slot
+/// - `async_preempt2` + `mcall`: ordinary Rust frames, several hundred
+///   bytes each in unoptimised debug builds
+///
+/// 4096 covers all of that with margin while still being well under the
+/// smallest stack we ever run on (16 KiB Linux debug).  The equivalent of
+/// Go's `asyncPreemptStack` used by `isAsyncSafePoint`.
+#[cfg(not(windows))]
+const ASYNC_PREEMPT_HEADROOM: usize = 4096;
 
 /// Install the runtime's SIGURG handler for async goroutine preemption.
 ///
@@ -1033,6 +1080,56 @@ unsafe extern "C" fn sigurg_handler(
             return; // not on goroutine's stack — skip preemption
         }
 
+        // Guard 2.5: there must be enough free stack BELOW the interrupted SP
+        // for the entire preemption machinery to run without touching the
+        // guard page.
+        //
+        // The preempt path consumes goroutine stack out of band of any normal
+        // call: `redirect_to_async_preempt` pushes the resume PC (x86-64) or
+        // the original LR (AArch64), `async_preempt_trampoline` then builds a
+        // ~400 B register-save frame, and `async_preempt2` + `mcall` push
+        // ordinary (debug: wide) Rust frames before `mcall_asm` finally
+        // switches to g0's stack.
+        //
+        // If any of those writes lands in the guard page, the SIGSEGV/SIGBUS
+        // growth handler fires NESTED inside the preemption machinery — and
+        // that growth is unrecoverable: `update_sp_in_context` adjusts only
+        // RSP/RBP in the usable-stack range (heap-false-positive fix, PR #23),
+        // so live user register values that point into the old usable stack
+        // stay stale, get pushed into the trampoline's register-save frame
+        // AFTER copystack's conservative scan already ran, and are popped
+        // back into the resumed goroutine pointing at the freed (and quickly
+        // remapped, zero-filled) old stack.  Observed as `many_goroutines`
+        // resuming the spawner with zeroed callee-saved registers in debug
+        // builds (SIGSEGV on Linux, SIGABRT via the trampoline's RFLAGS
+        // corruption path on macOS).
+        //
+        // Mirrors Go's `isAsyncSafePoint` stack check (`asyncPreemptStack`):
+        // when headroom is insufficient, simply skip — sysmon keeps
+        // `gp.preempt` set and retries; if the goroutine stays deep it will
+        // touch the guard page through a NORMAL memory access soon enough,
+        // which the growth handler recovers from cleanly, and the next SIGURG
+        // then finds a doubled stack with plenty of headroom.
+        if sp < lo + ASYNC_PREEMPT_HEADROOM {
+            return; // too close to the guard page — defer preemption
+        }
+
+        // Guard 2.6: the interrupted SP must be 8-byte aligned before we use
+        // it as a `*mut usize` to push the resume PC in
+        // `redirect_to_async_preempt`.  An async signal can land at any
+        // instruction boundary, including inside an unoptimised debug
+        // prologue that has only partially adjusted RSP (rustc emits
+        // `sub rsp, 2`-style frames for byte-sized locals), leaving RSP at an
+        // odd or 2/4/6-mod-8 value.  Pushing a usize there is an unaligned
+        // store (UB in Rust, and the debug-build alignment check turns it
+        // into a `panic_nounwind` *inside the signal handler* → process
+        // abort).  Skipping is safe and cheap: sysmon keeps `gp.preempt` set
+        // and retries; RSP is realigned within a few instructions.  Go does
+        // not hit this because it controls its own register-safe points.
+        if sp & 7 != 0 {
+            return; // unaligned SP — not a safe preemption point, defer
+        }
+
         // Guard 3: interrupted PC must not be inside our scheduler's asm
         // trampolines — `gogo_asm`, `mcall_asm`, or `async_preempt_trampoline`
         // itself.
@@ -1070,8 +1167,11 @@ unsafe extern "C" fn sigurg_handler(
 /// Redirect the goroutine's execution to `async_preempt_trampoline` by modifying
 /// the interrupted register state in `ucontext_t`.
 ///
-/// On AMD64/x86_64: push the original `RIP` onto the goroutine's stack (decrement
-/// `RSP`, write to `[RSP]`), then set `RIP` = `async_preempt_trampoline`.
+/// On AMD64/x86_64: store the original `RIP` at `rsp − 136` (8 bytes for the
+/// push plus 128 bytes to hop over the System V red zone, which an interrupted
+/// leaf function may be using for locals), set `RSP` to that slot, then set
+/// `RIP` = `async_preempt_trampoline`.  The trampoline's `ret 128` restores
+/// the original `RSP` exactly.
 ///
 /// On AArch64: place the original `PC` into `LR` (x30), then set `PC` to the
 /// trampoline.  The trampoline saves x30 and restores it before `ret`.
@@ -1083,7 +1183,18 @@ unsafe fn redirect_to_async_preempt(gp: *mut G, ctx: *mut libc::c_void) {
         let uc  = ctx as *mut libc::ucontext_t;
         let rip = (*uc).uc_mcontext.gregs[libc::REG_RIP as usize] as usize;
         let rsp = (*uc).uc_mcontext.gregs[libc::REG_RSP as usize] as usize;
-        let new_rsp = rsp - 8;
+        // Skip the System V AMD64 red zone: the 128 bytes BELOW the
+        // interrupted RSP are scratch space that a leaf function may be using
+        // for its locals without adjusting RSP.  Pushing the resume PC at
+        // rsp−8 (and letting the trampoline build its 392-byte register-save
+        // frame below that) overwrites those locals; the leaf function then
+        // resumes with garbage in its red-zone slots — observed as arbitrary
+        // downstream corruption (wild pointers, double-frees) in debug
+        // builds.  Go does not need this because the Go ABI has no red zone.
+        // The trampoline compensates with `ret 128`, restoring the original
+        // RSP exactly.  136 ≡ 8 (mod 16) keeps the trampoline's stack-
+        // alignment math identical to a plain rsp−8 push.
+        let new_rsp = rsp - 128 - 8;
         *(new_rsp as *mut usize) = rip;
         (*uc).uc_mcontext.gregs[libc::REG_RSP as usize] = new_rsp as libc::greg_t;
         (*uc).uc_mcontext.gregs[libc::REG_RIP as usize] =
@@ -1114,7 +1225,10 @@ unsafe fn redirect_to_async_preempt(gp: *mut G, ctx: *mut libc::c_void) {
         let ss  = &mut (*(*uc).uc_mcontext).__ss;
         let rip = ss.__rip as usize;
         let rsp = ss.__rsp as usize;
-        let new_rsp = rsp - 8;
+        // Skip the System V AMD64 red zone — see the Linux x86-64 branch
+        // above for the full rationale.  The trampoline's `ret 128` undoes
+        // the extra displacement.
+        let new_rsp = rsp - 128 - 8;
         *(new_rsp as *mut usize) = rip;
         ss.__rsp = new_rsp as u64;
         ss.__rip = async_preempt_trampoline as *const () as u64;
@@ -1927,6 +2041,37 @@ pub fn set_gomaxprocs(n: usize) -> usize {
 /// for g0 goroutines (one per M).
 static NEXT_GOID: AtomicU64 = AtomicU64::new(1);
 
+/// Free pool of retired G descriptors — the port of Go's `gfree` lists.
+///
+/// G allocations are IMMORTAL: once created, a `G` struct is never returned
+/// to the heap, only recycled through this pool.  This is load-bearing, not
+/// an optimisation: `sysmon`'s `preemptone` dereferences `m.curg` and writes
+/// `preempt` / `stackguard0` through it with no synchronisation against
+/// goroutine exit (mirroring Go).  If the Box were freed, that write would
+/// land in recycled heap memory — observed as corrupted sudogs, channel
+/// elements, and Gobufs in debug-build `many_goroutines` runs.  With the
+/// pool, the worst case is a stray `preempt = true` on a dormant or reused
+/// G, which the SIGURG guards and `G::reinit` handle harmlessly.
+///
+/// Retire a dead G's descriptor.  The descriptor is *leaked on purpose*: G
+/// structs are immortal so that sysmon's `preemptone` can read `m.curg` and
+/// write `gp.preempt`/`gp.stackguard0` without racing goroutine teardown (a
+/// freed descriptor would be a use-after-free; observed as corrupted sudogs,
+/// channel elements, and Gobufs in debug-build `many_goroutines` runs).
+///
+/// The caller must already have freed the G's mmap'd stack and removed it
+/// from `allg` and every queue; only the (small) `G` descriptor leaks.
+///
+/// NOTE: descriptors are not recycled.  Go bounds memory by reusing g structs
+/// off a gFree list, but safe reuse needs a stale-reference-clearing protocol
+/// (a leaked `sudog.g` or a late `gp.param` write must never reach a recycled
+/// descriptor).  Reuse without that protocol corrupted unrelated goroutines
+/// in `ping_pong` after the `many_goroutines` churn; it is a tracked
+/// follow-up.  `gfree_put` therefore simply drops the owning pointer.
+unsafe fn gfree_put(_gp: *mut G) {
+    // Intentionally empty: the descriptor is immortal (leaked).
+}
+
 /// Monotonically-increasing M ID counter.
 static NEXT_MID: AtomicI64 = AtomicI64::new(1);
 
@@ -2054,11 +2199,33 @@ unsafe extern "C" fn goexit_trampoline() -> ! {
 /// - Returning from `goroutine_entry` lands in `goexit_trampoline`.
 /// - `G.sched.ctxt` holds a thin pointer to the heap-allocated closure.
 ///
+/// Returns a raw pointer to a freshly leaked, immortal `Box<G>`.  The pointer
+/// is owned by the scheduler from here on and is retired via [`gfree_put`]
+/// at goroutine exit — never freed (see `gfree_put` for why).
+///
 /// Ported from `newproc1` in `runtime/proc.go`.
-pub(crate) fn new_goroutine(f: impl FnOnce() + Send + 'static) -> Box<G> {
+pub(crate) fn new_goroutine(f: impl FnOnce() + Send + 'static) -> *mut G {
     let stack = unsafe { stack_alloc().expect("new_goroutine: stack_alloc failed") };
     let goid  = NEXT_GOID.fetch_add(1, Relaxed);
-    let mut g  = G::new(stack, goid);
+
+    // Reuse a retired descriptor when available.  m_lock spans the pool
+    // Mutex so SIGURG cannot preempt (and migrate) us while the std
+    // MutexGuard is held — a MutexGuard must unlock on the thread that
+    // locked it.
+    // Every G descriptor is heap-allocated and *immortal*: it is never freed
+    // and never recycled (see `gfree_put`).  Immortality is what makes
+    // sysmon's `preemptone` sound — it reads `m.curg` and writes
+    // `gp.preempt`/`gp.stackguard0` without synchronising against goroutine
+    // exit, so the descriptor must outlive every possible racing access.
+    //
+    // Descriptor *reuse* (an earlier design) is intentionally NOT done here:
+    // recycling an address while a stale reference to its previous tenant is
+    // still live (a leaked `sudog.g`, a waker about to write `gp.param`)
+    // corrupts the new tenant.  Under no-reuse those stale writes land on a
+    // dead, never-rescheduled descriptor and are harmless.  Safe reuse (to
+    // bound memory the way Go's gFree list does) is a tracked follow-up.
+    let gp: *mut G = Box::into_raw(G::new(stack, goid));
+    let g: &mut G = unsafe { &mut *gp };
 
     // Heap-allocate the closure behind a thin pointer and store it in ctxt.
     let go_fn   = Box::new(GoFn(Box::new(f)));
@@ -2087,7 +2254,7 @@ pub(crate) fn new_goroutine(f: impl FnOnce() + Send + 'static) -> Box<G> {
     }
 
     g.atomicstatus.store(GRUNNABLE, Release);
-    g
+    gp
 }
 
 // ---------------------------------------------------------------------------
@@ -2111,7 +2278,7 @@ pub(crate) fn spawn_goroutine(f: impl FnOnce() + Send + 'static) {
         !current_rt_ptr().is_null(),
         "spawn_goroutine called without an active Rt; call run_impl first"
     );
-    let g_ptr = Box::into_raw(new_goroutine(f));
+    let g_ptr = new_goroutine(f);
     // Tag the new G with its invocation: inherit from the spawning
     // goroutine, or — when spawned from the run_impl calling thread (the
     // wrapper goroutine) — from the thread-local set by run_impl.
@@ -2570,13 +2737,15 @@ where
             for &gp in &drained {
                 let stack = unsafe { (*gp).stack };
                 unsafe { super::stack::stack_free(&stack) };
-                unsafe { drop(Box::from_raw(gp)) };
+                // Free the mmap'd stack but leak the descriptor — G structs are
+                // immortal so sysmon can't UAF them.  See `gfree_put`.
+                unsafe { gfree_put(gp) };
             }
             for &gp_addr in &graveyard {
                 let gp = gp_addr as *mut G;
                 let stack = unsafe { (*gp).stack };
                 unsafe { super::stack::stack_free(&stack) };
-                unsafe { drop(Box::from_raw(gp)) };
+                unsafe { gfree_put(gp) };
             }
             // No allg cleanup needed here: drained Gs were removed during
             // the claim pass above, and graveyard Gs were removed by the
@@ -2648,8 +2817,7 @@ mod tests {
         use crate::runtime::g::GRUNNABLE;
         use std::sync::atomic::Ordering::Relaxed;
 
-        let g     = new_goroutine(|| {});
-        let g_ptr = Box::into_raw(g);
+        let g_ptr = new_goroutine(|| {});
 
         unsafe {
             assert_eq!(
@@ -2674,9 +2842,9 @@ mod tests {
                 assert_eq!((*g_ptr).sched.lr, goexit_trampoline as *const () as usize);
             }
 
-            // Drop the G — the closure and stack will be leaked here since G has
-            // no Drop impl, but this is acceptable in a unit test.
-            let _ = Box::from_raw(g_ptr);
+            // Retire the descriptor (immortal — leaked, never freed); the
+            // closure and stack leak too, which is acceptable in a unit test.
+            gfree_put(g_ptr);
         }
     }
 
