@@ -49,6 +49,14 @@ use super::asm_arm64::mcall;
 ///
 /// Ported from `gopark` in `runtime/proc.go`.
 pub(crate) fn gopark(reason: WaitReason) {
+    // Block SIGURG across the `current_g()` read and the `mcall` save so async
+    // preemption cannot split the thread-local read and migrate this goroutine
+    // mid-park (which would make `mcall` save into the wrong goroutine's gobuf
+    // — the cross-stack corruption fixed in `async_preempt2`).  Unlike
+    // `gopark_commit`, plain `gopark` arrives WITHOUT `m.locks` elevated, so it
+    // has no Guard-0 protection of its own.  `park_fn` unblocks on g0.
+    #[cfg(not(windows))]
+    unsafe { super::m::block_sigurg() };
     let gp = current_g();
     debug_assert!(!gp.is_null(), "gopark: called from g0 or bare OS thread");
     // SAFETY: gp is non-null (asserted above) and points to the current goroutine.
@@ -106,6 +114,11 @@ pub(crate) unsafe fn gopark_commit(
 ///
 /// Sets G status to `Gwaiting`, unlinks G from the M, and enters `schedule`.
 unsafe extern "C" fn park_fn(gp: *mut G) {
+    // Balance plain `gopark`'s block_sigurg() (a no-op for the `gopark_commit`
+    // path, which keeps SIGURG mask-unblocked and relies on `m.locks` instead).
+    // The gobuf save is complete and we are on g0, so preemption is safe again.
+    #[cfg(not(windows))]
+    unsafe { super::m::unblock_sigurg() };
     let m = current_m();
 
     // Snapshot the gopark_commit unlock handoff FIRST: once the G is
