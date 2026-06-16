@@ -67,7 +67,22 @@ thread_local! {
 }
 
 /// Return the M for the current OS thread, or null before initialisation.
-#[inline]
+///
+/// ## Why `#[inline(never)]` is load-bearing (async-preemption safety)
+///
+/// Reading the thread-local `CURRENT_M` is a two-step operation: obtain the
+/// slot address (on macOS via a `tlv_get_addr` call), then load the value.
+/// If async preemption (`SIGURG`) lands between those two steps and migrates
+/// the goroutine to a different OS thread, the cached slot address still
+/// refers to the *original* thread's TLS block, so the load returns the old
+/// M.  Callers that immediately bump `m.locks` (`m_lock`, `goexit0_handler`)
+/// would then apply the increment to the wrong M (see `m_lock`'s doc-comment).
+///
+/// Keeping `current_m` out-of-line gives it a stable PC range that
+/// `pc_in_scheduler_asm` (sigurg_handler Guard 3) lists, so the SIGURG handler
+/// skips preemption for the whole read — exactly as Go's `isAsyncSafePoint`
+/// never preempts runtime code.  Mirrors `current_g`'s `#[inline(never)]`.
+#[inline(never)]
 pub(crate) fn current_m() -> *mut M {
     CURRENT_M.with(|c| c.get())
 }
@@ -428,6 +443,39 @@ impl Drop for M {
 /// }
 /// ```
 ///
+/// Block `SIGURG` delivery on the current OS thread.
+///
+/// Used to make a `current_g()` / `current_m()` thread-local read plus its
+/// dependent action (an `m.locks` bump, or `mcall`'s gobuf save) atomic with
+/// respect to async preemption: while `SIGURG` is blocked the goroutine cannot
+/// be redirected to `preemptm` and therefore cannot migrate to another M, so
+/// the TLS read cannot be split across a migration (which would return the
+/// wrong M / goroutine — see `m_lock` and `async_preempt2`).  A `SIGURG` that
+/// arrives while blocked is held pending and delivered on unblock.
+#[cfg(not(windows))]
+#[inline]
+pub(crate) unsafe fn block_sigurg() {
+    let mut s: libc::sigset_t = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::sigemptyset(&mut s);
+        libc::sigaddset(&mut s, libc::SIGURG);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &s, std::ptr::null_mut());
+    }
+}
+
+/// Unblock `SIGURG` delivery on the current OS thread — the inverse of
+/// [`block_sigurg`].  Safe to call when `SIGURG` is already unblocked.
+#[cfg(not(windows))]
+#[inline]
+pub(crate) unsafe fn unblock_sigurg() {
+    let mut s: libc::sigset_t = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::sigemptyset(&mut s);
+        libc::sigaddset(&mut s, libc::SIGURG);
+        libc::pthread_sigmask(libc::SIG_UNBLOCK, &s, std::ptr::null_mut());
+    }
+}
+
 /// The guard is dropped at the end of the scope, restoring preemptability.
 pub(crate) struct MLockGuard {
     m: *mut M,
@@ -458,13 +506,63 @@ impl Drop for MLockGuard {
 ///
 /// # Safety
 /// Safe to call from any thread.  The returned guard is not `Send`.
-#[inline]
+///
+/// ## Async-preemption safety — the `m.locks` 0→1 transition (residual #4)
+///
+/// `(*m).locks += 1` is a non-atomic read-modify-write that is NOT yet
+/// protected by its own counter: it reads `current_m()` into `m`, then stores
+/// `m.locks + 1`.  While `m.locks` is still 0, `sigurg_handler`'s Guard 0
+/// (`m.locks > 0`) does not suppress async preemption.  If `SIGURG` lands
+/// anywhere between reading `m` and the store, `preemptm` can reschedule this
+/// goroutine onto a *different* M before the store executes; on resume the
+/// cached `m` value still names the *old* M, so the increment lands there.
+/// The critical section then runs on the new M with `locks == 0` (Guard 0
+/// fails to suppress preemption → the lock's invariant is violated and the
+/// scheduler state it protects is corrupted), while the old M's counter is
+/// mutated cross-thread (it is documented single-writer).  This was the
+/// residual intermittent `many_goroutines` debug-build corruption — confirmed
+/// by a migration detector that fired exactly here.
+///
+/// PC-based skipping (the technique Go uses via pcdata, and this port uses for
+/// its asm trampolines in `pc_in_scheduler_asm`) cannot close this window on
+/// stable Rust: the `thread_local!` read dispatches through libstd's
+/// `LocalKey` glue, whose PC lies in our own text but outside any bounded
+/// range we can name.  Instead we block `SIGURG` at the kernel level for the
+/// duration of the bump, which needs no thread-local read to take effect and
+/// has no race of its own.  A `SIGURG` that arrives while blocked is held
+/// pending and delivered on unblock, by which point `locks > 0` and Guard 0
+/// makes the handler skip — so no preemption is lost, merely deferred.
+/// `#[inline(never)]` keeps the body (and the matching restore) in one place.
+#[inline(never)]
 pub(crate) fn m_lock() -> MLockGuard {
+    // Block SIGURG so async preemption cannot fire — and thus cannot migrate
+    // this goroutine to another M — between the `current_m()` read and the
+    // `m.locks += 1` store below.  See the doc-comment above.
+    #[cfg(not(windows))]
+    let oldset = unsafe {
+        let mut block: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut block);
+        libc::sigaddset(&mut block, libc::SIGURG);
+        let mut old: libc::sigset_t = std::mem::zeroed();
+        libc::pthread_sigmask(libc::SIG_BLOCK, &block, &mut old);
+        old
+    };
+
     let m = current_m();
     if !m.is_null() {
         // SAFETY: `m` belongs to the current OS thread; no other thread reads
-        // or writes the `locks` field.  See the field's doc-comment.
+        // or writes the `locks` field.  See the field's doc-comment.  SIGURG
+        // is blocked here, so the goroutine cannot migrate between the read of
+        // `m` and this store.
         unsafe { (*m).locks += 1 };
+    }
+
+    // Restore the previous signal mask.  `locks` is now > 0 (if we had an M),
+    // so Guard 0 suppresses preemption for the rest of the critical section;
+    // any SIGURG that was held pending fires here and is skipped.
+    #[cfg(not(windows))]
+    unsafe {
+        libc::pthread_sigmask(libc::SIG_SETMASK, &oldset, std::ptr::null_mut());
     }
     MLockGuard { m, _not_send: std::marker::PhantomData }
 }

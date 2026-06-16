@@ -672,6 +672,13 @@ pub(crate) unsafe fn execute(gp: *mut G) -> ! {
 ///
 /// Ported from `goexit0` in `runtime/proc.go`.
 pub(crate) unsafe extern "C" fn goexit0(gp: *mut G) {
+    // Balance the block_sigurg() taken by goexit_trampoline / goexit0_handler:
+    // the goroutine's gobuf save is complete and we are on g0, so SIGURG may be
+    // delivered to this M again.  (The matching `m.locks -= 1` below balances
+    // the raw counter bump.)
+    #[cfg(not(windows))]
+    unsafe { super::m::unblock_sigurg() };
+
     let m = current_m();
 
     // Snapshot stack bounds while we still own the G (GRUNNING).  After the
@@ -734,6 +741,14 @@ pub(crate) unsafe extern "C" fn goexit0(gp: *mut G) {
 ///
 /// Ported from `Gosched` / `gosched_m` in `runtime/proc.go`.
 pub(crate) unsafe fn gosched() {
+    // Block SIGURG across the `current_g()` read and the `mcall` save.  In a
+    // CPU-bound loop (the canonical `gosched` caller) async preemption is
+    // already imminent; if SIGURG split the thread-local read here and migrated
+    // the goroutine, `mcall` would save this stack into the wrong goroutine's
+    // gobuf (the same cross-stack corruption fixed in `async_preempt2`).
+    // `gosched_m` unblocks once the save has completed on g0.
+    #[cfg(not(windows))]
+    unsafe { super::m::block_sigurg() };
     let gp = current_g();
     debug_assert!(!gp.is_null(), "gosched: called from g0 or uninitialised thread");
     unsafe { mcall(gp, gosched_m) };
@@ -741,6 +756,9 @@ pub(crate) unsafe fn gosched() {
 
 /// Mcall target for `gosched`.  Runs on g0's stack.
 unsafe extern "C" fn gosched_m(gp: *mut G) {
+    // Balance `gosched`'s block_sigurg(): the gobuf save is done (we are on g0).
+    #[cfg(not(windows))]
+    unsafe { super::m::unblock_sigurg() };
     let m = current_m();
 
     unsafe {
@@ -956,7 +974,7 @@ fn pc_in_scheduler_asm(pc: usize) -> bool {
     }
 
     #[cfg(target_arch = "x86_64")]
-    let bases: [usize; 7] = [
+    let bases: [usize; 11] = [
         super::asm_amd64::async_preempt_trampoline as *const () as usize,
         super::asm_amd64::gogo                     as *const () as usize,
         super::asm_amd64::mcall                    as *const () as usize,
@@ -968,9 +986,25 @@ fn pc_in_scheduler_asm(pc: usize) -> bool {
         // both the naked trampoline and the handler with Guard 3.
         goexit_trampoline                          as *const () as usize,
         goexit0_handler                            as *const () as usize,
+        // m_lock's 0→1 `m.locks` bump is not yet visible to Guard 0 until the
+        // store lands; SIGURG in that window could migrate the goroutine to a
+        // different M and apply the increment to the wrong M.  Keep the whole
+        // bump un-preemptable.  (m_lock is #[inline(never)] so this address
+        // covers every caller's acquire.)  See m_lock's doc-comment.
+        super::m::m_lock                           as *const () as usize,
+        // current_m reads the CURRENT_M TLS slot; a migration between the
+        // slot-address fetch and the load returns the wrong M, poisoning the
+        // m.locks bump.  Cover its whole body.  See current_m's doc-comment.
+        super::m::current_m                        as *const () as usize,
+        // async_preempt2's prologue (before it blocks SIGURG) must not itself
+        // be nested-preempted, or the goroutine could migrate before the block
+        // takes effect.  See async_preempt2's doc-comment.
+        async_preempt2                             as *const () as usize,
+        // goroutine_entry prologue, before it blocks SIGURG — same rationale.
+        goroutine_entry                            as *const () as usize,
     ];
     #[cfg(target_arch = "aarch64")]
-    let bases: [usize; 6] = [
+    let bases: [usize; 10] = [
         super::asm_arm64::async_preempt_trampoline as *const () as usize,
         super::asm_arm64::gogo                     as *const () as usize,
         super::asm_arm64::mcall                    as *const () as usize,
@@ -984,6 +1018,16 @@ fn pc_in_scheduler_asm(pc: usize) -> bool {
         // Same pre-lock window as AMD64: goexit_trampoline bumps m.locks but
         // the TLS accessor runs before the increment lands.
         goexit_trampoline                          as *const () as usize,
+        // m_lock's 0→1 `m.locks` bump must be un-preemptable (else SIGURG can
+        // migrate the goroutine mid-bump and apply it to the wrong M).  See
+        // m_lock's doc-comment.
+        super::m::m_lock                           as *const () as usize,
+        // current_m's TLS read window — see x86-64 list and current_m's doc.
+        super::m::current_m                        as *const () as usize,
+        // async_preempt2 prologue — see x86-64 list and async_preempt2's doc.
+        async_preempt2                             as *const () as usize,
+        // goroutine_entry prologue — see x86-64 list.
+        goroutine_entry                            as *const () as usize,
     ];
 
     for b in bases {
@@ -1260,8 +1304,25 @@ unsafe fn redirect_to_async_preempt(gp: *mut G, ctx: *mut libc::c_void) {
 /// Ported from `asyncPreempt2` in `runtime/preempt.go`.
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn async_preempt2() {
+    // Block SIGURG for the whole body.  This trampoline-invoked function runs
+    // with SIGURG unblocked (the signal mask was restored on sigreturn), so a
+    // *nested* SIGURG could otherwise fire while we read `current_g()` below
+    // and migrate this goroutine to a different M mid-read.  The thread-local
+    // read dispatches through libstd's `LocalKey` glue, so a migration there
+    // returns the goroutine that the *old* M scheduled next — and `mcall`
+    // would then save THIS stack's registers into THAT goroutine's gobuf,
+    // leaving its `sched.sp`/`bp` pointing into a different goroutine's stack
+    // (the residual cross-stack `many_goroutines` corruption, pinpointed via a
+    // write-side check in `preemptm`).  Go likewise never async-preempts the
+    // async-preempt machinery.  `preemptm` unblocks once the save is done on
+    // g0; the bail paths below unblock before returning to the trampoline.
+    #[cfg(not(windows))]
+    unsafe { super::m::block_sigurg() };
+
     let gp = current_g();
     if gp.is_null() {
+        #[cfg(not(windows))]
+        unsafe { super::m::unblock_sigurg() };
         return;
     }
 
@@ -1272,6 +1333,8 @@ pub(crate) unsafe extern "C" fn async_preempt2() {
     // from calling casgstatus(gp, GRUNNING, GPREEMPTED) on a non-GRUNNING G
     // which would spin forever in the CAS retry loop.
     if unsafe { readgstatus(gp) } != GRUNNING {
+        #[cfg(not(windows))]
+        unsafe { super::m::unblock_sigurg() };
         return;
     }
 
@@ -1281,8 +1344,10 @@ pub(crate) unsafe extern "C" fn async_preempt2() {
         (*gp).stackguard0 = (*gp).stack.lo + STACK_GUARD;
     }
 
-    // mcall saves this goroutine's state, switches to g0, and calls preemptm.
-    // When the goroutine is rescheduled via gogo, mcall returns here.
+    // mcall saves this goroutine's state, switches to g0, and calls preemptm
+    // (which unblocks SIGURG once the save has completed on g0).  When the
+    // goroutine is rescheduled via gogo, mcall returns here — on whatever M
+    // resumes it, whose signal mask already has SIGURG unblocked.
     unsafe { mcall(gp, preemptm) };
 }
 
@@ -1297,6 +1362,13 @@ pub(crate) unsafe extern "C" fn async_preempt2() {
 /// a future GC scanner observe that the goroutine was stopped at an async-safe
 /// point and scan its stack before it becomes runnable again.
 unsafe extern "C" fn preemptm(gp: *mut G) {
+    // Balance `async_preempt2`'s `block_sigurg()`: the goroutine's gobuf has
+    // now been saved on g0 (no longer on the goroutine's own stack), so it is
+    // safe to let SIGURG preempt this M again.  Done first so the rest of the
+    // scheduler (schedule/findrunnable) runs preemptable as usual.
+    #[cfg(not(windows))]
+    unsafe { super::m::unblock_sigurg() };
+
     let m = current_m();
     unsafe {
         casgstatus(gp, GRUNNING, GPREEMPTED);
@@ -2090,12 +2162,28 @@ static SIGNALS_INSTALLED: AtomicBool = AtomicBool::new(false);
 /// Ported from `runtime·goexit` + Go's goroutine creation mechanism in
 /// `runtime/proc.go` and `runtime/asm_{amd64,arm64}.s`.
 unsafe extern "C" fn goroutine_entry() {
+    // Block SIGURG across the `current_g()` read and the closure-pointer fetch.
+    // `gogo` set `current_g` to this fresh goroutine just before jumping here,
+    // but if async preemption splits the thread-local read below and migrates
+    // the goroutine, `current_g()` returns the goroutine the old M scheduled
+    // next — whose `sched.ctxt` we would then consume (it is null after that
+    // goroutine's own entry → `Box::from_raw(null)` aborts; observed as
+    // "goroutine_entry: NULL ctxt").  We unblock before running the user
+    // closure so the closure body remains preemptable.  (goroutine_entry is
+    // also in `pc_in_scheduler_asm`, covering the prologue before this block.)
+    #[cfg(not(windows))]
+    unsafe { super::m::block_sigurg() };
     let gp = current_g();
     let go_fn = unsafe {
         let fn_ptr = (*gp).sched.ctxt as *mut GoFn;
         (*gp).sched.ctxt = ptr::null_mut();
         Box::from_raw(fn_ptr)
     };
+
+    // The closure pointer is now safely in hand; allow preemption again before
+    // running (potentially long-lived) user code.
+    #[cfg(not(windows))]
+    unsafe { super::m::unblock_sigurg() };
 
     // Catch panics so they don't abort the process.  The closure may capture
     // non-UnwindSafe types (raw pointers, RefCell, …) so we assert that it is
@@ -2164,6 +2252,15 @@ unsafe extern "C" fn goexit_trampoline() -> ! {
 /// aborting the process with "thread caused non-unwinding panic. aborting."
 #[cfg(target_arch = "x86_64")]
 unsafe extern "C" fn goexit0_handler() -> ! {
+    // Block SIGURG across the locks bump, the `current_g()` read and the mcall
+    // save.  Both thread-local reads here are otherwise split-prone: a SIGURG
+    // that migrated this goroutine mid-read would land the `locks` bump on the
+    // wrong M and/or make `mcall` save into the wrong goroutine's gobuf (the
+    // cross-stack corruption fixed in `async_preempt2`).  `goexit0` unblocks on
+    // g0.  (goexit0_handler is also in `pc_in_scheduler_asm`, covering the
+    // prologue before this block takes effect.)
+    #[cfg(not(windows))]
+    unsafe { super::m::block_sigurg() };
     // Raw `locks += 1` (not an MLockGuard): mcall never returns here, so a
     // guard's Drop would never run and the count would stay elevated for the
     // rest of the M's life, permanently disabling async preemption on this M.
@@ -2182,6 +2279,10 @@ unsafe extern "C" fn goexit0_handler() -> ! {
 // function works with no naked-asm tricks.
 #[cfg(target_arch = "aarch64")]
 unsafe extern "C" fn goexit_trampoline() -> ! {
+    // Block SIGURG across the bump + current_g() read + mcall save — see the
+    // x86-64 goexit0_handler for the rationale.  goexit0 unblocks on g0.
+    #[cfg(not(windows))]
+    unsafe { super::m::block_sigurg() };
     // Raw `locks += 1` for the entire goexit path; goexit0 decrements once
     // the G is dead — see goexit0_handler's doc comment for the full
     // explanation of why an RAII guard must not be used here.
