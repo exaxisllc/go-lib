@@ -180,6 +180,24 @@ pub(crate) fn current_rt_ptr() -> *const Rt {
     CURRENT_RT.with(|c| c.get())
 }
 
+/// Return the `P` attached to the current OS thread's M, or null when there
+/// is no M (bare threads: the `run_impl` caller, sysmon, the timer thread) or
+/// the M currently holds no P.
+///
+/// Used only to pick *which* per-P cache (sudog free list) to use; the result
+/// need not be "our" P for correctness, since each P's cache carries its own
+/// lock and Ps live for the whole process (never freed), so any non-null
+/// pointer this returns is valid to dereference.
+#[inline]
+pub(crate) fn current_p() -> *mut P {
+    let m = super::m::current_m();
+    if m.is_null() {
+        ptr::null_mut()
+    } else {
+        unsafe { (*m).p }
+    }
+}
+
 /// Bind `rt` as the `Rt` for the current OS thread.
 #[inline]
 pub(crate) fn set_current_rt(rt: *const Rt) {
