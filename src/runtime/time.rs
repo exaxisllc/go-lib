@@ -1,21 +1,34 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Timer heap — ported from `runtime/time.go`.
 //!
-//! ## Design (v1 simplified)
+//! ## Design — sharded min-heaps
 //!
-//! Go's runtime uses per-P 4-ary min-heaps for timers; that requires changes
-//! to the P struct and deep scheduler integration.  v1 uses a single global
-//! min-heap behind a `Mutex`.  The per-P tier can be layered on later without
-//! changing the public `sleep` API.
+//! Go's runtime uses per-P 4-ary min-heaps for timers.  We approximate that
+//! with a fixed array of [`TIMER_SHARDS`] independent min-heaps, each behind
+//! its own `Mutex` and fronted by an `AtomicU64` caching that shard's
+//! earliest deadline.  A goroutine's `sleep` inserts into the shard selected
+//! by its current `P`'s id, so sleepers on different Ps do not contend on a
+//! single lock; the old single global heap serialised every `sleep` and the
+//! timer thread on one mutex.
+//!
+//! A fixed shard array (rather than a literally per-P heap) sidesteps the
+//! `allp`-can-grow / `GOMAXPROCS`-resize problem: the timer thread iterates a
+//! compile-time-constant set of shards with no dependency on the scheduler's
+//! P list, reading each shard's `earliest` atomic locklessly to skip empty or
+//! not-yet-due shards without taking its lock.  Shard choice never affects
+//! correctness — every entry is found by a full all-shard scan — so a
+//! goroutine migrating between selecting a shard and locking it is harmless,
+//! requiring no preemption pin.
 //!
 //! ## Execution model
 //!
 //! A dedicated OS timer thread (`timer_thread`) sleeps with
-//! `thread::park_timeout` until the earliest timer fires.  It then:
-//! 1. Pops all timers whose `when ≤ now` from the heap.
+//! `thread::park_timeout` until the earliest deadline across all shards.  It
+//! then, for each shard whose `earliest ≤ now`:
+//! 1. Pops all timers whose `when ≤ now` from that shard's heap.
 //! 2. Calls `goready` on each parked G.
 //!
-//! When `sleep` adds a timer that is earlier than the current next wakeup, it
+//! When `sleep` adds a timer earlier than its shard's previous earliest, it
 //! calls `thread::unpark` on the timer thread to shorten its sleep.
 //!
 //! ## Relationship with sysmon
@@ -26,6 +39,7 @@
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -66,7 +80,7 @@ struct TimerEntry {
     inv: usize,
 }
 
-// SAFETY: TimerEntry is only touched under TIMER_HEAP's Mutex.
+// SAFETY: a TimerEntry is only touched under its shard's Mutex.
 unsafe impl Send for TimerEntry {}
 
 /// Order by `when` ascending (smallest `when` fires first).
@@ -83,11 +97,63 @@ impl Ord for TimerEntry {
 }
 
 // ---------------------------------------------------------------------------
-// Global timer heap + thread handle
+// Sharded timer heaps + thread handle
 // ---------------------------------------------------------------------------
 
-static TIMER_HEAP:   Mutex<BinaryHeap<TimerEntry>> = Mutex::new(BinaryHeap::new());
-static TIMER_THREAD: OnceLock<std::thread::Thread>  = OnceLock::new();
+/// Number of independent timer heaps.  Power of two so shard selection is a
+/// mask.  Sized to comfortably cover typical `GOMAXPROCS`, so each P usually
+/// maps to its own shard (`p.id & (TIMER_SHARDS-1)`); above this Ps share.
+const TIMER_SHARDS: usize = 64;
+
+/// Sentinel `earliest` for an empty shard.
+const NO_TIMER: u64 = u64::MAX;
+
+/// One timer heap shard: a min-heap plus a lockless cache of its earliest
+/// deadline so the timer thread (and the drain/remove sweeps) can skip it
+/// without taking the lock.
+struct TimerShard {
+    heap:     Mutex<BinaryHeap<TimerEntry>>,
+    /// Earliest `when` currently in `heap`, or [`NO_TIMER`] when empty.
+    /// Written only while holding `heap`'s lock (so a non-`NO_TIMER` value
+    /// always means the heap is non-empty); read locklessly as a hint.
+    earliest: AtomicU64,
+}
+
+impl TimerShard {
+    const fn new() -> Self {
+        TimerShard {
+            heap:     Mutex::new(BinaryHeap::new()),
+            earliest: AtomicU64::new(NO_TIMER),
+        }
+    }
+}
+
+/// Refresh `shard.earliest` from the heap top.  Caller holds `heap`'s lock.
+#[inline]
+fn refresh_earliest(shard: &TimerShard, heap: &BinaryHeap<TimerEntry>) {
+    let e = heap.peek().map(|e| e.when).unwrap_or(NO_TIMER);
+    shard.earliest.store(e, Relaxed);
+}
+
+static TIMER_SHARDS_ARR: [TimerShard; TIMER_SHARDS] =
+    [const { TimerShard::new() }; TIMER_SHARDS];
+
+static TIMER_THREAD: OnceLock<std::thread::Thread> = OnceLock::new();
+
+/// Pick the timer shard for the current goroutine: its `P`'s id masked into
+/// the shard range, or shard 0 when there is no current P (the run_impl
+/// caller and other bare threads — which in practice never call `sleep`,
+/// since `sleep` requires a running goroutine).
+#[inline]
+fn current_shard() -> &'static TimerShard {
+    let p = super::sched::current_p();
+    let idx = if p.is_null() {
+        0
+    } else {
+        (unsafe { (*p).id } as usize) & (TIMER_SHARDS - 1)
+    };
+    &TIMER_SHARDS_ARR[idx]
+}
 
 // ---------------------------------------------------------------------------
 // Timer thread
@@ -125,17 +191,29 @@ pub(crate) fn start_timer_thread() {
 /// thread across the lifetime of the process and is shared between
 /// `run_impl` invocations.
 pub(crate) fn drain_timer_heap_for_shutdown(my_inv: usize) {
-    let mut heap = TIMER_HEAP.lock().unwrap();
-    // Retain only entries that belong to other (still-live) invocations.
-    let retained: BinaryHeap<TimerEntry> =
-        std::mem::take(&mut *heap)
-            .into_iter()
-            .filter(|e| e.inv != my_inv)
-            .collect();
-    *heap = retained;
+    for shard in &TIMER_SHARDS_ARR {
+        // Lockless skip: an empty shard (earliest == NO_TIMER) holds no
+        // entries for any invocation.  A non-empty shard always has
+        // earliest < NO_TIMER (set under the lock on every push), so this
+        // never skips a shard that has work.
+        if shard.earliest.load(Relaxed) == NO_TIMER {
+            continue;
+        }
+        let mut heap = shard.heap.lock().unwrap();
+        if heap.iter().any(|e| e.inv == my_inv) {
+            // Retain only entries that belong to other (still-live) invocations.
+            let retained: BinaryHeap<TimerEntry> =
+                std::mem::take(&mut *heap)
+                    .into_iter()
+                    .filter(|e| e.inv != my_inv)
+                    .collect();
+            *heap = retained;
+            refresh_earliest(shard, &heap);
+        }
+    }
     // The thread may currently be sleeping with a stale deadline; that is
     // fine — when it wakes (no later than 1 s; see `timer_thread_body`) it
-    // re-evaluates the heap.
+    // re-evaluates the heaps.
 }
 
 /// Remove every heap entry whose goroutine is `gp`.
@@ -147,20 +225,30 @@ pub(crate) fn drain_timer_heap_for_shutdown(my_inv: usize) {
 /// retires it — that entry would otherwise outlive the G and make
 /// `fire_expired` dereference freed memory.
 ///
-/// Serialisation: `fire_expired` holds the heap lock across its entire
-/// pop→wake batch, so by the time this function acquires the lock no
-/// in-flight popped entry for `gp` can exist either — any concurrent fire
-/// observed the G's status (GDEAD by the time the reaper calls us) and
-/// dropped the entry without dereferencing further.
+/// Serialisation: `fire_expired` holds a shard's lock across its entire
+/// pop→wake batch for that shard, so by the time this function acquires the
+/// same lock no in-flight popped entry for `gp` can exist either — any
+/// concurrent fire observed the G's status (GDEAD by the time the reaper
+/// calls us) and dropped the entry without dereferencing further.
+///
+/// `gp` is already `GDEAD` here, so it cannot itself call `sleep` and add a
+/// new entry concurrently; an empty shard therefore truly holds none of its
+/// entries and is safe to skip locklessly.
 pub(crate) fn remove_timer_entries_for(gp: *mut G) {
-    let mut heap = TIMER_HEAP.lock().unwrap();
-    if heap.iter().any(|e| e.gp == gp) {
-        let retained: BinaryHeap<TimerEntry> =
-            std::mem::take(&mut *heap)
-                .into_iter()
-                .filter(|e| e.gp != gp)
-                .collect();
-        *heap = retained;
+    for shard in &TIMER_SHARDS_ARR {
+        if shard.earliest.load(Relaxed) == NO_TIMER {
+            continue;
+        }
+        let mut heap = shard.heap.lock().unwrap();
+        if heap.iter().any(|e| e.gp == gp) {
+            let retained: BinaryHeap<TimerEntry> =
+                std::mem::take(&mut *heap)
+                    .into_iter()
+                    .filter(|e| e.gp != gp)
+                    .collect();
+            *heap = retained;
+            refresh_earliest(shard, &heap);
+        }
     }
 }
 
@@ -172,18 +260,21 @@ fn timer_thread_body() {
     let _ = TIMER_THREAD.set(handle);
 
     loop {
-        // Compute how long to sleep until the next expiry.
-        let sleep_dur = {
-            let heap = TIMER_HEAP.lock().unwrap();
-            if let Some(entry) = heap.peek() {
-                let now = mono_ns();
-                if entry.when <= now {
-                    Duration::ZERO
-                } else {
-                    Duration::from_nanos(entry.when - now)
-                }
+        // Compute how long to sleep until the earliest deadline across all
+        // shards, reading the per-shard `earliest` caches locklessly.
+        let next = TIMER_SHARDS_ARR
+            .iter()
+            .map(|s| s.earliest.load(Relaxed))
+            .min()
+            .unwrap_or(NO_TIMER);
+        let sleep_dur = if next == NO_TIMER {
+            Duration::from_secs(1) // idle; wake to re-check
+        } else {
+            let now = mono_ns();
+            if next <= now {
+                Duration::ZERO
             } else {
-                Duration::from_secs(1) // idle; wake to re-check
+                Duration::from_nanos(next - now)
             }
         };
 
@@ -227,59 +318,69 @@ fn fire_expired() {
     }
     set_current_rt(rt);
 
-    // Hold the TIMER_HEAP lock across the ENTIRE pop → status-check →
-    // goready → retry-re-push sequence.  `drain_timer_heap_for_shutdown`
-    // takes the same lock, so a run_impl Phase 2b drain can never run its
-    // heap filter while we are holding popped entries: either the filter
-    // runs first (and removes that Rt's entries before we can pop them),
-    // or it blocks until every entry we popped has been consumed or
-    // re-pushed into the heap (where the filter will see it).
+    let retry_when = now.saturating_add(5_000_000); // +5 ms
+
+    // Process each shard independently.  Skip shards not yet due via the
+    // lockless `earliest` cache; for due shards, hold THAT shard's lock
+    // across the ENTIRE pop → status-check → goready → retry-re-push
+    // sequence.  `drain_timer_heap_for_shutdown` and `remove_timer_entries_for`
+    // take the same per-shard lock, so a run_impl Phase 2b drain can never run
+    // its filter on this shard while we hold popped entries: either the filter
+    // runs first (removing that invocation's entries before we pop them), or it
+    // blocks until every entry we popped has been consumed or re-pushed into
+    // the shard (where the filter will see it).
     //
-    // Without this serialisation an in-flight entry escapes the filter:
-    // the drain frees the sleeping G's Box while we still hold its
+    // Without this per-shard serialisation an in-flight entry escapes the
+    // filter: the drain frees the sleeping G's Box while we still hold its
     // pointer, and our later `readgstatus`/`goready` dereferences freed
     // memory.  If the allocation has been reused for a new G parked on a
-    // channel, the spurious wake resumes it with `(*gp).param == null`
-    // and it crashes with a NULL dereference in chanrecv/selectgo's
-    // resumed path (observed as the intermittent macOS arm64 CI SIGSEGV).
+    // channel, the spurious wake resumes it with `(*gp).param == null` and it
+    // crashes with a NULL dereference in chanrecv/selectgo's resumed path
+    // (the intermittent macOS arm64 CI SIGSEGV the original global-lock design
+    // was hardened against).
     //
-    // Holding the lock across `goready` is safe: goready never touches
-    // TIMER_HEAP, and its GRUNNING→GWAITING spin completes independently
-    // (the parking goroutine does not need this lock to finish gopark).
-    // `sleep` callers pushing new timers simply block for the duration of
-    // this wake batch.
-    let mut heap = TIMER_HEAP.lock().unwrap();
-
-    let mut to_wake: Vec<WakeEntry> = Vec::new();
-    while let Some(entry) = heap.peek() {
-        if entry.when <= now {
-            let entry = heap.pop().unwrap();
-            to_wake.push(WakeEntry { gp: entry.gp, inv: entry.inv });
-        } else {
-            break;
+    // Holding the lock across `goready` is safe: goready never touches a timer
+    // shard, and its GRUNNING→GWAITING spin completes independently (the
+    // parking goroutine does not need this lock to finish gopark).  `sleep`
+    // callers targeting this shard simply block for the duration of its batch.
+    for shard in &TIMER_SHARDS_ARR {
+        if shard.earliest.load(Relaxed) > now {
+            continue; // not due (covers NO_TIMER too)
         }
-    }
 
-    let retry_when = now.saturating_add(5_000_000); // +5 ms
-    for entry in to_wake {
-        // Check the goroutine's status before calling goready.
-        let s = unsafe { readgstatus(entry.gp) };
-        if s == GWAITING {
-            unsafe { goready(entry.gp) };
-        } else if s != GDEAD {
-            // GRUNNABLE/GRUNNING: preempted between timer insertion and its
-            // gopark call.  Re-insert a near-immediate timer rather than
-            // spinning or asserting; the retry delay (5 ms) is larger than
-            // the typical preemption-to-resume latency so the goroutine is
-            // almost certainly GWAITING by the time it fires.  The re-push
-            // happens under the heap lock, so a concurrent shutdown drain's
-            // heap filter is guaranteed to see (and remove) the entry.
-            heap.push(TimerEntry { when: retry_when, gp: entry.gp, inv: entry.inv });
+        let mut heap = shard.heap.lock().unwrap();
+
+        let mut to_wake: Vec<WakeEntry> = Vec::new();
+        while let Some(entry) = heap.peek() {
+            if entry.when <= now {
+                let entry = heap.pop().unwrap();
+                to_wake.push(WakeEntry { gp: entry.gp, inv: entry.inv });
+            } else {
+                break;
+            }
         }
-        // GDEAD: the goroutine was cancelled by a run_impl shutdown drain —
-        // drop the entry, never wake or retry.
-    }
 
+        for entry in to_wake {
+            // Check the goroutine's status before calling goready.
+            let s = unsafe { readgstatus(entry.gp) };
+            if s == GWAITING {
+                unsafe { goready(entry.gp) };
+            } else if s != GDEAD {
+                // GRUNNABLE/GRUNNING: preempted between timer insertion and its
+                // gopark call.  Re-insert a near-immediate timer rather than
+                // spinning or asserting; the retry delay (5 ms) is larger than
+                // the typical preemption-to-resume latency so the goroutine is
+                // almost certainly GWAITING by the time it fires.  The re-push
+                // happens under the shard lock, so a concurrent shutdown drain's
+                // filter is guaranteed to see (and remove) the entry.
+                heap.push(TimerEntry { when: retry_when, gp: entry.gp, inv: entry.inv });
+            }
+            // GDEAD: the goroutine was cancelled by a run_impl shutdown drain —
+            // drop the entry, never wake or retry.
+        }
+
+        refresh_earliest(shard, &heap);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -304,14 +405,22 @@ pub(crate) unsafe fn sleep(d: Duration) {
     let gp   = current_g();
     debug_assert!(!gp.is_null(), "sleep: called from g0");
 
-    // Insert the timer.  If it is the earliest, wake the timer thread so it
-    // re-evaluates its sleep deadline.
+    // Insert into this goroutine's shard.  Unpark the timer thread when this
+    // entry lowers the shard's earliest deadline: the global minimum can only
+    // have decreased if some shard's minimum did, and that shard is this one.
+    // (When `when` is not below the shard's old earliest the global minimum is
+    // unchanged, so no wake is needed; a spurious wake would be harmless
+    // anyway — the thread just re-evaluates.)
     let inv = unsafe { (*gp).inv as usize };
+    let shard = current_shard();
     let need_unpark = {
-        let mut heap = TIMER_HEAP.lock().unwrap();
-        let was_earliest = heap.peek().map(|e| e.when > when).unwrap_or(true);
+        let mut heap = shard.heap.lock().unwrap();
+        let lowered = shard.earliest.load(Relaxed) > when;
         heap.push(TimerEntry { when, gp, inv });
-        was_earliest
+        if lowered {
+            shard.earliest.store(when, Relaxed);
+        }
+        lowered
     };
 
     if need_unpark && let Some(t) = TIMER_THREAD.get() {
@@ -407,6 +516,38 @@ mod tests {
 
             wg.wait();
         });
+    }
+
+    /// Many goroutines sleeping concurrently all wake — exercises timer
+    /// entries spread across multiple shards (more sleepers than there are
+    /// Ps, so shard reuse and cross-shard firing are both covered).
+    #[test]
+    fn many_sleepers_across_shards() {
+        use crate::runtime::sched::spawn_goroutine;
+        use crate::sync::WaitGroup;
+
+        const N: i32 = 200;
+        let awoke = Arc::new(AtomicI32::new(0));
+        let awoke2 = Arc::clone(&awoke);
+
+        run_impl(move || {
+            let wg = Arc::new(WaitGroup::new());
+            for k in 0..N {
+                let awoke3 = Arc::clone(&awoke2);
+                let wg2 = Arc::clone(&wg);
+                wg.add(1);
+                spawn_goroutine(move || {
+                    // Vary the delay so entries interleave within and across
+                    // shards rather than all expiring at once.
+                    unsafe { sleep(Duration::from_millis(5 + (k % 7) as u64)) };
+                    awoke3.fetch_add(1, Ordering::Relaxed);
+                    wg2.done();
+                });
+            }
+            wg.wait();
+        });
+
+        assert_eq!(awoke.load(Ordering::Acquire), N);
     }
 
     /// Multiple goroutines sleeping concurrently all wake.
