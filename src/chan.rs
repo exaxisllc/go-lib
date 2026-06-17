@@ -124,17 +124,24 @@ unsafe impl<T: Send> Sync for Hchan<T> {}
 /// * `channel` must point at a `Hchan<T>` whose channel mutex is held by the
 ///   caller (the Phase 2b drainer locks it via `Sudog.c as *const RawMutex`).
 /// * `sudog` must be a `*mut Sudog` originally enqueued in this channel.
+/// Returns `true` if `sudog` was actually removed from one of this channel's
+/// wait queues (i.e. it was still enqueued).  The Phase 2b drain uses this to
+/// decide payload-box ownership: only the party that removes the sudog from
+/// the queue owns — and frees — its `elem` box.  A `false` return means a live
+/// peer already dequeued (and now owns) the sudog, so the drain must not touch
+/// its box.
 pub(crate) unsafe extern "C" fn unlink_sudog_for_drain<T: Send + 'static>(
     channel: *mut u8,
     sudog:   *mut crate::runtime::sudog::Sudog,
-) {
+) -> bool {
     let hchan = channel as *const Hchan<T>;
     // SAFETY: caller holds the channel lock; we read state behind the
     // UnsafeCell, mutating the waitqs.
     let state = unsafe { &mut *(*hchan).state.get() };
     // `dequeue_sudog` is idempotent — no-op if the sudog isn't in the queue.
-    unsafe { state.sendq.dequeue_sudog(sudog) };
-    unsafe { state.recvq.dequeue_sudog(sudog) };
+    let removed_send = unsafe { state.sendq.dequeue_sudog(sudog) };
+    let removed_recv = unsafe { state.recvq.dequeue_sudog(sudog) };
+    removed_send || removed_recv
 }
 
 /// Phase 2b drain helper: drop the payload allocated by `chansend`'s blocking
@@ -303,10 +310,15 @@ pub(crate) unsafe fn chansend<T: Send + 'static>(
     // ── Case 1: direct handoff to a waiting receiver ─────────────────────────
     let recv_sg = unsafe { state.recvq.dequeue() };
     if !recv_sg.is_null() {
-        // RCU read-side: covers the dereferences of the receiver G below.
-        // Pairs with the run_impl Phase 2b drainer's `DrainSync` so that a
-        // concurrent drain cannot free this `gp` while we are using it.
-        let _cs = crate::runtime::rcu::RcuGuard::new();
+        // We hold the channel lock across the dequeue, the `*elem_ptr` write
+        // (which, for a select receiver, lands in that goroutine's `selectgo`
+        // stack frame), and `goready`.  That lock is the synchronisation point
+        // against a concurrent Phase 2b drain: `unregister_drained_g` unlinks
+        // this sudog under the *same* channel lock before any `stack_free`, so
+        // the drain can never munmap the receiver's stack while we are writing
+        // into it (see the happens-before proof on `unregister_drained_g`).
+        // The G descriptor itself is immortal (`gfree_put` leaks it), so the
+        // `(*gp)` dereferences below are always safe.
         let gp       = unsafe { (*recv_sg).g };
         // recv_sg.elem points to Option<T> (allocated by chanrecv or selectgo).
         let elem_ptr = unsafe { (*recv_sg).elem as *mut Option<T> };
@@ -565,10 +577,13 @@ fn recv_from_sender<T: Send + 'static>(
     state:   &mut HchanState<T>,
     send_sg: *mut Sudog,
 ) -> T {
-    // RCU read-side: covers the dereferences of the sender G below.  Pairs
-    // with the run_impl Phase 2b drainer's `DrainSync` so the drain cannot
-    // free `gp` while we are using it.
-    let _cs = crate::runtime::rcu::RcuGuard::new();
+    // The caller holds the channel lock across the dequeue of `send_sg`, the
+    // `ptr::read` of `send_sg.elem` below (which, for a select sender, reads
+    // out of that goroutine's `selectgo` stack frame), and `goready`.  The
+    // channel lock serialises this against a Phase 2b drain's
+    // `unregister_drained_g`, which unlinks the sudog under the same lock
+    // before any `stack_free` — so the sender's stack cannot be munmapped out
+    // from under this read.  The G descriptor is immortal, so `(*gp)` is safe.
     let gp = unsafe { (*send_sg).g };
 
     let boxed = unsafe { (*send_sg).boxed_elem };
@@ -628,12 +643,11 @@ pub(crate) unsafe fn closechan<T: Send + 'static>(c: &Arc<Hchan<T>>) {
     }
     state.closed = true;
 
-    // RCU read-side spans the entire load-and-wake sequence, including the
-    // dereferences of `(*sg).g` below and every `goready` call.  Pairs with
-    // the run_impl Phase 2b drainer's `DrainSync` so a concurrent drain
-    // cannot free any of these `gp` pointers while we are using them.
-    let _cs = crate::runtime::rcu::RcuGuard::new();
-
+    // `closechan` never touches any waiter's stack: it only writes `success`
+    // and `param`, both fields of the immortal `Sudog`/`G` descriptors, and
+    // then `goready`s each waiter (which dereferences only the immortal G).
+    // There is therefore no stack-reclamation hazard here and no
+    // synchronisation against the Phase 2b drain is needed.
     let mut wakeup: Vec<*mut crate::runtime::g::G> = Vec::new();
 
     loop {

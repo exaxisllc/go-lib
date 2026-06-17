@@ -416,12 +416,11 @@ pub(crate) unsafe fn findrunnable() -> Option<*mut G> {
 
         // ── 4. Non-blocking netpoll: check if any I/O goroutines are ready ──
         {
-            // Guard BEFORE the harvest: netpoll_wait consumes REG entries,
-            // so a harvested event is invisible to the owning Rt's
-            // `netpoll_clear_reg`.  Acquiring the RCU guard first ensures a
-            // concurrent Phase 2b drain cannot free the harvested `*mut G`s
-            // before the goready calls below.
-            let _cs = super::rcu::RcuGuard::new();
+            // No drain synchronisation: the harvested entries are immortal
+            // `*mut G` descriptors and we wake each only via `goready`, which
+            // never touches the goroutine's stack.  An entry whose invocation
+            // was concurrently drained is GDEAD by the time `goready` runs and
+            // is dropped by `goready`'s GDEAD arm.
             let ready = unsafe { super::netpoll::netpoll_wait(0) };
             // Singleton scheduler: every harvested goroutine belongs to this
             // Rt, so plain goready is always correct (goready's GDEAD check
@@ -699,9 +698,11 @@ pub(crate) unsafe extern "C" fn goexit0(gp: *mut G) {
 
     let m = current_m();
 
-    // Snapshot stack bounds while we still own the G (GRUNNING).  After the
-    // casgstatus below the G is logically dead; we must not read its fields
-    // after the subsequent drop(Box::from_raw(gp)).
+    // Snapshot stack bounds while we still own the G (GRUNNING).  The G is
+    // about to go GDEAD and have its stack freed; snapshot now so the
+    // `stack_free` below does not depend on re-reading `(*gp).stack` after the
+    // status transition (the descriptor itself is immortal and survives, but
+    // taking the snapshot up front keeps the ownership story simple).
     let stack: Stack = unsafe { (*gp).stack };
 
     unsafe {
@@ -2587,7 +2588,6 @@ unsafe fn spawn_m(rt: &'static Rt, id: i64, p: *mut P) {
 /// no normal waker can transition it again).  Callers in `run_impl` ensure
 /// this via the CAS done immediately before invoking this helper.
 unsafe fn unregister_drained_g(gp: *mut G) {
-    use super::sudog::release_sudog;
 
     // ── Channel sudogs ──────────────────────────────────────────────────────
     //
@@ -2596,60 +2596,116 @@ unsafe fn unregister_drained_g(gp: *mut G) {
     // at a monomorphised helper that knows the channel's `T`.  We lock the
     // channel by its mutex (at offset 0 of `Hchan<T>`), call the helper to
     // remove the sudog from its sendq/recvq, then release the sudog.
-    let mut sudog_head = unsafe { (*gp).waiting_sudogs };
-    while !sudog_head.is_null() {
-        let sg = sudog_head;
-        let next = unsafe { (*sg).g_link_next };
-        sudog_head = next;
+    // Detach the whole list FIRST, before releasing any sudog.  Each
+    // `release_sudog` below puts the sudog back on the free pool, where another
+    // live goroutine may immediately re-acquire it and `push_waiting_sudog` it
+    // onto ITS list.  If we left `gp.waiting_sudogs` (and the `g_link_next`
+    // chain) pointing at sudogs we are concurrently releasing, that re-acquired
+    // sudog would momentarily be reachable from two lists at once — tangling
+    // them and double-releasing the sudog (observed as a sudog free-list
+    // double-free / "double-acquire" under the select+drain stress harness).
+    // Snapshotting + detaching the head up front guarantees a released sudog is
+    // never reachable from `gp` again.  We also sever `g_link_next` as we
+    // snapshot so the chain cannot be walked into after release.
+    let mut snapshot: Vec<*mut super::sudog::Sudog> = Vec::new();
+    {
+        let mut cur = unsafe { (*gp).waiting_sudogs };
+        unsafe { (*gp).waiting_sudogs = std::ptr::null_mut() };
+        while !cur.is_null() {
+            let next = unsafe { (*cur).g_link_next };
+            unsafe { (*cur).g_link_next = std::ptr::null_mut() };
+            snapshot.push(cur);
+            cur = next;
+        }
+    }
 
+    for sg in snapshot {
         let chan_ptr = unsafe { (*sg).c };
         let unlink_fn = unsafe { (*sg).unlink_for_drain };
-        if !chan_ptr.is_null() && unlink_fn.is_some() {
+        let drop_fn   = unsafe { (*sg).drop_elem_for_drain };
+        if !chan_ptr.is_null() {
             let mu = chan_ptr as *const super::rawmutex::RawMutex;
             // SAFETY: the user-side Hchan<T> Arc is held by goroutines we
             // have just CAS'd to GDEAD, but the Arc allocation itself stays
-            // mapped (closure-capture leak — see run_impl doc-comment).  No
-            // concurrent user code in this Rt can be dereferencing this channel
-            // because all goroutines have been CAS'd to GDEAD.
+            // mapped (closure-capture leak — see run_impl doc-comment).
+            //
+            // Everything that touches this sudog's channel state — unlinking
+            // it from the sendq/recvq AND dropping/clearing its `elem` payload
+            // box — happens UNDER the channel lock, atomically.  A live peer
+            // completing a rendezvous on this sudog (`chansend` Case 1,
+            // `recv_from_sender`, or `selectgo`'s try-path) does the symmetric
+            // work — consume the value, free the box, null `elem` — under the
+            // SAME lock.  Performing the drain's drop outside the lock (the old
+            // structure) let the peer and the drain both free the same payload
+            // box: a double-free of the `Box<ManuallyDrop<T>>` (caught by
+            // `stress_drain_select` as `try_recv_chan` vs
+            // `drop_send_elem_for_drain`).  Holding the lock across unlink +
+            // drop + null makes the two mutually exclusive: whoever takes the
+            // lock first either consumes-and-nulls or unlinks-and-drops, and
+            // the other then observes a nulled `elem` / a missing sudog.
             unsafe { (*mu).lock() };
-            // SAFETY: `unlink_fn` is the monomorphised
-            // `chan::unlink_sudog_for_drain::<T>` for the T of this channel,
-            // stored when the sudog was enqueued (`chansend`/`chanrecv`/
-            // `selectgo`).  It expects the channel pointer and a sudog
-            // pointer; both are valid here.
-            unsafe { unlink_fn.unwrap_unchecked()(chan_ptr, sg) };
+            // Box ownership rule: only the party that actually REMOVES the
+            // sudog from the channel's wait queue owns its `elem` payload box.
+            // `unlink_sudog_for_drain` returns `true` iff it removed the sudog.
+            // If it returns `false`, a live peer (chansend/recv/select try-path)
+            // already dequeued it under this same lock and now owns the box —
+            // the drain must NOT free it (doing so is the `try_recv_chan` vs
+            // `drop_send_elem_for_drain` double-free).  Tying box ownership to
+            // queue removal makes the two mutually exclusive even if the
+            // sudog's cached channel pointer were ever stale, because removal
+            // happens under the channel lock that both sides take.
+            let removed = match unlink_fn {
+                // SAFETY: monomorphised `chan::unlink_sudog_for_drain::<T>`
+                // stored at enqueue; valid for this channel and sudog.
+                Some(unlink_fn) => unsafe { unlink_fn(chan_ptr, sg) },
+                None => false,
+            };
+            // Drop the heap `elem` box (send: `Box<ManuallyDrop<T>>`, recv:
+            // `Box<Option<T>>`) only if WE removed the sudog.  `None` drop_fn
+            // for select sudogs whose `elem` points into a stack frame.  Null
+            // `elem` first so it is freed at most once.
+            let elem = unsafe { (*sg).elem };
+            if removed
+                && let Some(drop_fn) = drop_fn
+                && !elem.is_null()
+            {
+                unsafe { (*sg).elem = std::ptr::null_mut() };
+                unsafe { drop_fn(elem) };
+            }
             unsafe { (*mu).unlock() };
-        }
-
-        // Drop the heap-allocated `elem` payload via the monomorphised
-        // function pointer set at enqueue time.  Only present for plain
-        // channel send/recv sudogs (`Box<ManuallyDrop<T>>` / `Box<Option<T>>`);
-        // `None` for select sudogs whose `elem` points into the user's
-        // `selectgo` stack frame (which the goroutine-stack munmap reclaims).
-        let drop_fn = unsafe { (*sg).drop_elem_for_drain };
-        let elem    = unsafe { (*sg).elem };
-        if let Some(drop_fn) = drop_fn
-            && !elem.is_null()
-        {
-            // SAFETY: `drop_fn` is the monomorphised
-            // `drop_send_elem_for_drain::<T>` or `drop_recv_elem_for_drain::<T>`
-            // for the channel's `T`, and `elem` is the Box pointer the
-            // send/recv path stored.  No other thread holds this pointer
-            // (the sudog is gone from the waitq after the unlink call above).
-            unsafe { drop_fn(elem) };
+        } else {
+            // No channel — a select sudog whose `elem` points into a stack
+            // frame; it carries no heap box to drop.
+            debug_assert!(drop_fn.is_none(),
+                "unregister_drained_g: sudog with drop_elem_for_drain but null channel");
         }
 
         unsafe {
             (*sg).g    = std::ptr::null_mut();
             (*sg).c    = std::ptr::null_mut();
             (*sg).elem = std::ptr::null_mut();
-            (*sg).g_link_next         = std::ptr::null_mut();
+            // g_link_next was already severed during the snapshot above.
             (*sg).unlink_for_drain    = None;
             (*sg).drop_elem_for_drain = None;
-            release_sudog(sg);
+            // Deliberately LEAK the sudog instead of `release_sudog(sg)`.
+            //
+            // A force-drained goroutine's sudog may still be referenced by a
+            // peer that is concurrently completing a channel rendezvous on it
+            // (a select peer that won `selectdone`, or a sender/receiver whose
+            // handoff is mid-flight) — the peer accesses it under the channel
+            // lock but does not own its release.  Returning such a sudog to the
+            // shared free pool let it be re-acquired by a live goroutine while
+            // the peer (or a second drain that also reached it through a
+            // momentarily-tangled `waiting_sudogs` list) still touched it,
+            // corrupting the free list (observed as a sudog double-free /
+            // double-acquire under `stress_drain_select`).  Leaking drained
+            // sudogs makes them immortal, exactly as `gfree_put` does for the
+            // `G` descriptor and for the same reason — the leak is bounded by
+            // the number of goroutines force-drained per invocation.
+            let _leaked = sg;
         }
     }
-    unsafe { (*gp).waiting_sudogs = std::ptr::null_mut() };
+    // `gp.waiting_sudogs` was detached to null before the release loop.
 
     // ── WaitGroup ──────────────────────────────────────────────────────────
     let wg_ptr = unsafe { (*gp).waiting_wg };
@@ -2676,6 +2732,34 @@ unsafe fn unregister_drained_g(gp: *mut G) {
     // outlive the `Box<G>` free that follows this call.
     super::time::remove_timer_entries_for(gp);
     super::netpoll::netpoll_remove_entries_for(gp);
+}
+
+/// Test-only widener for the Phase 2b drain's unregister→stack_free window.
+///
+/// When `GOLIB_DRAIN_WIDEN_US` is set to a positive integer, the drain sleeps
+/// that many microseconds between unlinking a drained goroutine's select
+/// sudogs and munmapping its stack.  This amplifies any (hypothetical)
+/// ordering bug in the channel-lock happens-before argument that lets a
+/// channel writer touch a select-waiter's stack after the unlink: with the
+/// window widened, such a writer faults on the munmapped page deterministically
+/// instead of in a vanishingly small race window.  Used by the
+/// `stress_drain_select` reproducer; a no-op unless the env var is set.
+#[inline]
+fn maybe_widen_drain_window() {
+    use std::sync::atomic::AtomicU64;
+    // Cache the parsed value: 0 = disabled, u64::MAX sentinel = "not yet read".
+    static WIDEN_US: AtomicU64 = AtomicU64::new(u64::MAX);
+    let mut us = WIDEN_US.load(Relaxed);
+    if us == u64::MAX {
+        us = std::env::var("GOLIB_DRAIN_WIDEN_US")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        WIDEN_US.store(us, Relaxed);
+    }
+    if us > 0 {
+        std::thread::sleep(std::time::Duration::from_micros(us));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2783,10 +2867,23 @@ where
     //     leaks self-healing across invocations.
     //
     // Safety protocol is unchanged from before:
-    //   1. CAS GWAITING → GDEAD (goready guards see GDEAD and return early)
+    //   1. CAS GWAITING → GDEAD (goready sees GDEAD and returns early)
     //   2. Unregister each gp from every waker (channel waitq, WG, Cond)
-    //   3. DrainSync barrier (blocks in-flight goready calls)
-    //   4. Free stacks and Box<G>
+    //   3. Free stacks (descriptors are immortal, so nothing else to free)
+    //
+    // No reader/drainer barrier is needed between steps 2 and 3.  The only
+    // operation that touches a *parked* goroutine's stack is a channel handoff
+    // writing/reading a select-waiter's `sudog.elem` (which points into that
+    // goroutine's `selectgo` frame).  Every such access happens under the
+    // channel lock, in the same critical section as the dequeue of the peer's
+    // sudog.  `unregister_drained_g` (step 2) unlinks each select sudog under
+    // that same channel lock, so for any (writer, drainer) pair on a channel:
+    // whoever takes the lock first wins — either the writer completes its elem
+    // access before the drainer unlinks (and only then do we `stack_free`), or
+    // the drainer unlinks first and the writer never finds the sudog to touch
+    // the stack.  Either way the munmap in step 3 cannot race a live writer.
+    // (This replaced the old `DrainSync` barrier + per-site `RcuGuard`s, which
+    // existed to protect a now-immortal `Box<G>` free.)
     {
         // Claim (CAS) and remove from `allg` in one locked pass.  Removal
         // must happen BEFORE the frees below: `allg` is shared by every
@@ -2849,7 +2946,19 @@ where
                 unsafe { unregister_drained_g(gp) };
             }
 
-            let _sync = super::rcu::DrainSync::new();
+            // No barrier here — `unregister_drained_g` has already unlinked
+            // every select sudog under its channel lock, which is the
+            // happens-before edge that makes the `stack_free` below safe
+            // against any concurrent channel writer (see the drain protocol
+            // comment above).
+            //
+            // Test-only widener: artificially stretch the window between the
+            // unregister-unlink and the `stack_free` munmap so a stress run can
+            // flush out any ordering bug in the happens-before argument (the
+            // same technique as the #37 800µs widener).  Gated on an env var so
+            // it costs a single relaxed-ordered check on the rare drain path
+            // and never fires in production.
+            maybe_widen_drain_window();
 
             for &gp in &drained {
                 let stack = unsafe { (*gp).stack };

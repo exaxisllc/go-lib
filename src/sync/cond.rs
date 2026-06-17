@@ -174,10 +174,10 @@ impl Cond {
         // acquiring and releasing the spinlock could deschedule us while the
         // lock is held, deadlocking the next goroutine on this M.
         let _lk = crate::runtime::m::m_lock();
-        // RCU read-side covers the pop from `waitq` and the goready call.
-        // Pairs with the run_impl Phase 2b drainer's `DrainSync` so a
-        // concurrent drain cannot free `gp` while we are using it.
-        let _cs = crate::runtime::rcu::RcuGuard::new();
+        // No drain synchronisation: a Cond waiter is woken purely via
+        // `goready`, which touches only the immortal `G` descriptor — never
+        // the waiter's stack.  (The `gp` pop and `goready` are safe even if a
+        // Phase 2b drain has concurrently CAS'd the waiter to GDEAD.)
         self.mu.lock();
         // SAFETY: `mu` is held.
         let gp = unsafe { (*self.waitq.get()).pop_front() };
@@ -199,9 +199,8 @@ impl Cond {
     /// Wake all waiting goroutines.
     pub fn notify_all(&self) {
         let _lk = crate::runtime::m::m_lock();
-        // RCU read-side covers the drain of `waitq` and every goready call.
-        // Pairs with the run_impl Phase 2b drainer's `DrainSync`.
-        let _cs = crate::runtime::rcu::RcuGuard::new();
+        // No drain synchronisation needed — see `notify_one`: waiters are woken
+        // only via `goready`, which never touches a waiter's stack.
         self.mu.lock();
         // SAFETY: `mu` is held.
         let waiters: Vec<*mut G> = unsafe { (*self.waitq.get()).drain(..).collect() };

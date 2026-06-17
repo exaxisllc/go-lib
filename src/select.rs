@@ -153,7 +153,7 @@ pub struct SCase {
     /// Phase 2b unlink function — stored into `Sudog.unlink_for_drain` so
     /// the drain can remove this sudog from the channel without knowing `T`.
     pub(crate) unlink_for_drain_fn:
-        Option<unsafe extern "C" fn(*mut u8, *mut Sudog)>,
+        Option<unsafe extern "C" fn(*mut u8, *mut Sudog) -> bool>,
 }
 
 // SAFETY: SCase is always used within a single goroutine context; the raw
@@ -274,12 +274,15 @@ pub fn selectgo(cases: &mut [SCase], has_default: bool) -> (usize, bool) {
 
     // ── 4. First pass: check each case in poll order ──────────────────────────
     //
-    // RCU read-side covers `try_fn`'s dequeue (which loads a peer's `*mut G`
-    // out of a channel waitq), the lock releases below, and the eventual
-    // `goready(gp)` call.  Without the guard, a concurrent Phase 2b drainer
-    // could free the peer's `Box<G>` between the load inside `try_fn` and the
-    // `goready` call below, producing a use-after-free.
-    let _cs = crate::runtime::rcu::RcuGuard::new();
+    // `try_fn` dequeues a peer's sudog and reads/writes its `elem` (which, for
+    // a select peer, points into that peer's `selectgo` stack frame) entirely
+    // under the channel locks acquired in step 3.  Those locks are not
+    // released until the `unlock_fn` loop below, *after* the elem access — so
+    // a concurrent Phase 2b drain's `unregister_drained_g`, which unlinks the
+    // peer's sudog under the same channel lock before any `stack_free`, cannot
+    // munmap the peer's stack while we hold the lock (see the happens-before
+    // proof on `unregister_drained_g`).  The G descriptor is immortal, so the
+    // `gp` we hand to `goready` is always valid.
     for &i in &pollorder {
         let result = unsafe { (cases[i].try_fn)(cases[i].chan_ptr, cases[i].elem) };
         match result {
@@ -310,7 +313,6 @@ pub fn selectgo(cases: &mut [SCase], has_default: bool) -> (usize, bool) {
             }
         }
     }
-    drop(_cs);
 
     // ── 5. Default case ───────────────────────────────────────────────────────
     if has_default {

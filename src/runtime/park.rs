@@ -204,18 +204,13 @@ unsafe extern "C" fn park_fn(gp: *mut G) {
 ///
 /// Ported from `goready` in `runtime/proc.go`.
 pub(crate) unsafe fn goready(gp: *mut G) {
-    // RCU read-side critical section.  Pairs with the `DrainSync` that the
-    // run_impl Phase 2b drainer holds while freeing `Box<G>` allocations of
-    // cancelled goroutines.  As long as this guard is alive, no drainer will
-    // free the `gp` we are about to dereference.
-    //
-    // The guard MUST cover every dereference of `gp` in this function (the
-    // status reads in the spin loop, the CAS, and the schedlink store on the
-    // global-queue path).  Callers that load `gp` from shared state and then
-    // call `goready` should hold their own outer `RcuGuard` so the pointer
-    // load itself is also covered — see `closechan`, `chansend`,
-    // `WaitGroup::add`, etc.
-    let _cs = super::rcu::RcuGuard::new();
+    // `goready` dereferences only the immortal `G` descriptor — its
+    // `atomicstatus` (spin loop + CAS), `param`, and `schedlink` — never the
+    // goroutine's stack.  Because `gfree_put` leaks the descriptor, every one
+    // of those dereferences is unconditionally safe even if a concurrent
+    // Phase 2b drain has CAS'd this G to GDEAD and freed its stack (the GDEAD
+    // arm below handles that case and returns without scheduling).  No
+    // reader/drainer synchronisation is required here.
 
     // Spin until the goroutine finishes its in-flight status transition.
     // The only wakeable state is GWAITING.

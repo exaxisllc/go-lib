@@ -129,7 +129,7 @@ pub(crate) struct Sudog {
     /// `None` if the sudog is not currently enqueued (e.g. fresh from
     /// `acquire_sudog` or just `release_sudog`-bound).
     pub unlink_for_drain:
-        Option<unsafe extern "C" fn(channel: *mut u8, sudog: *mut Sudog)>,
+        Option<unsafe extern "C" fn(channel: *mut u8, sudog: *mut Sudog) -> bool>,
 
     /// Type-erased function that drops this sudog's `elem` payload.  Used by
     /// the Phase 2b drain to reclaim heap allocations that the original
@@ -298,14 +298,14 @@ impl WaitQ {
     /// Caller must hold the channel lock.
     ///
     /// Ported from `dequeueSudoG` in `runtime/chan.go`.
-    pub(crate) unsafe fn dequeue_sudog(&mut self, sgp: *mut Sudog) {
+    pub(crate) unsafe fn dequeue_sudog(&mut self, sgp: *mut Sudog) -> bool {
         let prev = unsafe { (*sgp).prev };
         let next = unsafe { (*sgp).next };
 
         // Guard: if sgp has no prev link and is not the head, it has already
         // been unlinked by a racing `dequeue()` call.  Do nothing.
         if prev.is_null() && self.first != sgp {
-            return;
+            return false;
         }
 
         if !prev.is_null() {
@@ -324,6 +324,7 @@ impl WaitQ {
             (*sgp).next = std::ptr::null_mut();
             (*sgp).prev = std::ptr::null_mut();
         }
+        true
     }
 }
 

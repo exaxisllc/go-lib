@@ -643,7 +643,7 @@ pub(crate) unsafe fn push_waiting_sudog(
 pub(crate) unsafe fn remove_waiting_sudog(
     gp:    *mut G,
     sudog: *mut super::sudog::Sudog,
-) {
+) -> bool {
     unsafe {
         let mut cur = (*gp).waiting_sudogs;
         let mut prev: *mut super::sudog::Sudog = std::ptr::null_mut();
@@ -656,12 +656,13 @@ pub(crate) unsafe fn remove_waiting_sudog(
                     (*prev).g_link_next = next;
                 }
                 (*cur).g_link_next = std::ptr::null_mut();
-                return;
+                return true;
             }
             prev = cur;
             cur = (*cur).g_link_next;
         }
     }
+    false
 }
 
 // ---------------------------------------------------------------------------
