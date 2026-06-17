@@ -328,59 +328,110 @@ impl WaitQ {
 }
 
 // ---------------------------------------------------------------------------
-// Global sudog free list
+// Sudog free lists — per-P caches + a global central overflow list
 // ---------------------------------------------------------------------------
 
-/// Internal free-list node.  `next` in `Sudog` is reused as the chain link.
-struct SudogCache {
+/// An intrusive LIFO free list of `Sudog`s, chained through `Sudog.next`.
+///
+/// Two tiers use this type:
+/// * one per `P` (`P.sudog_cache`) — the fast path, almost always
+///   uncontended; refilled from / flushed to the central list in batches;
+/// * one process-wide central list ([`SUDOG_CENTRAL`]) — the overflow tier
+///   and the path taken when there is no current `P` (the `run_impl` caller,
+///   the Phase 2b drain, and unit tests).
+///
+/// Mirrors Go's `pp.sudogcache` + `sched.sudogcache` split (`acquireSudog` /
+/// `releaseSudog` in `runtime/proc.go`).
+pub(crate) struct SudogCache {
     head:  *mut Sudog,
     count: usize,
 }
 
-// SAFETY: The cache is only ever accessed while holding SUDOG_CACHE's Mutex.
+// SAFETY: a SudogCache is only ever accessed while holding the Mutex that
+// wraps it (the per-P one on `P`, or `SUDOG_CENTRAL`).
 unsafe impl Send for SudogCache {}
 
-/// Maximum number of sudogs kept in the global free list.
-///
-/// Mirrors Go's per-P cap of 128; our single global list is capped at 1 024
-/// so that channels under high concurrency don't exhaust the heap.
-const CACHE_CAP: usize = 1_024;
+impl SudogCache {
+    pub(crate) const fn new() -> Self {
+        SudogCache { head: std::ptr::null_mut(), count: 0 }
+    }
 
-/// Process-wide sudog free list.
-///
-/// v1 uses a single global list protected by a `Mutex`.  The per-P tier
-/// (step 15.5) will be layered on top without changing `acquire_sudog` /
-/// `release_sudog`'s signatures.
-static SUDOG_CACHE: Mutex<SudogCache> = Mutex::new(SudogCache {
-    head:  std::ptr::null_mut(),
-    count: 0,
-});
+    /// Pop the head, or null if empty.
+    #[inline]
+    fn pop(&mut self) -> *mut Sudog {
+        let s = self.head;
+        if !s.is_null() {
+            self.head = unsafe { (*s).next };
+            self.count -= 1;
+        }
+        s
+    }
+
+    /// Push `s` onto the head.
+    #[inline]
+    fn push(&mut self, s: *mut Sudog) {
+        unsafe { (*s).next = self.head };
+        self.head = s;
+        self.count += 1;
+    }
+}
+
+/// Per-P local cache capacity (Go's `len(pp.sudogbuf)` = 128).  On overflow,
+/// half is flushed to the central list; on underflow, a batch is pulled from
+/// it.
+const LOCAL_CAP: usize = 128;
+
+/// Number of sudogs moved in a single refill/flush between a P cache and the
+/// central list (Go flushes/​refills half the local buffer).
+const BATCH: usize = LOCAL_CAP / 2;
+
+/// Cap on the central overflow list, bounding total retained free sudogs to
+/// roughly `CENTRAL_CAP + LOCAL_CAP * GOMAXPROCS`.  Beyond it, released
+/// sudogs are freed back to the allocator.
+const CENTRAL_CAP: usize = 4_096;
+
+/// Process-wide central sudog free list — overflow tier and the no-P path.
+static SUDOG_CENTRAL: Mutex<SudogCache> = Mutex::new(SudogCache::new());
 
 // ---------------------------------------------------------------------------
 // acquire_sudog / release_sudog
 // ---------------------------------------------------------------------------
 
-/// Acquire a zeroed `Sudog` from the free list, allocating one if necessary.
+/// Acquire a zeroed `Sudog`, allocating one if every tier is empty.
 ///
-/// The returned pointer is exclusively owned by the caller until passed to
-/// [`release_sudog`].
+/// Fast path: pop the current P's local cache (refilling it from the central
+/// list in one batch if empty).  With no current P, pop the central list
+/// directly.  The returned pointer is exclusively owned by the caller until
+/// passed to [`release_sudog`].
 ///
 /// Ported from `acquireSudog` in `runtime/proc.go`.
 pub(crate) fn acquire_sudog() -> *mut Sudog {
-    let mut cache = SUDOG_CACHE.lock().unwrap();
-    if !cache.head.is_null() {
-        let s = cache.head;
-        // Advance the free-list head.
-        unsafe { cache.head = (*s).next };
-        cache.count -= 1;
-        drop(cache); // release the lock before zeroing
+    let p = super::sched::current_p();
+    let s = if !p.is_null() {
+        // Per-P fast path.  Lock ordering is always local-then-central.
+        let pref = unsafe { &*p };
+        let mut local = pref.sudog_cache.lock().unwrap();
+        if local.head.is_null() {
+            let mut central = SUDOG_CENTRAL.lock().unwrap();
+            for _ in 0..BATCH {
+                let t = central.pop();
+                if t.is_null() {
+                    break;
+                }
+                local.push(t);
+            }
+        }
+        local.pop() // null if local + central were both empty
+    } else {
+        SUDOG_CENTRAL.lock().unwrap().pop()
+    };
 
+    if s.is_null() {
+        Box::into_raw(Box::new(Sudog::zeroed()))
+    } else {
         // Zero-out any stale fields from the previous use.
         unsafe { std::ptr::write(s, Sudog::zeroed()) };
         s
-    } else {
-        drop(cache); // release lock before heap allocation
-        Box::into_raw(Box::new(Sudog::zeroed()))
     }
 }
 
@@ -389,6 +440,10 @@ pub(crate) fn acquire_sudog() -> *mut Sudog {
 /// The caller **must** clear `s.g`, `s.elem`, and `s.c` before calling.
 /// This matches Go's `releaseSudog` precondition (panics in debug mode if
 /// the pointer fields are non-null on arrival).
+///
+/// Fast path: push onto the current P's local cache (flushing half to the
+/// central list first if it is full).  With no current P, push onto the
+/// central list, or free the sudog if the central list is at capacity.
 ///
 /// # Safety
 /// `s` must have been obtained from [`acquire_sudog`] and must not be used
@@ -409,16 +464,36 @@ pub(crate) unsafe fn release_sudog(s: *mut Sudog) {
         "release_sudog: c not cleared"
     );
 
-    let mut cache = SUDOG_CACHE.lock().unwrap();
-    if cache.count < CACHE_CAP {
-        // Link into the free list via the `next` field.
-        unsafe { (*s).next = cache.head };
-        cache.head  = s;
-        cache.count += 1;
+    let p = super::sched::current_p();
+    if !p.is_null() {
+        // Per-P fast path.  Lock ordering is always local-then-central.
+        let pref = unsafe { &*p };
+        let mut local = pref.sudog_cache.lock().unwrap();
+        if local.count >= LOCAL_CAP {
+            // Flush half the local cache into the central list so other Ps can
+            // reuse it (and so this list stays bounded).
+            let mut central = SUDOG_CENTRAL.lock().unwrap();
+            for _ in 0..BATCH {
+                let t = local.pop();
+                if t.is_null() {
+                    break;
+                }
+                if central.count < CENTRAL_CAP {
+                    central.push(t);
+                } else {
+                    let _ = unsafe { Box::from_raw(t) };
+                }
+            }
+        }
+        local.push(s);
     } else {
-        drop(cache);
-        // Cache is full: free the allocation directly.
-        let _ = unsafe { Box::from_raw(s) };
+        let mut central = SUDOG_CENTRAL.lock().unwrap();
+        if central.count < CENTRAL_CAP {
+            central.push(s);
+        } else {
+            drop(central);
+            let _ = unsafe { Box::from_raw(s) };
+        }
     }
 }
 

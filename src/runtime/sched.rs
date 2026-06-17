@@ -180,6 +180,24 @@ pub(crate) fn current_rt_ptr() -> *const Rt {
     CURRENT_RT.with(|c| c.get())
 }
 
+/// Return the `P` attached to the current OS thread's M, or null when there
+/// is no M (bare threads: the `run_impl` caller, sysmon, the timer thread) or
+/// the M currently holds no P.
+///
+/// Used only to pick *which* per-P cache (sudog free list) to use; the result
+/// need not be "our" P for correctness, since each P's cache carries its own
+/// lock and Ps live for the whole process (never freed), so any non-null
+/// pointer this returns is valid to dereference.
+#[inline]
+pub(crate) fn current_p() -> *mut P {
+    let m = super::m::current_m();
+    if m.is_null() {
+        ptr::null_mut()
+    } else {
+        unsafe { (*m).p }
+    }
+}
+
 /// Bind `rt` as the `Rt` for the current OS thread.
 #[inline]
 pub(crate) fn set_current_rt(rt: *const Rt) {
@@ -2811,13 +2829,13 @@ where
         // A goroutine that is still GRUNNING inside `sleep()` while the
         // filter runs can push its timer entry and gopark immediately
         // afterwards; a pre-CAS filter misses that entry, the CAS then
-        // drains (and frees) the goroutine, and the stale entry left in
-        // TIMER_HEAP makes a later `fire_expired` dereference a freed G
+        // drains (and frees) the goroutine, and the stale entry left in the
+        // timer shard makes a later `fire_expired` dereference a freed G
         // (caught by guard-malloc as a fault inside the timer thread).
         // Running the filter after the CAS is sufficient: any entry whose G
         // we just drained was pushed *before* that G reached GWAITING, so it
-        // is in the heap by the time the CAS succeeds — and `fire_expired`
-        // holds the heap lock across its whole pop→wake sequence, so an
+        // is in its shard by the time the CAS succeeds — and `fire_expired`
+        // holds each shard's lock across its whole pop→wake sequence, so an
         // in-flight entry cannot escape the filter either (the filter blocks
         // until the fire completes; the G's status is GDEAD by then and the
         // fire drops it without waking).

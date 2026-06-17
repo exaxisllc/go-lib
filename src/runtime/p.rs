@@ -193,6 +193,22 @@ pub(crate) struct P {
     // ── scheduler links ───────────────────────────────────────────────────
     /// Intrusive link for the idle-P list maintained by the scheduler (step 8).
     pub link: *mut P,
+
+    // ── per-P sudog free list (Go's `pp.sudogcache`) ──────────────────────
+    /// Local cache of free [`Sudog`](super::sudog::Sudog) records.  Refilled
+    /// from / flushed to the global central list in `sudog.rs`.
+    ///
+    /// Protected by its own `Mutex` rather than accessed lock-free as in Go:
+    /// a goroutine can be async-preempted (SIGURG) and migrated to another M
+    /// between picking "the current P" and touching its cache, so two threads
+    /// can momentarily race on one P's list.  The lock makes that safe; it is
+    /// virtually always uncontended (the owning M is the only regular user),
+    /// so it costs one futex CAS — far cheaper than the `pthread_sigmask`
+    /// pin that lock-free access would otherwise require, and unlike the old
+    /// single global list it does not serialise every channel park
+    /// process-wide.  A plain `std::sync::Mutex` (not the loom shim) keeps the
+    /// cache out of loom modelling — it participates in no model test.
+    pub sudog_cache: std::sync::Mutex<super::sudog::SudogCache>,
 }
 
 // SAFETY: The scheduler ensures only one M operates on a P at any time, except
@@ -218,6 +234,7 @@ impl P {
             schedtick:   AtomicU32::new(0),
             syscalltick: AtomicU32::new(0),
             link:        std::ptr::null_mut(),
+            sudog_cache: std::sync::Mutex::new(super::sudog::SudogCache::new()),
         })
     }
 
