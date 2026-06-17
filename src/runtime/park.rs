@@ -136,7 +136,7 @@ unsafe extern "C" fn park_fn(gp: *mut G) {
     // lands on the SAME M that took the increment — after the unlock below,
     // this G may resume on a different M.
     if unlock_fn.is_some() {
-        unsafe { (*m).locks -= 1 };
+        unsafe { (*m).locks.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) };
     }
 
     // Dead-invocation check MUST come before the GWAITING transition, while

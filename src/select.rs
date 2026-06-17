@@ -448,7 +448,9 @@ pub(crate) unsafe fn unlock_chan<T>(p: *const ()) {
     // `lock_chan`.  We avoid constructing/dropping an MLockGuard here
     // because the lock/unlock are split across two separate functions.
     let mp = crate::runtime::m::current_m();
-    if !mp.is_null() { (*mp).locks -= 1; }
+    if !mp.is_null() {
+        (*mp).locks.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 pub(crate) unsafe fn try_send_chan<T: Send + 'static>(
