@@ -718,7 +718,7 @@ pub(crate) unsafe extern "C" fn goexit0(gp: *mut G) {
     // (sigurg_handler Guard 0 skips whenever m.locks > 0).  Decrementing is
     // safe here: the G is GDEAD and current_g is null, so sigurg_handler
     // cannot start a preemption on this M anyway.
-    unsafe { (*m).locks -= 1 };
+    unsafe { (*m).locks.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) };
 
     // Remove from the live-goroutine registry before freeing so that the
     // run_impl drain cannot observe a dangling pointer.
@@ -992,7 +992,7 @@ fn pc_in_scheduler_asm(pc: usize) -> bool {
     }
 
     #[cfg(target_arch = "x86_64")]
-    let bases: [usize; 11] = [
+    let bases: [usize; 10] = [
         super::asm_amd64::async_preempt_trampoline as *const () as usize,
         super::asm_amd64::gogo                     as *const () as usize,
         super::asm_amd64::mcall                    as *const () as usize,
@@ -1001,18 +1001,17 @@ fn pc_in_scheduler_asm(pc: usize) -> bool {
         // goexit path: RSP is still on the goroutine stack while m.locks is
         // being acquired (TLS accessor has 3 instructions before incl 96(%rax)).
         // Guard 0 (m.locks > 0) is not yet active in that window, so we protect
-        // both the naked trampoline and the handler with Guard 3.
+        // both the naked trampoline and the handler with Guard 3.  (This path
+        // bumps m.locks raw, outside m_lock, and relies on block_sigurg + this
+        // whitelist rather than m_lock's re-validation.)
         goexit_trampoline                          as *const () as usize,
         goexit0_handler                            as *const () as usize,
-        // m_lock's 0→1 `m.locks` bump is not yet visible to Guard 0 until the
-        // store lands; SIGURG in that window could migrate the goroutine to a
-        // different M and apply the increment to the wrong M.  Keep the whole
-        // bump un-preemptable.  (m_lock is #[inline(never)] so this address
-        // covers every caller's acquire.)  See m_lock's doc-comment.
-        super::m::m_lock                           as *const () as usize,
-        // current_m reads the CURRENT_M TLS slot; a migration between the
-        // slot-address fetch and the load returns the wrong M, poisoning the
-        // m.locks bump.  Cover its whole body.  See current_m's doc-comment.
+        // current_m reads the CURRENT_M TLS slot via libstd's LocalKey glue; a
+        // migration between the slot-address fetch and the load would return a
+        // stale M.  Kept whitelisted as defense-in-depth: for read-only callers
+        // a stale read is benign, and m_lock no longer depends on it (it now
+        // re-validates current_m after the bump — see m_lock's doc-comment), so
+        // m_lock itself is intentionally NOT in this list.
         super::m::current_m                        as *const () as usize,
         // async_preempt2's prologue (before it blocks SIGURG) must not itself
         // be nested-preempted, or the goroutine could migrate before the block
@@ -1022,7 +1021,7 @@ fn pc_in_scheduler_asm(pc: usize) -> bool {
         goroutine_entry                            as *const () as usize,
     ];
     #[cfg(target_arch = "aarch64")]
-    let bases: [usize; 10] = [
+    let bases: [usize; 9] = [
         super::asm_arm64::async_preempt_trampoline as *const () as usize,
         super::asm_arm64::gogo                     as *const () as usize,
         super::asm_arm64::mcall                    as *const () as usize,
@@ -1033,14 +1032,11 @@ fn pc_in_scheduler_asm(pc: usize) -> bool {
         // x86-64 list above includes gogo_asm/mcall_asm for the same reason.
         super::asm_arm64::gogo_asm                 as *const () as usize,
         super::asm_arm64::mcall_asm                as *const () as usize,
-        // Same pre-lock window as AMD64: goexit_trampoline bumps m.locks but
-        // the TLS accessor runs before the increment lands.
+        // Same pre-lock window as AMD64: goexit_trampoline bumps m.locks raw
+        // (outside m_lock) and relies on block_sigurg + this whitelist.
         goexit_trampoline                          as *const () as usize,
-        // m_lock's 0→1 `m.locks` bump must be un-preemptable (else SIGURG can
-        // migrate the goroutine mid-bump and apply it to the wrong M).  See
-        // m_lock's doc-comment.
-        super::m::m_lock                           as *const () as usize,
-        // current_m's TLS read window — see x86-64 list and current_m's doc.
+        // current_m's TLS read window, defense-in-depth — see x86-64 list and
+        // current_m's doc.  m_lock is intentionally NOT listed (it re-validates).
         super::m::current_m                        as *const () as usize,
         // async_preempt2 prologue — see x86-64 list and async_preempt2's doc.
         async_preempt2                             as *const () as usize,
@@ -1080,7 +1076,9 @@ unsafe extern "C" fn sigurg_handler(
         // `(*m).locks`.  This guard checks the counter and skips preemption
         // when it is non-zero.
         let mp = super::m::current_m();
-        if !mp.is_null() && unsafe { (*mp).locks } > 0 {
+        if !mp.is_null()
+            && unsafe { (*mp).locks.load(std::sync::atomic::Ordering::Relaxed) } > 0
+        {
             return; // holding a scheduler-internal lock — skip preemption
         }
 
@@ -2283,7 +2281,7 @@ unsafe extern "C" fn goexit0_handler() -> ! {
     // guard's Drop would never run and the count would stay elevated for the
     // rest of the M's life, permanently disabling async preemption on this M.
     // goexit0 decrements once the G is GDEAD and current_g is cleared.
-    unsafe { (*current_m()).locks += 1 };
+    unsafe { (*current_m()).locks.fetch_add(1, std::sync::atomic::Ordering::Relaxed) };
     let gp = current_g();
     unsafe { mcall(gp, goexit0) };
     // SAFETY: goexit0 → schedule() is an infinite loop; this is unreachable.
@@ -2304,7 +2302,7 @@ unsafe extern "C" fn goexit_trampoline() -> ! {
     // Raw `locks += 1` for the entire goexit path; goexit0 decrements once
     // the G is dead — see goexit0_handler's doc comment for the full
     // explanation of why an RAII guard must not be used here.
-    unsafe { (*current_m()).locks += 1 };
+    unsafe { (*current_m()).locks.fetch_add(1, std::sync::atomic::Ordering::Relaxed) };
     let gp = current_g();
     unsafe { mcall(gp, goexit0) };
     // SAFETY: goexit0 → schedule() is an infinite loop; this is unreachable.
@@ -3085,7 +3083,7 @@ mod tests {
                 let exited     = Arc::clone(&exited_w);
                 let max_locks1 = Arc::clone(&max_locks1_w);
                 spawn_goroutine(move || {
-                    let locks = unsafe { (*current_m()).locks };
+                    let locks = unsafe { (*current_m()).locks.load(Ordering::Relaxed) };
                     max_locks1.fetch_max(locks, Ordering::AcqRel);
                     exited.fetch_add(1, Ordering::AcqRel);
                 });
@@ -3100,7 +3098,7 @@ mod tests {
                 let checked    = Arc::clone(&checked_w);
                 let max_locks2 = Arc::clone(&max_locks2_w);
                 spawn_goroutine(move || {
-                    let locks = unsafe { (*current_m()).locks };
+                    let locks = unsafe { (*current_m()).locks.load(Ordering::Relaxed) };
                     max_locks2.fetch_max(locks, Ordering::AcqRel);
                     checked.fetch_add(1, Ordering::AcqRel);
                 });
@@ -3118,6 +3116,72 @@ mod tests {
              max = {m2}) — batch1 > 0 means the stray count predates any \
              goroutine exit (spawn/ready side); batch2-only means the goexit \
              path leaked an increment"
+        );
+    }
+
+    /// Migration detector for the optimistic `m_lock` pin (replaces the old
+    /// `pthread_sigmask` window-blocking).  Once `m_lock` returns, `m.locks`
+    /// is > 0, so sigurg_handler Guard 0 must suppress async preemption for the
+    /// guard's whole lifetime — meaning `current_m()` cannot change while the
+    /// guard is held.  This depends on Guard 0 observing the atomic `locks`
+    /// bump; if that read/write pairing were wrong, a goroutine could be
+    /// migrated mid-pin and `current_m()` would change under it.
+    ///
+    /// Each of many goroutines hammers `m_lock`/release in a tight loop, spins
+    /// while pinned (giving SIGURG a chance to wrongly migrate), and yields
+    /// between iterations so it actually moves across Ms — maximising the
+    /// chance that any pin acquired across a real migration window is observed.
+    /// The companion `goroutine_exit_releases_m_locks` test covers the dual
+    /// failure (a torn acquire leaking/mis-applying a count).
+    #[test]
+    fn m_lock_pins_current_m_under_load() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use crate::runtime::m::m_lock;
+
+        const N: usize = 128;
+
+        let violations = Arc::new(AtomicUsize::new(0));
+        let done       = Arc::new(AtomicUsize::new(0));
+        let violations_w = Arc::clone(&violations);
+        let done_w       = Arc::clone(&done);
+
+        run_impl(move || {
+            for _ in 0..N {
+                let v = Arc::clone(&violations_w);
+                let d = Arc::clone(&done_w);
+                spawn_goroutine(move || {
+                    for _ in 0..2_000 {
+                        let guard  = m_lock();
+                        let pinned = current_m();
+                        // Pinned: locks > 0 ⇒ Guard 0 suppresses preemption, so
+                        // current_m() must not move while we hold `guard`.
+                        for _ in 0..64 {
+                            if current_m() != pinned {
+                                v.fetch_add(1, Ordering::Relaxed);
+                                break;
+                            }
+                            std::hint::spin_loop();
+                        }
+                        drop(guard);
+                        // Unpinned: yield so we genuinely migrate across Ms,
+                        // making the next acquire race a real migration window.
+                        unsafe { gosched() };
+                    }
+                    d.fetch_add(1, Ordering::Relaxed);
+                });
+            }
+            while done_w.load(Ordering::Acquire) < N {
+                unsafe { gosched() };
+            }
+        });
+
+        assert_eq!(
+            violations.load(Ordering::Acquire),
+            0,
+            "current_m() changed while an MLockGuard was held — the optimistic \
+             pin failed to suppress preemption (Guard 0 did not observe the \
+             atomic m.locks bump)"
         );
     }
 

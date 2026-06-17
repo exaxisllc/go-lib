@@ -68,20 +68,23 @@ thread_local! {
 
 /// Return the M for the current OS thread, or null before initialisation.
 ///
-/// ## Why `#[inline(never)]` is load-bearing (async-preemption safety)
+/// ## Why `#[inline(never)]` + the `pc_in_scheduler_asm` whitelist entry
 ///
 /// Reading the thread-local `CURRENT_M` is a two-step operation: obtain the
 /// slot address (on macOS via a `tlv_get_addr` call), then load the value.
 /// If async preemption (`SIGURG`) lands between those two steps and migrates
-/// the goroutine to a different OS thread, the cached slot address still
-/// refers to the *original* thread's TLS block, so the load returns the old
-/// M.  Callers that immediately bump `m.locks` (`m_lock`, `goexit0_handler`)
-/// would then apply the increment to the wrong M (see `m_lock`'s doc-comment).
+/// the goroutine to a different OS thread, the cached slot address still refers
+/// to the *original* thread's TLS block, so the load returns the old M.
 ///
 /// Keeping `current_m` out-of-line gives it a stable PC range that
-/// `pc_in_scheduler_asm` (sigurg_handler Guard 3) lists, so the SIGURG handler
-/// skips preemption for the whole read — exactly as Go's `isAsyncSafePoint`
-/// never preempts runtime code.  Mirrors `current_g`'s `#[inline(never)]`.
+/// `pc_in_scheduler_asm` (sigurg_handler Guard 3) lists, so the handler skips
+/// preemption for the whole read — exactly as Go's `isAsyncSafePoint` never
+/// preempts runtime code.  This is now **defense-in-depth rather than
+/// load-bearing**: `m_lock` no longer trusts a single `current_m` read (it
+/// bumps `m.locks` and then re-reads `current_m` to confirm no migration
+/// happened — see `m_lock`'s doc-comment), and the raw `goexit` bump blocks
+/// `SIGURG` outright.  For every other (read-only) caller a stale M from a
+/// mid-read migration is harmless.  Mirrors `current_g`'s `#[inline(never)]`.
 #[inline(never)]
 pub(crate) fn current_m() -> *mut M {
     CURRENT_M.with(|c| c.get())
@@ -240,14 +243,20 @@ pub(crate) struct M {
     /// `preemptm` (which also calls `push_batch`) would re-acquire the same
     /// mutex on the same thread → self-deadlock.
     ///
-    /// Stored as a plain `i32` because it is only ever read/written by the
-    /// owning OS thread (the M's thread) and by the signal handler on that
-    /// same thread.  No cross-thread access; an atomic would be a
-    /// pessimisation.  Volatile via direct field write/read on `*mut M` —
-    /// the field is `Sync + Send` via the M-level unsafe impls.
+    /// Stored as an `AtomicI32`.  Almost all access is by the owning OS thread
+    /// (the M's thread) and the signal handler on that same thread, for which a
+    /// `Relaxed` RMW is as cheap as a plain one.  The atomicity is load-bearing
+    /// for one transient case: `m_lock`'s optimistic pin (see its doc-comment)
+    /// may `fetch_add`/`fetch_sub` on a *stale* M cross-thread when an async
+    /// preemption migrates the goroutine mid-pin.  That cross-thread RMW must be
+    /// atomic to avoid a data race with the stale M's owning thread; it is
+    /// always immediately undone and is benign (it can at most make the stale
+    /// M skip one best-effort preemption).  `Relaxed` suffices everywhere: each
+    /// thread only relies on observing its *own* prior writes (program order),
+    /// and the transient blips need no ordering.
     ///
     /// Ported from `m.locks` in `runtime/runtime2.go`.
-    pub locks: i32,
+    pub locks: std::sync::atomic::AtomicI32,
 }
 
 // SAFETY: The scheduler guarantees that only one thread operates on a given M
@@ -297,7 +306,7 @@ impl M {
             alllink:   std::ptr::null_mut(),
             schedlink: std::ptr::null_mut(),
             pthread_id: 0, // set by M::start() once the OS thread is running
-            locks:     0,
+            locks:     std::sync::atomic::AtomicI32::new(0),
         });
 
         // Transfer g0 ownership to a raw pointer and wire both directions.
@@ -493,7 +502,9 @@ impl Drop for MLockGuard {
         // plus the explicit `PhantomData<*mut ()>`), so it cannot have moved
         // to a different thread.
         if !self.m.is_null() {
-            unsafe { (*self.m).locks -= 1 };
+            unsafe {
+                (*self.m).locks.fetch_sub(1, std::sync::atomic::Ordering::Relaxed)
+            };
         }
     }
 }
@@ -509,62 +520,69 @@ impl Drop for MLockGuard {
 ///
 /// ## Async-preemption safety — the `m.locks` 0→1 transition (residual #4)
 ///
-/// `(*m).locks += 1` is a non-atomic read-modify-write that is NOT yet
-/// protected by its own counter: it reads `current_m()` into `m`, then stores
-/// `m.locks + 1`.  While `m.locks` is still 0, `sigurg_handler`'s Guard 0
+/// Acquiring the pin is a read-modify-write: read `current_m()` into `m`, then
+/// bump `m.locks`.  While `m.locks` is still 0, `sigurg_handler`'s Guard 0
 /// (`m.locks > 0`) does not suppress async preemption.  If `SIGURG` lands
-/// anywhere between reading `m` and the store, `preemptm` can reschedule this
-/// goroutine onto a *different* M before the store executes; on resume the
-/// cached `m` value still names the *old* M, so the increment lands there.
-/// The critical section then runs on the new M with `locks == 0` (Guard 0
-/// fails to suppress preemption → the lock's invariant is violated and the
-/// scheduler state it protects is corrupted), while the old M's counter is
-/// mutated cross-thread (it is documented single-writer).  This was the
-/// residual intermittent `many_goroutines` debug-build corruption — confirmed
-/// by a migration detector that fired exactly here.
+/// between reading `m` and the bump, `preemptm` can reschedule this goroutine
+/// onto a *different* M before the bump executes; on resume the cached `m`
+/// still names the *old* M, so a naive bump would land there — the critical
+/// section then runs on the new M with `locks == 0` (no Guard-0 protection)
+/// while the old M's counter is mutated cross-thread.  This was the residual
+/// intermittent `many_goroutines` debug-build corruption (#4), confirmed by a
+/// migration detector that fired exactly here.
 ///
 /// PC-based skipping (the technique Go uses via pcdata, and this port uses for
 /// its asm trampolines in `pc_in_scheduler_asm`) cannot close this window on
-/// stable Rust: the `thread_local!` read dispatches through libstd's
-/// `LocalKey` glue, whose PC lies in our own text but outside any bounded
-/// range we can name.  Instead we block `SIGURG` at the kernel level for the
-/// duration of the bump, which needs no thread-local read to take effect and
-/// has no race of its own.  A `SIGURG` that arrives while blocked is held
-/// pending and delivered on unblock, by which point `locks > 0` and Guard 0
-/// makes the handler skip — so no preemption is lost, merely deferred.
-/// `#[inline(never)]` keeps the body (and the matching restore) in one place.
+/// stable Rust: the `thread_local!` read dispatches through libstd's `LocalKey`
+/// glue (on macOS a real indirect `callq` into `tlv_get_addr`), whose PC lies
+/// outside any bounded range we can name.  An earlier fix blocked `SIGURG` at
+/// the kernel level around the bump — correct, but two `pthread_sigmask`
+/// syscalls per pin (~2.3 µs on macOS), and the pin sits on the channel-park,
+/// mutex, cond and goready paths.
+///
+/// We now close the window with an **optimistic re-validating pin** instead,
+/// at zero syscall cost:
+///
+/// 1. read `m1 = current_m()`;
+/// 2. `m1.locks.fetch_add(1)` (atomic — see the field doc);
+/// 3. re-read `current_m()`.  If it still equals `m1`, no migration happened
+///    in the window and we are correctly pinned: `current_m() == m1` means we
+///    are on `m1`'s own OS thread (each thread keeps its M for life — M
+///    descriptors are immortal and never reused, so there is no ABA) and
+///    `m1.locks` is now > 0, so Guard 0 protects the rest of the section.
+/// 4. otherwise a `SIGURG` migrated us mid-pin: the `fetch_add` landed on the
+///    stale `m1` cross-thread (benign — at most one skipped best-effort
+///    preemption on `m1`, and atomic so race-free).  Undo it with
+///    `fetch_sub(m1)` and retry on the new M.
+///
+/// Async preemption is rate-limited (sysmon retake cadence), so the retry is
+/// taken at most about once in the worst case; the common path is one TLS read,
+/// one atomic add, one TLS read.  `#[inline(never)]` keeps the body in one
+/// place; unlike the old design it is NOT load-bearing for correctness — the
+/// re-validation, not any PC range, closes the window, so `m_lock` is no longer
+/// listed in `pc_in_scheduler_asm`.
 #[inline(never)]
 pub(crate) fn m_lock() -> MLockGuard {
-    // Block SIGURG so async preemption cannot fire — and thus cannot migrate
-    // this goroutine to another M — between the `current_m()` read and the
-    // `m.locks += 1` store below.  See the doc-comment above.
-    #[cfg(not(windows))]
-    let oldset = unsafe {
-        let mut block: libc::sigset_t = std::mem::zeroed();
-        libc::sigemptyset(&mut block);
-        libc::sigaddset(&mut block, libc::SIGURG);
-        let mut old: libc::sigset_t = std::mem::zeroed();
-        libc::pthread_sigmask(libc::SIG_BLOCK, &block, &mut old);
-        old
-    };
-
-    let m = current_m();
-    if !m.is_null() {
-        // SAFETY: `m` belongs to the current OS thread; no other thread reads
-        // or writes the `locks` field.  See the field's doc-comment.  SIGURG
-        // is blocked here, so the goroutine cannot migrate between the read of
-        // `m` and this store.
-        unsafe { (*m).locks += 1 };
+    use std::sync::atomic::Ordering::Relaxed;
+    loop {
+        let m = current_m();
+        if m.is_null() {
+            // No M yet (e.g. main thread before schedinit): nothing to pin.
+            return MLockGuard { m, _not_send: std::marker::PhantomData };
+        }
+        // SAFETY: `m` is a valid, immortal M pointer.  The `fetch_add` is
+        // atomic, so it is sound even if a mid-pin migration makes this land on
+        // the wrong (stale) M's `locks` — see the field and the steps above.
+        unsafe { (*m).locks.fetch_add(1, Relaxed) };
+        if current_m() == m {
+            // No migration occurred between the two reads: we are pinned to our
+            // own M with `locks > 0`.  Guard 0 now protects the section.
+            return MLockGuard { m, _not_send: std::marker::PhantomData };
+        }
+        // A SIGURG migrated us to a different M after the read but the bump
+        // landed on the old M.  Undo it (atomic, race-free) and retry.
+        unsafe { (*m).locks.fetch_sub(1, Relaxed) };
     }
-
-    // Restore the previous signal mask.  `locks` is now > 0 (if we had an M),
-    // so Guard 0 suppresses preemption for the rest of the critical section;
-    // any SIGURG that was held pending fires here and is skipped.
-    #[cfg(not(windows))]
-    unsafe {
-        libc::pthread_sigmask(libc::SIG_SETMASK, &oldset, std::ptr::null_mut());
-    }
-    MLockGuard { m, _not_send: std::marker::PhantomData }
 }
 
 // ---------------------------------------------------------------------------
