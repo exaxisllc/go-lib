@@ -132,17 +132,13 @@ fn sysmon_loop(rt_addr: usize) {
         // Use a non-blocking poll here (0 ms timeout); sysmon must not block
         // indefinitely or it will miss retake/preempt duties.
         //
-        // RCU read-side covers the netpoll result vector (which holds
-        // `*mut G` pointers loaded from REG) through the goready calls.
-        // Pairs with the run_impl Phase 2b drainer's `DrainSync`.
+        // No drain synchronisation: the harvested entries are `*mut G`
+        // descriptors, which are immortal (`gfree_put` leaks them), and we wake
+        // each one purely via `goready`, which never touches the goroutine's
+        // stack.  A goroutine drained by a concurrent Phase 2b pass is GDEAD by
+        // the time we `goready` it, and `goready`'s GDEAD arm drops it without
+        // dereferencing its stack or rescheduling it.
         {
-            // The guard must be acquired BEFORE netpoll_wait: the harvest
-            // consumes each fd's REG entry, so once an event is popped the
-            // owning Rt's `netpoll_clear_reg` can no longer see it.  If the
-            // guard came after the harvest, a run_impl Phase 2b drain could
-            // slip in between, free the harvested `Box<G>` pointers, and we
-            // would wake freed (possibly recycled) goroutines.
-            let _cs = super::rcu::RcuGuard::new();
             let ready = unsafe { super::netpoll::netpoll_wait(0) };
             if !ready.is_empty() {
                 idle = 0;
