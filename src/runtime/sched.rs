@@ -411,27 +411,39 @@ pub(crate) unsafe fn findrunnable() -> Option<*mut G> {
             }
         }
 
-        // ── 3. Work-steal from a random P ─────────────────────────────────
+        // ── 3. Work-steal from every other P ──────────────────────────────
+        // Four passes over *all* Ps (in a per-M rotated order), stealing the
+        // victim's `runnext` only on the final pass.  Covering every P — not a
+        // fixed sample of four — is load-bearing at low GOMAXPROCS: a goroutine
+        // woken via `goready` lands in its waker's P `runnext`, and if that
+        // waker then monopolises its P (e.g. a long CPU-bound goroutine with
+        // async preemption off) the only way the G ever runs is for another M
+        // to steal it.  Stealing `runnext` solely on the last pass mirrors Go
+        // and avoids tugging a G away from a P that is about to run it.  See
+        // issue #5: the old fixed 4-victim sample could omit the P holding the
+        // stranded `runnext`, livelocking after `stopm`'s re-check kept us awake.
         {
             let inner = sc.inner.lock().unwrap();
-            let allp  = &inner.allp;
-            let np    = allp.len();
+            let np    = inner.allp.len();
             if np > 1 && !p.is_null() {
                 let start = (unsafe { (*m).id as usize }).wrapping_mul(0x9e3779b9) % np;
-                let victim_ptrs: Vec<*mut P> = (0..4)
-                    .map(|i| allp[(start.wrapping_add(i)) % np])
+                let victim_ptrs: Vec<*mut P> = (0..np)
+                    .map(|i| inner.allp[(start.wrapping_add(i)) % np])
                     .collect();
                 drop(inner);
 
-                for (i, victim_ptr) in victim_ptrs.iter().enumerate() {
-                    if *victim_ptr == p {
-                        continue;
-                    }
-                    let stolen = unsafe {
-                        (*p).runqsteal(&**victim_ptr, i == 3)
-                    };
-                    if !stolen.is_null() {
-                        return Some(stolen);
+                for pass in 0..4 {
+                    let steal_run_next = pass == 3;
+                    for &victim_ptr in &victim_ptrs {
+                        if victim_ptr == p || victim_ptr.is_null() {
+                            continue;
+                        }
+                        let stolen = unsafe {
+                            (*p).runqsteal(&*victim_ptr, steal_run_next)
+                        };
+                        if !stolen.is_null() {
+                            return Some(stolen);
+                        }
                     }
                 }
             }
@@ -491,12 +503,19 @@ pub(crate) unsafe fn findrunnable() -> Option<*mut G> {
 /// sysmon threads can hit this race.
 ///
 /// The fix matches Go's `stopm` / `mPark` pattern: after adding M to the
-/// idle list (still under `inner.lock`), re-check the global queue.  If
-/// work appeared, pop ourselves back out of idle_m, take a P, and return
-/// without parking.  Holding `inner.lock` across the re-check serialises
-/// us with any concurrent `startm`, which also takes `inner.lock` and
-/// pops idle_m there — if work was queued after our park, `startm` is
-/// guaranteed to find us on idle_m.
+/// idle list (still under `inner.lock`), re-check the run queues.  If work
+/// appeared, pop ourselves back out of idle_m, take a P, and return without
+/// parking.  Holding `inner.lock` across the re-check serialises us with any
+/// concurrent `startm`, which also takes `inner.lock` and pops idle_m there —
+/// if work was queued after our park, `startm` is guaranteed to find us on
+/// idle_m.
+///
+/// The re-check must cover **every** P's local run queue, not just the global
+/// one: a `goready` running on an M-with-P enqueues onto its *local* P (via
+/// `runqput(.., next=true)`) before calling `startm`, so a wake dropped by
+/// `startm` (no idle M yet) leaves the G on a local queue.  Re-checking only
+/// the global queue missed that and stranded the G with every M asleep —
+/// issue #5.  See the scan in the body for the full happens-before argument.
 ///
 /// Ported from `stopm` in `runtime/proc.go`.
 unsafe fn stopm() {
@@ -536,27 +555,61 @@ unsafe fn stopm() {
             inner.nmidle  += 1;
         }
 
-        // ── Re-check global queue (lost-wakeup avoidance) ─────────────────
-        // Still holding `inner.lock`.  If goready raced with our queue check
-        // and pushed work between findrunnable and here, we would otherwise
-        // park forever.
-        if sc.global_run_q.len() > 0 {
-            // Pop ourselves back off idle_m, reclaim a P, and return.
-            unsafe {
-                inner.idle_m  = (*m).schedlink;
-                (*m).schedlink = ptr::null_mut();
-                inner.nmidle -= 1;
-            }
+        // ── Re-check ALL run queues (lost-wakeup avoidance) ───────────────
+        // Still holding `inner.lock`.  If a `goready` raced with our queue
+        // checks and enqueued work between `findrunnable` and here, we would
+        // otherwise park forever.
+        //
+        // It is NOT enough to re-check only the global queue.  `goready`, when
+        // called from an M that owns a P, does `runqput(gp, next=true)` onto
+        // that M's *local* P and then `startm(null)`.  If that `startm` runs in
+        // the narrow window *before* we add ourselves to `idle_m` (above), it
+        // finds no idle M and drops the wake — and the woken G is sitting on a
+        // local run queue the old global-only re-check never inspected.  With a
+        // low `GOMAXPROCS` and async preemption off, the P's owner can stay on a
+        // long CPU-bound goroutine and nobody steals the G, so it strands while
+        // every other M sleeps here (issue #5).  Scanning every P closes it.
+        //
+        // The scan is race-free against a concurrent `runqput` *because* of the
+        // `inner.lock` handoff: any `goready` that enqueues work also calls
+        // `startm`, which must take `inner.lock`.  Either that `startm` acquired
+        // the lock before us — in which case the release→acquire edge makes its
+        // prior `runqput` visible to this scan — or it acquires the lock after
+        // us, by which point we are already on `idle_m` and `startm` will wake
+        // us.  One of the two always holds, so no wake is lost.
+        let global_work = sc.global_run_q.len() > 0;
+        let local_work  = inner.allp.iter().any(|&p| {
+            !p.is_null() && unsafe { (*p).runq_size() } > 0
+        });
+        if global_work || local_work {
+            // Try to reclaim a P so the resumed `findrunnable` can actually
+            // act on the work: local work must be *stolen* (needs a P); global
+            // work can be popped P-lessly, so bail on it even without a P.
+            let mut p2 = ptr::null_mut();
             if !inner.idle_p.is_null() {
-                let p2 = inner.idle_p;
+                p2 = inner.idle_p;
                 unsafe {
                     inner.idle_p = (*p2).link;
                     (*p2).link   = ptr::null_mut();
-                    (*p2).status.store(PRUNNING, Release);
-                    (*m).p = p2;
                 }
             }
-            return;
+            if !p2.is_null() || global_work {
+                // Pop ourselves back off idle_m and return to findrunnable.
+                unsafe {
+                    inner.idle_m  = (*m).schedlink;
+                    (*m).schedlink = ptr::null_mut();
+                    inner.nmidle -= 1;
+                }
+                if !p2.is_null() {
+                    unsafe {
+                        (*p2).status.store(PRUNNING, Release);
+                        (*m).p = p2;
+                    }
+                }
+                return;
+            }
+            // Local work only and no idle P to steal it with: leave it for the
+            // owning P's M to run, put the (null) P back, and park normally.
         }
 
         // ── Second shutdown check (still under lock) ──────────────────────
