@@ -131,10 +131,8 @@ impl WaitGroup {
         // same-thread re-lock blocks forever in `__psynch_mutexwait`).
         // Captured live via lldb on a hung `many_goroutines` run.
         let _lk = crate::runtime::m::m_lock();
-        // No drain synchronisation: WaitGroup waiters are woken only via
-        // `goready`, which dereferences only the immortal `G` descriptor and
-        // never the waiter's stack.  A concurrent Phase 2b drain that CAS'd a
-        // waiter to GDEAD is handled by `goready`'s GDEAD arm.
+        // WaitGroup waiters are woken only via `goready`, which dereferences
+        // only the `G` descriptor and never the waiter's stack.
         // Collect goroutine waiters to wake (if counter reaches zero).
         let goroutine_waiters: Vec<*mut G> = {
             self.mu.lock();
@@ -162,10 +160,6 @@ impl WaitGroup {
         // Wake goroutine waiters outside the lock so we don't hold it during
         // the goready spin (which waits for GRUNNING → GWAITING).
         for gp in goroutine_waiters {
-            // Phase 2b: clear the gp.waiting_wg tag — once the goready fires,
-            // gp is no longer registered in our waiters list.  The Phase 2b
-            // drain will skip gps whose tag has been cleared.
-            unsafe { (*gp).waiting_wg = std::ptr::null_mut() };
             unsafe { goready(gp) };
         }
     }
@@ -212,11 +206,6 @@ impl WaitGroup {
             // a window where preemption made us GRUNNABLE and add()'s wake
             // was silently dropped — the waiter then parked forever.
             state.waiters.push(gp);
-            // Phase 2b: tag gp with the WaitGroup it is parked on so the
-            // run_impl drain can remove the stale `*mut G` from
-            // `state.waiters` if gp is reclaimed while parked.  Cleared by
-            // `add()` when it wakes us, and below as a defensive measure.
-            unsafe { (*gp).waiting_wg = self as *const WaitGroup as *mut u8 };
             // Transfer the m.locks increment to park_fn.
             std::mem::forget(_lk);
             unsafe {
@@ -226,11 +215,6 @@ impl WaitGroup {
                     &self.mu as *const RawMutex as *mut u8,
                 );
             }
-            // Phase 2b: clear the tag now that we have been woken.  (The
-            // waker — `add()` above — clears it too; doing it here as well is
-            // defensive against a future code path that wakes without going
-            // through add()).
-            unsafe { (*gp).waiting_wg = std::ptr::null_mut() };
             return;
         }
 

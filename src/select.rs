@@ -149,11 +149,6 @@ pub struct SCase {
     /// Remove `sg` from the channel's sendq or recvq (under the lock).
     /// No-op if `sg` was already removed by a racing channel operation.
     pub(crate) dequeue_fn: unsafe fn(*const (), *mut Sudog),
-
-    /// Phase 2b unlink function — stored into `Sudog.unlink_for_drain` so
-    /// the drain can remove this sudog from the channel without knowing `T`.
-    pub(crate) unlink_for_drain_fn:
-        Option<unsafe extern "C" fn(*mut u8, *mut Sudog) -> bool>,
 }
 
 // SAFETY: SCase is always used within a single goroutine context; the raw
@@ -194,9 +189,9 @@ impl Lehmer {
 /// by a parked `selectgo`, from g0, after the goroutine is `GWAITING`.
 ///
 /// Lives on the selecting goroutine's stack across the park.  That stack stays
-/// mapped while the goroutine is `GWAITING` (and, in the dead-invocation reap
-/// path, until `park_fn` finishes and releases the locks here), so the raw
-/// pointers remain valid for the single shim call.
+/// mapped while the goroutine is `GWAITING` (and until `park_fn` finishes and
+/// releases the locks here), so the raw pointers remain valid for the single
+/// shim call.
 struct SelectParkCtx {
     /// `cases.as_ptr()` — the select's case slice base.
     cases:     *const SCase,
@@ -277,12 +272,12 @@ pub fn selectgo(cases: &mut [SCase], has_default: bool) -> (usize, bool) {
     // `try_fn` dequeues a peer's sudog and reads/writes its `elem` (which, for
     // a select peer, points into that peer's `selectgo` stack frame) entirely
     // under the channel locks acquired in step 3.  Those locks are not
-    // released until the `unlock_fn` loop below, *after* the elem access — so
-    // a concurrent Phase 2b drain's `unregister_drained_g`, which unlinks the
-    // peer's sudog under the same channel lock before any `stack_free`, cannot
-    // munmap the peer's stack while we hold the lock (see the happens-before
-    // proof on `unregister_drained_g`).  The G descriptor is immortal, so the
-    // `gp` we hand to `goready` is always valid.
+    // released until the `unlock_fn` loop below, *after* the elem access — and
+    // the peer cannot resume and unwind that `selectgo` frame until it dequeues
+    // its own sudog, which needs the same channel lock.  So the peer's stack
+    // stays valid while we hold the lock.  The G descriptor is reused via the
+    // gFree pool (never freed while parked), so the `gp` we hand to `goready`
+    // is always valid.
     for &i in &pollorder {
         let result = unsafe { (cases[i].try_fn)(cases[i].chan_ptr, cases[i].elem) };
         match result {
@@ -334,14 +329,9 @@ pub fn selectgo(cases: &mut [SCase], has_default: bool) -> (usize, bool) {
             (*sg).is_select = true;
             (*sg).success   = false;
             (*sg).c         = case.chan_ptr as *mut u8;
-            (*sg).unlink_for_drain = case.unlink_for_drain_fn;
         }
         case.sg = sg;
         unsafe { (case.enqueue_fn)(case.chan_ptr, sg) };
-        // Phase 2b: link the sudog into gp's waiting list so the drain can
-        // unregister it from this case's channel if the goroutine is
-        // reclaimed while parked in `gopark(Select)` below.
-        unsafe { crate::runtime::g::push_waiting_sudog(gp, sg) };
     }
 
     // Reset selectdone so this goroutine can be claimed by exactly one case.
@@ -417,9 +407,6 @@ pub fn selectgo(cases: &mut [SCase], has_default: bool) -> (usize, bool) {
         let sg = case.sg;
         case.sg = ptr::null_mut();
         unsafe {
-            // Phase 2b: unlink the sudog from gp's waiting list now that
-            // the select has resolved.
-            crate::runtime::g::remove_waiting_sudog(gp, sg);
             (*sg).g    = ptr::null_mut();
             (*sg).elem = ptr::null_mut();
             (*sg).c    = ptr::null_mut();
@@ -580,7 +567,6 @@ pub fn recv_case_of<T: Send + 'static>(rx: &Receiver<T>, slot: *mut Option<T>) -
         try_fn:      try_recv_chan::<T>,
         enqueue_fn:  enqueue_recv_chan::<T>,
         dequeue_fn:  dequeue_recv_chan::<T>,
-        unlink_for_drain_fn: Some(crate::chan::unlink_sudog_for_drain::<T>),
     }
 }
 
@@ -603,7 +589,6 @@ pub fn send_case_of<T: Send + 'static>(tx: &Sender<T>, val: *mut ManuallyDrop<T>
         try_fn:      try_send_chan::<T>,
         enqueue_fn:  enqueue_send_chan::<T>,
         dequeue_fn:  dequeue_send_chan::<T>,
-        unlink_for_drain_fn: Some(crate::chan::unlink_sudog_for_drain::<T>),
     }
 }
 
@@ -739,7 +724,6 @@ mod tests {
             try_fn:    try_send_i32,
             enqueue_fn: enqueue_send_i32,
             dequeue_fn: dequeue_send_sg_i32,
-            unlink_for_drain_fn: Some(crate::chan::unlink_sudog_for_drain::<i32>),
         }
     }
 
@@ -754,7 +738,6 @@ mod tests {
             try_fn:    try_recv_i32,
             enqueue_fn: enqueue_recv_i32,
             dequeue_fn: dequeue_recv_sg_i32,
-            unlink_for_drain_fn: Some(crate::chan::unlink_sudog_for_drain::<i32>),
         }
     }
 

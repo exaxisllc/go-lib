@@ -100,13 +100,14 @@ impl<T> HchanState<T> {
 /// The `mutex` field is first so that `Arc::as_ptr(h) as *const RawMutex` gives
 /// a stable address suitable for address-ordered lock acquisition in `selectgo`.
 ///
-/// `#[repr(C)]` is **load-bearing**: the Phase 2b drain locks a channel via
-/// `Sudog.c as *const RawMutex`, i.e. it assumes `mutex` lives at offset 0.
-/// Without `repr(C)`, Rust's default layout reorders fields by alignment and
-/// puts the (8-aligned) `state` at offset 0 and the 1-byte `mutex` at the end —
-/// so the drain would spin on bytes inside `state.buf` instead of the real
-/// lock, never excluding live channel operations and corrupting the wait queues
-/// (observed as `stress_drain_select` SIGSEGV/SIGBUS and lost-wakeup hangs).
+/// `#[repr(C)]` is **load-bearing**: `selectgo` locks a channel via
+/// `Arc::as_ptr(h) as *const RawMutex`, i.e. it assumes `mutex` lives at
+/// offset 0.  Without `repr(C)`, Rust's default layout reorders fields by
+/// alignment and puts the (8-aligned) `state` at offset 0 and the 1-byte
+/// `mutex` at the end — so `selectgo` would spin on bytes inside `state.buf`
+/// instead of the real lock, never excluding live channel operations and
+/// corrupting the wait queues (observed as SIGSEGV/SIGBUS and lost-wakeup
+/// hangs under select stress).
 #[repr(C)]
 pub(crate) struct Hchan<T> {
     /// Raw adaptive spinlock protecting `state`.
@@ -120,74 +121,6 @@ pub(crate) struct Hchan<T> {
 
 unsafe impl<T: Send> Send for Hchan<T> {}
 unsafe impl<T: Send> Sync for Hchan<T> {}
-
-/// Phase 2b drain helper: remove `sudog` from whichever waitq of
-/// `channel: *mut Hchan<T>` it currently lives in.  The drain knows nothing
-/// about `T`; it calls this function via the type-erased pointer stored in
-/// `Sudog.unlink_for_drain` and the channel pointer stored in `Sudog.c`.
-///
-/// The function is `extern "C"` so its address can be safely cast to/from
-/// `unsafe extern "C" fn(*mut u8, *mut crate::runtime::sudog::Sudog)`.
-///
-/// # Safety
-/// * `channel` must point at a `Hchan<T>` whose channel mutex is held by the
-///   caller (the Phase 2b drainer locks it via `Sudog.c as *const RawMutex`).
-/// * `sudog` must be a `*mut Sudog` originally enqueued in this channel.
-/// Returns `true` if `sudog` was actually removed from one of this channel's
-/// wait queues (i.e. it was still enqueued).  The Phase 2b drain uses this to
-/// decide payload-box ownership: only the party that removes the sudog from
-/// the queue owns — and frees — its `elem` box.  A `false` return means a live
-/// peer already dequeued (and now owns) the sudog, so the drain must not touch
-/// its box.
-pub(crate) unsafe extern "C" fn unlink_sudog_for_drain<T: Send + 'static>(
-    channel: *mut u8,
-    sudog:   *mut crate::runtime::sudog::Sudog,
-) -> bool {
-    let hchan = channel as *const Hchan<T>;
-    // SAFETY: caller holds the channel lock; we read state behind the
-    // UnsafeCell, mutating the waitqs.
-    let state = unsafe { &mut *(*hchan).state.get() };
-    // `dequeue_sudog` is idempotent — no-op if the sudog isn't in the queue.
-    let removed_send = unsafe { state.sendq.dequeue_sudog(sudog) };
-    let removed_recv = unsafe { state.recvq.dequeue_sudog(sudog) };
-    removed_send || removed_recv
-}
-
-/// Phase 2b drain helper: drop the payload allocated by `chansend`'s blocking
-/// path (a `Box<ManuallyDrop<T>>` holding the value being sent).  Runs `T`'s
-/// destructor and frees the Box.
-///
-/// # Safety
-/// `elem` must be `Box::into_raw(Box::new(ManuallyDrop::new(t)))` where the
-/// `T` has not yet been consumed by a receiver (i.e. the send sudog was
-/// never woken successfully).
-pub(crate) unsafe extern "C" fn drop_send_elem_for_drain<T: Send + 'static>(
-    elem: *mut u8,
-) {
-    let ep = elem as *mut ManuallyDrop<T>;
-    unsafe {
-        // Run T's destructor on the value that the receiver never picked up.
-        ManuallyDrop::drop(&mut *ep);
-        // Release the Box allocation.
-        let _ = Box::from_raw(ep);
-    }
-}
-
-/// Phase 2b drain helper: drop the payload allocated by `chanrecv`'s
-/// blocking path (a `Box<Option<T>>` for the receive slot).
-///
-/// `Option<T>`'s Drop runs `Some(T)`'s destructor if a sender had written to
-/// the slot before the goroutine was reclaimed (rare — usually still `None`).
-///
-/// # Safety
-/// `elem` must be `Box::into_raw(Box::new(None::<T>))` from `chanrecv`.
-pub(crate) unsafe extern "C" fn drop_recv_elem_for_drain<T: Send + 'static>(
-    elem: *mut u8,
-) {
-    let ep = elem as *mut Option<T>;
-    // Box::from_raw + drop runs Option<T>::drop (which drops T if Some).
-    unsafe { let _ = Box::from_raw(ep); };
-}
 
 impl<T> Hchan<T> {
     pub(crate) fn new(cap: usize) -> Self {
@@ -321,13 +254,11 @@ pub(crate) unsafe fn chansend<T: Send + 'static>(
     if !recv_sg.is_null() {
         // We hold the channel lock across the dequeue, the `*elem_ptr` write
         // (which, for a select receiver, lands in that goroutine's `selectgo`
-        // stack frame), and `goready`.  That lock is the synchronisation point
-        // against a concurrent Phase 2b drain: `unregister_drained_g` unlinks
-        // this sudog under the *same* channel lock before any `stack_free`, so
-        // the drain can never munmap the receiver's stack while we are writing
-        // into it (see the happens-before proof on `unregister_drained_g`).
-        // The G descriptor itself is immortal (`gfree_put` leaks it), so the
-        // `(*gp)` dereferences below are always safe.
+        // stack frame), and `goready`.  The receiver cannot resume and unwind
+        // that frame until it dequeues its own sudog, which needs this same
+        // channel lock — so the stack we write into stays valid for the write.
+        // The G descriptor itself is reused via the gFree pool (never freed
+        // while parked), so the `(*gp)` dereferences below are always safe.
         let gp       = unsafe { (*recv_sg).g };
         // recv_sg.elem points to Option<T> (allocated by chanrecv or selectgo).
         let elem_ptr = unsafe { (*recv_sg).elem as *mut Option<T> };
@@ -368,13 +299,8 @@ pub(crate) unsafe fn chansend<T: Send + 'static>(
         (*s).boxed_elem = true; // Box<ManuallyDrop<T>> — must be freed by receiver
         (*s).success    = false;
         (*s).c          = Arc::as_ptr(c) as *mut u8;
-        (*s).unlink_for_drain    = Some(unlink_sudog_for_drain::<T>);
-        (*s).drop_elem_for_drain = Some(drop_send_elem_for_drain::<T>);
         (*gp).param     = ptr::null_mut();
         state.sendq.enqueue(s);
-        // Phase 2b: link the sudog into gp's waiting-sudog list so the drain
-        // can find it if this goroutine is reclaimed while parked.
-        crate::runtime::g::push_waiting_sudog(gp, s);
     }
 
     // Commit-park protocol: keep the channel lock held until park_fn has
@@ -399,9 +325,6 @@ pub(crate) unsafe fn chansend<T: Send + 'static>(
             ManuallyDrop::drop(&mut *ep); // run T's destructor
             if (*s2).boxed_elem { let _ = Box::from_raw(ep); }
         }
-        // Phase 2b: unlink the sudog from gp's waiting list now that the
-        // wake has consumed it.  Idempotent under racing drain.
-        crate::runtime::g::remove_waiting_sudog(gp, s2);
         (*s2).g = ptr::null_mut();
         (*s2).c = ptr::null_mut();
         release_sudog(s2);
@@ -473,13 +396,8 @@ pub(crate) unsafe fn chanrecv<T: Send + 'static>(
         (*s).boxed_elem = true; // Box<Option<T>> — must be freed on wakeup
         (*s).success    = false;
         (*s).c          = Arc::as_ptr(c) as *mut u8;
-        (*s).unlink_for_drain    = Some(unlink_sudog_for_drain::<T>);
-        (*s).drop_elem_for_drain = Some(drop_recv_elem_for_drain::<T>);
         (*gp).param     = ptr::null_mut();
         state.recvq.enqueue(s);
-        // Phase 2b: link the sudog into gp's waiting-sudog list (see chansend
-        // for rationale).
-        crate::runtime::g::push_waiting_sudog(gp, s);
     }
 
     // Commit-park protocol — see chansend for the lost-wakeup rationale.
@@ -519,8 +437,6 @@ pub(crate) unsafe fn chanrecv<T: Send + 'static>(
             None
         };
 
-        // Phase 2b: unlink the sudog from gp's waiting list.
-        crate::runtime::g::remove_waiting_sudog(gp, s2);
         (*s2).g = ptr::null_mut();
         (*s2).c = ptr::null_mut();
         release_sudog(s2);
@@ -589,10 +505,10 @@ fn recv_from_sender<T: Send + 'static>(
     // The caller holds the channel lock across the dequeue of `send_sg`, the
     // `ptr::read` of `send_sg.elem` below (which, for a select sender, reads
     // out of that goroutine's `selectgo` stack frame), and `goready`.  The
-    // channel lock serialises this against a Phase 2b drain's
-    // `unregister_drained_g`, which unlinks the sudog under the same lock
-    // before any `stack_free` — so the sender's stack cannot be munmapped out
-    // from under this read.  The G descriptor is immortal, so `(*gp)` is safe.
+    // sender cannot resume and unwind that frame until it dequeues its own
+    // sudog, which needs this same channel lock — so the sender's stack stays
+    // valid for this read.  The G descriptor is reused via the gFree pool
+    // (never freed while parked), so `(*gp)` is safe.
     let gp = unsafe { (*send_sg).g };
 
     let boxed = unsafe { (*send_sg).boxed_elem };
@@ -653,10 +569,10 @@ pub(crate) unsafe fn closechan<T: Send + 'static>(c: &Arc<Hchan<T>>) {
     state.closed = true;
 
     // `closechan` never touches any waiter's stack: it only writes `success`
-    // and `param`, both fields of the immortal `Sudog`/`G` descriptors, and
-    // then `goready`s each waiter (which dereferences only the immortal G).
-    // There is therefore no stack-reclamation hazard here and no
-    // synchronisation against the Phase 2b drain is needed.
+    // and `param`, both fields of the `Sudog`/`G` descriptors, and then
+    // `goready`s each waiter (which dereferences only the `G`).  Those
+    // descriptors stay live while the waiter is parked, so there is no
+    // stack-reclamation hazard here.
     let mut wakeup: Vec<*mut crate::runtime::g::G> = Vec::new();
 
     loop {

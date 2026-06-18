@@ -185,13 +185,12 @@ unsafe extern "C" fn park_fn(gp: *mut G) {
 ///
 /// Ported from `goready` in `runtime/proc.go`.
 pub(crate) unsafe fn goready(gp: *mut G) {
-    // `goready` dereferences only the immortal `G` descriptor — its
-    // `atomicstatus` (spin loop + CAS), `param`, and `schedlink` — never the
-    // goroutine's stack.  Because `gfree_put` leaks the descriptor, every one
-    // of those dereferences is unconditionally safe even if a concurrent
-    // Phase 2b drain has CAS'd this G to GDEAD and freed its stack (the GDEAD
-    // arm below handles that case and returns without scheduling).  No
-    // reader/drainer synchronisation is required here.
+    // `goready` dereferences only the `G` descriptor — its `atomicstatus`
+    // (spin loop + CAS), `param`, and `schedlink` — never the goroutine's
+    // stack.  The descriptor stays live while the goroutine is parked, so
+    // those dereferences are safe; a descriptor that has already exited shows
+    // up as GDEAD and is handled by the GDEAD arm below (return without
+    // scheduling).
 
     // Spin until the goroutine finishes its in-flight status transition.
     // The only wakeable state is GWAITING.
@@ -211,14 +210,12 @@ pub(crate) unsafe fn goready(gp: *mut G) {
     loop {
         let s = unsafe { readgstatus(gp) };
         if s == GWAITING {
-            // GWAITING / GPREEMPTED → GRUNNABLE.  Use a single
-            // compare_exchange rather than `casgstatus` (which retries until
-            // it wins): between our status read and the CAS, the run_impl
-            // Phase 2b drain can CAS GWAITING → GDEAD.  `casgstatus` would
-            // then spin forever waiting for GWAITING to come back — while
-            // holding the RcuGuard, which blocks the drainer's DrainSync and
-            // deadlocks the whole process.  On CAS failure simply re-inspect
-            // the status; the GDEAD/GRUNNABLE arms below handle the rest.
+            // GWAITING → GRUNNABLE.  Use a single compare_exchange rather than
+            // `casgstatus` (which retries until it wins): the goroutine's
+            // status can change underneath us between the read and the CAS
+            // (e.g. another concurrent waker, or the goroutine itself settling
+            // a transient transition).  On CAS failure simply re-inspect the
+            // status; the GDEAD/GRUNNABLE arms below handle the rest.
             let won = unsafe {
                 (*gp).atomicstatus
                     .compare_exchange(s, GRUNNABLE, std::sync::atomic::Ordering::AcqRel,
@@ -245,9 +242,9 @@ pub(crate) unsafe fn goready(gp: *mut G) {
             // will run without further intervention.
             return;
         }
-        // GDEAD — the goroutine was cancelled by the run_impl shutdown drain
-        // (GWAITING → GDEAD CAS) before this goready call arrived.  Nothing
-        // to schedule; return without touching the G further.
+        // GDEAD — the descriptor has already exited (and may have been
+        // recycled via the gFree pool) before this goready call arrived.
+        // Nothing to schedule; return without touching the G further.
         use super::g::GDEAD;
         if s == GDEAD {
             return;
