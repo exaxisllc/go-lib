@@ -327,7 +327,25 @@ pub(crate) unsafe fn reap_if_dead_invocation(gp: *mut G) -> bool {
 /// Going `GRUNNING → GDEAD` directly means no waker can ever claim the G
 /// (`goready`'s status loop returns on GDEAD), and ownership never leaves
 /// this M until the G is safely in the graveyard.
-pub(crate) unsafe fn reap_parking_if_dead(gp: *mut G) -> bool {
+///
+/// `unlock_fn`/`unlock_arg` are the parking goroutine's commit-park lock
+/// release (see [`gopark_commit`]).  A `selectgo`/`chansend`/`chanrecv` parks
+/// while **still holding** its channel lock(s) — they are released, from g0, by
+/// `unlock_fn` only after the park commits.  When we reap such a goroutine we
+/// MUST release those locks here, *after* the `GRUNNING → GDEAD` transition but
+/// *before* [`unregister_drained_g`], because `unregister_drained_g` re-acquires
+/// each channel's lock to unlink the sudogs — and `RawMutex` is non-reentrant,
+/// so re-locking a lock this goroutine already holds spins forever (a
+/// self-deadlock that surfaced as a 100%-hang in `stress_drain_select` once the
+/// drain started taking the *real* channel lock).  Releasing before the unlink
+/// is safe: the G is already GDEAD (any peer that now dequeues a sudog and
+/// `goready`s it is a no-op), and the channel lock still serialises that peer's
+/// select-slot stack access against the unlink + later stack free.
+pub(crate) unsafe fn reap_parking_if_dead(
+    gp:         *mut G,
+    unlock_fn:  Option<unsafe fn(*mut u8)>,
+    unlock_arg: *mut u8,
+) -> bool {
     let inv = unsafe { (*gp).inv };
     if inv.is_null() || !unsafe { (*inv).dead.load(Acquire) } {
         return false;
@@ -343,6 +361,11 @@ pub(crate) unsafe fn reap_parking_if_dead(gp: *mut G) -> bool {
         if let Some(pos) = allg.iter().position(|&p| p == gp) {
             allg.swap_remove(pos);
         }
+    }
+    // Release the commit-park channel lock(s) BEFORE unlinking the sudogs (which
+    // re-locks each channel) — see the doc-comment's self-deadlock note.
+    if let Some(f) = unlock_fn {
+        unsafe { f(unlock_arg) };
     }
     unsafe { unregister_drained_g(gp) };
     GRAVEYARD.lock().unwrap().push(gp as usize);
