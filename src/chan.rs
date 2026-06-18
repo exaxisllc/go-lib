@@ -99,6 +99,15 @@ impl<T> HchanState<T> {
 ///
 /// The `mutex` field is first so that `Arc::as_ptr(h) as *const RawMutex` gives
 /// a stable address suitable for address-ordered lock acquisition in `selectgo`.
+///
+/// `#[repr(C)]` is **load-bearing**: the Phase 2b drain locks a channel via
+/// `Sudog.c as *const RawMutex`, i.e. it assumes `mutex` lives at offset 0.
+/// Without `repr(C)`, Rust's default layout reorders fields by alignment and
+/// puts the (8-aligned) `state` at offset 0 and the 1-byte `mutex` at the end —
+/// so the drain would spin on bytes inside `state.buf` instead of the real
+/// lock, never excluding live channel operations and corrupting the wait queues
+/// (observed as `stress_drain_select` SIGSEGV/SIGBUS and lost-wakeup hangs).
+#[repr(C)]
 pub(crate) struct Hchan<T> {
     /// Raw adaptive spinlock protecting `state`.
     ///

@@ -147,16 +147,14 @@ unsafe extern "C" fn park_fn(gp: *mut G) {
     // `(*gp).inv` dereference inside the reaper).  reap_parking_if_dead
     // transitions GRUNNING → GDEAD directly, so no waker can ever claim the
     // G and this M retains exclusive ownership throughout.
-    if unsafe { super::sched::reap_parking_if_dead(gp) } {
+    // The reaped G never reaches GWAITING, but the caller-held commit-park
+    // lock must still be released — `reap_parking_if_dead` does that itself,
+    // after the GDEAD transition and before it unlinks the sudogs (it would
+    // otherwise self-deadlock re-locking a channel this G still holds).
+    if unsafe { super::sched::reap_parking_if_dead(gp, unlock_fn, unlock_arg) } {
         unsafe {
             (*m).curg = ptr::null_mut();
             set_current_g(ptr::null_mut());
-            // The reaped G never reaches GWAITING, but the caller-held lock
-            // must still be released or every other party on that channel
-            // deadlocks.
-            if let Some(f) = unlock_fn {
-                f(unlock_arg);
-            }
             schedule()
         };
         return;

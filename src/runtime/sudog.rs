@@ -61,6 +61,26 @@ pub(crate) struct Sudog {
     /// The channel always clears this field after dequeueing.
     pub next: *mut Sudog,
 
+    /// The wait queue this sudog is currently enqueued on, or `null` when it is
+    /// not in any queue.
+    ///
+    /// A sudog lives in **exactly one** queue at a time (a channel's `sendq` or
+    /// `recvq`).  The Phase 2b drain, however, does not know which one — it
+    /// calls [`WaitQ::dequeue_sudog`] on *both* a channel's queues.  Without an
+    /// owner record, `dequeue_sudog` cannot tell "this sudog is the tail of the
+    /// *other* queue" from "the tail of *this* queue" using only `prev`/`next`,
+    /// and would splice the node out using the wrong queue's head/tail — leaving
+    /// a queue's `last` dangling at a removed (and about-to-be-nulled) sudog
+    /// (observed as `chansend`/`try_recv_chan` dequeuing a sudog with a null
+    /// `g`/`elem`, plus lost-wakeup hangs, under `stress_drain_select`).  This
+    /// field makes queue membership authoritative: `enqueue` sets it, `dequeue`
+    /// / `dequeue_sudog` clear it, and `dequeue_sudog` is a no-op unless the
+    /// sudog actually belongs to the queue it was called on.
+    ///
+    /// Only ever mutated under the owning channel's lock (the same lock the
+    /// drain takes), so it is consistent for every reader.
+    pub q: *mut WaitQ,
+
     /// Previous sudog in the doubly-linked wait queue.
     ///
     /// `null` while the sudog is in the free list.
@@ -163,6 +183,7 @@ impl Sudog {
         Sudog {
             g:          std::ptr::null_mut(),
             next:       std::ptr::null_mut(),
+            q:          std::ptr::null_mut(),
             prev:       std::ptr::null_mut(),
             elem:       std::ptr::null_mut(),
             is_select:  false,
@@ -220,6 +241,10 @@ impl WaitQ {
     pub(crate) unsafe fn enqueue(&mut self, sgp: *mut Sudog) {
         unsafe {
             (*sgp).next = std::ptr::null_mut();
+            // Record the owning queue so the Phase 2b drain's `dequeue_sudog`
+            // can authoritatively tell which of a channel's two queues this
+            // sudog lives in (see the `Sudog.q` doc-comment).
+            (*sgp).q = self as *mut WaitQ;
 
             let last = self.last;
             if last.is_null() {
@@ -267,6 +292,9 @@ impl WaitQ {
                 unsafe { (*sgp).next = std::ptr::null_mut() };
             }
             unsafe { (*sgp).prev = std::ptr::null_mut() };
+            // Unlinked from this queue (whether it wins below or is a skipped
+            // select loser) — clear the owner record.
+            unsafe { (*sgp).q = std::ptr::null_mut() };
 
             // For select sudogs, race to claim the win.
             if unsafe { (*sgp).is_select } {
@@ -299,14 +327,20 @@ impl WaitQ {
     ///
     /// Ported from `dequeueSudoG` in `runtime/chan.go`.
     pub(crate) unsafe fn dequeue_sudog(&mut self, sgp: *mut Sudog) -> bool {
-        let prev = unsafe { (*sgp).prev };
-        let next = unsafe { (*sgp).next };
-
-        // Guard: if sgp has no prev link and is not the head, it has already
-        // been unlinked by a racing `dequeue()` call.  Do nothing.
-        if prev.is_null() && self.first != sgp {
+        // Authoritative membership check.  A sudog lives in exactly one queue;
+        // `sgp.q` records which.  If it is not *this* queue, do nothing — the
+        // sudog was already dequeued (q == null) or it belongs to the channel's
+        // other queue (the Phase 2b drain tries both).  Relying on `prev`/`next`
+        // alone is unsound: those links belong to whatever queue the sudog is
+        // really in, so splicing through them while operating on the wrong queue
+        // corrupts that queue's head/tail and leaves a dangling `last` (see the
+        // `Sudog.q` doc-comment and `unlink_sudog_for_drain`).
+        if unsafe { (*sgp).q } != self as *mut WaitQ {
             return false;
         }
+
+        let prev = unsafe { (*sgp).prev };
+        let next = unsafe { (*sgp).next };
 
         if !prev.is_null() {
             unsafe { (*prev).next = next };
@@ -323,6 +357,7 @@ impl WaitQ {
         unsafe {
             (*sgp).next = std::ptr::null_mut();
             (*sgp).prev = std::ptr::null_mut();
+            (*sgp).q    = std::ptr::null_mut();
         }
         true
     }
@@ -407,6 +442,16 @@ static SUDOG_CENTRAL: Mutex<SudogCache> = Mutex::new(SudogCache::new());
 ///
 /// Ported from `acquireSudog` in `runtime/proc.go`.
 pub(crate) fn acquire_sudog() -> *mut Sudog {
+    // Pin to this M (m.locks > 0) across the cache critical section.  The per-P
+    // `sudog_cache` and `SUDOG_CENTRAL` are plain `Mutex`es; if SIGURG async-
+    // preempts a goroutine holding one and the scheduler then runs (or, at
+    // shutdown, reaps) another goroutine that touches the same cache, it
+    // deadlocks on the held lock — and a goroutine reaped GDEAD mid-section
+    // never releases it at all (observed as a residual `stress_drain_select`
+    // hang where every M spins/blocks on the sudog cache).  `m_lock` makes
+    // `sigurg_handler`'s Guard 0 skip preemption here (same contract the
+    // channel `RawMutex` path relies on).  Dropped last, after the cache lock.
+    let _mlk = super::m::m_lock();
     let p = super::sched::current_p();
     let s = if !p.is_null() {
         // Per-P fast path.  Lock ordering is always local-then-central.
@@ -465,6 +510,8 @@ pub(crate) unsafe fn release_sudog(s: *mut Sudog) {
         "release_sudog: c not cleared"
     );
 
+    // Pin to this M across the cache critical section — see `acquire_sudog`.
+    let _mlk = super::m::m_lock();
     let p = super::sched::current_p();
     if !p.is_null() {
         // Per-P fast path.  Lock ordering is always local-then-central.
