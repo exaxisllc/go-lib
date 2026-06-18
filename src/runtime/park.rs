@@ -139,27 +139,10 @@ unsafe extern "C" fn park_fn(gp: *mut G) {
         unsafe { (*m).locks.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) };
     }
 
-    // Dead-invocation check MUST come before the GWAITING transition, while
-    // this M still exclusively owns gp.  The moment the status becomes
-    // GWAITING, a waker can make the G runnable, another M can run it to
-    // completion, and goexit0 frees the Box<G> — making any later deref of
-    // gp here a use-after-free (observed on macOS arm64 CI as a garbage
-    // `(*gp).inv` dereference inside the reaper).  reap_parking_if_dead
-    // transitions GRUNNING → GDEAD directly, so no waker can ever claim the
-    // G and this M retains exclusive ownership throughout.
-    // The reaped G never reaches GWAITING, but the caller-held commit-park
-    // lock must still be released — `reap_parking_if_dead` does that itself,
-    // after the GDEAD transition and before it unlinks the sudogs (it would
-    // otherwise self-deadlock re-locking a channel this G still holds).
-    if unsafe { super::sched::reap_parking_if_dead(gp, unlock_fn, unlock_arg) } {
-        unsafe {
-            (*m).curg = ptr::null_mut();
-            set_current_g(ptr::null_mut());
-            schedule()
-        };
-        return;
-    }
-
+    // Go-faithful semantics: goroutines are never force-killed, so parking
+    // simply transitions to GWAITING.  (The former dead-invocation reaper that
+    // transitioned GRUNNING → GDEAD here has been removed along with the rest
+    // of the kill paths.)
     unsafe {
         casgstatus(gp, GRUNNING, GWAITING);
         (*gp).m   = ptr::null_mut();

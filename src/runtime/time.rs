@@ -74,10 +74,6 @@ struct TimerEntry {
     /// Goroutine to wake when the timer fires.  Raw pointer valid because
     /// the goroutine is parked (GWAITING) for the entire duration.
     gp:     *mut G,
-    /// The `run_impl` invocation that owns this goroutine (the goroutine's
-    /// `G::inv` as a raw usize).  Used by `drain_timer_heap_for_shutdown` to
-    /// filter entries belonging to the exiting invocation.
-    inv: usize,
 }
 
 // SAFETY: a TimerEntry is only touched under its shard's Mutex.
@@ -178,80 +174,6 @@ pub(crate) fn start_timer_thread() {
     });
 }
 
-/// Drop every pending timer from the global heap and discard them.
-///
-/// Called by `run_impl`'s Phase 2b drain when the last concurrent `run_impl`
-/// is exiting and we are about to reclaim GWAITING goroutines.  Any goroutines
-/// referenced by these timer entries are simultaneously being CAS'd to GDEAD
-/// by the Phase 2b drain, so the canceled timers would never fire usefully
-/// anyway; dropping them lets the timer thread sleep until a future
-/// `sleep(d)` call wakes it.
-///
-/// The timer thread itself is not stopped — it remains the same background
-/// thread across the lifetime of the process and is shared between
-/// `run_impl` invocations.
-pub(crate) fn drain_timer_heap_for_shutdown(my_inv: usize) {
-    for shard in &TIMER_SHARDS_ARR {
-        // Lockless skip: an empty shard (earliest == NO_TIMER) holds no
-        // entries for any invocation.  A non-empty shard always has
-        // earliest < NO_TIMER (set under the lock on every push), so this
-        // never skips a shard that has work.
-        if shard.earliest.load(Relaxed) == NO_TIMER {
-            continue;
-        }
-        let mut heap = shard.heap.lock().unwrap();
-        if heap.iter().any(|e| e.inv == my_inv) {
-            // Retain only entries that belong to other (still-live) invocations.
-            let retained: BinaryHeap<TimerEntry> =
-                std::mem::take(&mut *heap)
-                    .into_iter()
-                    .filter(|e| e.inv != my_inv)
-                    .collect();
-            *heap = retained;
-            refresh_earliest(shard, &heap);
-        }
-    }
-    // The thread may currently be sleeping with a stale deadline; that is
-    // fine — when it wakes (no later than 1 s; see `timer_thread_body`) it
-    // re-evaluates the heaps.
-}
-
-/// Remove every heap entry whose goroutine is `gp`.
-///
-/// Called by `unregister_drained_g` before a reclaimed goroutine's `Box<G>`
-/// is freed.  Needed because a zombie goroutine (one whose `run_impl`
-/// invocation already exited and ran `drain_timer_heap_for_shutdown`) can
-/// still call `sleep()` and push a fresh entry before the park-time reaper
-/// retires it — that entry would otherwise outlive the G and make
-/// `fire_expired` dereference freed memory.
-///
-/// Serialisation: `fire_expired` holds a shard's lock across its entire
-/// pop→wake batch for that shard, so by the time this function acquires the
-/// same lock no in-flight popped entry for `gp` can exist either — any
-/// concurrent fire observed the G's status (GDEAD by the time the reaper
-/// calls us) and dropped the entry without dereferencing further.
-///
-/// `gp` is already `GDEAD` here, so it cannot itself call `sleep` and add a
-/// new entry concurrently; an empty shard therefore truly holds none of its
-/// entries and is safe to skip locklessly.
-pub(crate) fn remove_timer_entries_for(gp: *mut G) {
-    for shard in &TIMER_SHARDS_ARR {
-        if shard.earliest.load(Relaxed) == NO_TIMER {
-            continue;
-        }
-        let mut heap = shard.heap.lock().unwrap();
-        if heap.iter().any(|e| e.gp == gp) {
-            let retained: BinaryHeap<TimerEntry> =
-                std::mem::take(&mut *heap)
-                    .into_iter()
-                    .filter(|e| e.gp != gp)
-                    .collect();
-            *heap = retained;
-            refresh_earliest(shard, &heap);
-        }
-    }
-}
-
 /// Main body of the background timer thread.
 fn timer_thread_body() {
     // Register the thread handle so `sleep` can unpark us early.
@@ -307,7 +229,7 @@ fn fire_expired() {
     use super::g::{readgstatus, GDEAD, GWAITING};
 
     let now = mono_ns();
-    struct WakeEntry { gp: *mut G, inv: usize }
+    struct WakeEntry { gp: *mut G }
 
     // Bind the timer thread to the singleton Rt so goready -> sched()/startm
     // work.  Null only before the first schedinit, when no timer entry can
@@ -354,7 +276,7 @@ fn fire_expired() {
         while let Some(entry) = heap.peek() {
             if entry.when <= now {
                 let entry = heap.pop().unwrap();
-                to_wake.push(WakeEntry { gp: entry.gp, inv: entry.inv });
+                to_wake.push(WakeEntry { gp: entry.gp });
             } else {
                 break;
             }
@@ -373,7 +295,7 @@ fn fire_expired() {
                 // almost certainly GWAITING by the time it fires.  The re-push
                 // happens under the shard lock, so a concurrent shutdown drain's
                 // filter is guaranteed to see (and remove) the entry.
-                heap.push(TimerEntry { when: retry_when, gp: entry.gp, inv: entry.inv });
+                heap.push(TimerEntry { when: retry_when, gp: entry.gp });
             }
             // GDEAD: the goroutine was cancelled by a run_impl shutdown drain —
             // drop the entry, never wake or retry.
@@ -411,12 +333,11 @@ pub(crate) unsafe fn sleep(d: Duration) {
     // (When `when` is not below the shard's old earliest the global minimum is
     // unchanged, so no wake is needed; a spurious wake would be harmless
     // anyway — the thread just re-evaluates.)
-    let inv = unsafe { (*gp).inv as usize };
     let shard = current_shard();
     let need_unpark = {
         let mut heap = shard.heap.lock().unwrap();
         let lowered = shard.earliest.load(Relaxed) > when;
-        heap.push(TimerEntry { when, gp, inv });
+        heap.push(TimerEntry { when, gp });
         if lowered {
             shard.earliest.store(when, Relaxed);
         }

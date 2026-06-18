@@ -144,8 +144,8 @@ fn sysmon_loop(rt_addr: usize) {
                 idle = 0;
                 // Singleton scheduler: every harvested goroutine belongs to
                 // this Rt; plain goready is always correct (its GDEAD check
-                // handles already-drained invocations).
-                for (gp, _inv) in ready {
+                // handles goroutines that have already exited).
+                for gp in ready {
                     unsafe { super::park::goready(gp) };
                 }
             }

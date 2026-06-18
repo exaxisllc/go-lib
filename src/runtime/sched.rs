@@ -46,10 +46,10 @@
 use std::any::Any;
 use std::cell::Cell;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, Ordering::*};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, AtomicU8, Ordering::*};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use super::g::{casgstatus, current_g, readgstatus, set_current_g, G, Stack, GDEAD, GPREEMPTED, GRUNNABLE, GRUNNING, STACK_GUARD};
+use super::g::{casgstatus, current_g, readgstatus, set_current_g, G, GDEAD, GPREEMPTED, GRUNNABLE, GRUNNING, STACK_GUARD};
 use super::m::{current_m, M};
 use super::p::{GlobalRunQueue, P, PIDLE, PRUNNING};
 use super::stack::{grow_stack_if_needed, stack_alloc, stack_free};
@@ -128,12 +128,6 @@ thread_local! {
     /// `run_impl` calling thread (via `schedinit`).  Never set on bare OS
     /// threads that have no scheduler role.
     static CURRENT_RT: Cell<*const Rt> = Cell::new(ptr::null());
-
-    /// The `InvState` of the `run_impl` invocation owned by this thread.
-    /// Set by `run_impl` on the calling thread so that `spawn_goroutine`
-    /// can tag the wrapper goroutine (which has no parent G to inherit
-    /// from); goroutine-to-goroutine spawns inherit `G::inv` instead.
-    static CURRENT_INV: Cell<*const super::g::InvState> = Cell::new(ptr::null());
 }
 
 /// The process-wide singleton scheduler.  Initialised by the first
@@ -149,17 +143,6 @@ static GLOBAL_RT: OnceLock<&'static Rt> = OnceLock::new();
 pub(crate) fn global_rt_ptr() -> *const Rt {
     GLOBAL_RT.get().map_or(ptr::null(), |rt| *rt as *const Rt)
 }
-
-/// Counter backing `InvState.id`.
-static INV_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-/// Goroutines reaped by the scheduler (runnable Gs of dead invocations, or
-/// zombies caught parking).  They are already `GDEAD` and unregistered from
-/// every waker; their stacks and `Box<G>`s are freed by the next `run_impl`
-/// exit drain under its `DrainSync` (freeing requires excluding in-flight
-/// RCU readers, which the scheduler hot path must not wait for).  Stored as
-/// `usize` because `*mut G` is not `Send`.
-static GRAVEYARD: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
 /// Return a reference to the calling thread's `Rt`.
 ///
@@ -215,161 +198,52 @@ pub(crate) fn sched() -> &'static Rt {
 // schedule — main scheduler loop (runs on g0)
 // ---------------------------------------------------------------------------
 
-/// Main scheduling loop.  Runs on g0's stack.
+/// Pick the next runnable goroutine and transfer control to it.  Runs on g0's
+/// stack.
 ///
-/// Picks a runnable goroutine via `findrunnable` and transfers control to it
-/// via `execute`.  Called initially from `M::start` and re-entered via mcall
-/// targets (`goexit0`, `gosched_m`, `park_fn`, `preemptm`, etc.).
+/// Picks a runnable goroutine via `findrunnable` and hands off to it via
+/// `execute` (which never returns — it `gogo`s into the goroutine).  Called
+/// initially from `M::start` and re-entered via mcall targets (`goexit0`,
+/// `gosched_m`, `park_fn`, `preemptm`, etc.), so the "loop" is the chain of
+/// `execute → … → mcall → schedule` re-entries, not a back-edge in this body:
+/// every path here either diverges through `execute` or returns.
 ///
-/// Returns `()` when the owning `Rt` signals shutdown (all goroutines have
-/// finished and Phase 2b drain has completed).  After returning, the caller
-/// (mcall target or spawn_m's thread closure) should terminate the OS thread
-/// — mcall_asm accomplishes this by calling `m_thread_exit` instead of `ud2`.
+/// Returns `()` only when `findrunnable` reports the owning `Rt` is shutting
+/// down.  After returning, the caller (mcall target or spawn_m's thread
+/// closure) terminates the OS thread — mcall_asm does this by calling
+/// `m_thread_exit` instead of `ud2`.
 ///
 /// Ported from `schedule` in `runtime/proc.go`.
 pub(crate) unsafe fn schedule() {
     let m = current_m();
     debug_assert!(!m.is_null(), "schedule: CURRENT_M is null — call set_current_m first");
 
-    loop {
-        let p = unsafe { (*m).p };
-        debug_assert!(!p.is_null(), "schedule: M has no P attached");
+    let p = unsafe { (*m).p };
+    debug_assert!(!p.is_null(), "schedule: M has no P attached");
 
-        // Every 61 ticks drain one G from the global queue to prevent starvation.
-        let tick = unsafe { (*p).schedtick.load(Relaxed) };
-        if tick % 61 == 0 && sched().global_run_q.len() > 0 {
-            let gp = unsafe { sched().global_run_q.pop() };
-            if !gp.is_null() {
-                if unsafe { reap_if_dead_invocation(gp) } {
-                    continue;
-                }
-                unsafe { execute(gp) }; // -> !, never returns
-            }
+    // Every 61 ticks drain one G from the global queue to prevent starvation.
+    let tick = unsafe { (*p).schedtick.load(Relaxed) };
+    if tick % 61 == 0 && sched().global_run_q.len() > 0 {
+        let gp = unsafe { sched().global_run_q.pop() };
+        if !gp.is_null() {
+            unsafe { execute(gp) }; // -> !, never returns
         }
+    }
 
-        // Try local run queue first — no lock needed.
-        let (gp, _inherit) = unsafe { (*p).runqget() };
+    // Try local run queue first — no lock needed.
+    let (gp, _inherit) = unsafe { (*p).runqget() };
 
-        let gp = if !gp.is_null() {
-            gp
-        } else {
-            // Local queue empty; find work elsewhere.
-            match unsafe { findrunnable() } {
-                Some(gp) => gp,
-                None => return, // Rt is shutting down — caller will exit the thread
-            }
-        };
-
-        if unsafe { reap_if_dead_invocation(gp) } {
-            continue;
+    let gp = if !gp.is_null() {
+        gp
+    } else {
+        // Local queue empty; find work elsewhere.
+        match unsafe { findrunnable() } {
+            Some(gp) => gp,
+            None => return, // Rt is shutting down — caller will exit the thread
         }
-        unsafe { execute(gp) }; // -> !, never returns
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Dead-invocation reaper
-// ---------------------------------------------------------------------------
-
-/// If `gp` belongs to a `run_impl` invocation that has already exited,
-/// retire it instead of executing it: transition `GRUNNABLE → GDEAD`,
-/// unregister it from every waker, and push it onto the [`GRAVEYARD`] for
-/// the next exit drain to free.  Returns `true` if the G was reaped (the
-/// caller must not execute it).
-///
-/// Called by `schedule()` with exclusive ownership of the popped `gp` (it
-/// is off every run queue), so the status CAS cannot race another executor.
-/// It can race a `goready`-style waker only if the G were GWAITING — it is
-/// not — so a failed CAS means an unexpected state and we conservatively
-/// fall through to `execute` (its own `casgstatus` asserts).
-pub(crate) unsafe fn reap_if_dead_invocation(gp: *mut G) -> bool {
-    let inv = unsafe { (*gp).inv };
-    if inv.is_null() || !unsafe { (*inv).dead.load(Acquire) } {
-        return false;
-    }
-    let claimed = unsafe {
-        (*gp).atomicstatus
-            .compare_exchange(GRUNNABLE, GDEAD, AcqRel, Relaxed)
-            .is_ok()
     };
-    if !claimed {
-        return false;
-    }
-    // Remove from the shared `allg` BEFORE pushing to the graveyard: a
-    // concurrent run_impl exit drain iterates `allg` and dereferences every
-    // entry — a graveyard G it could free must never still be visible
-    // there (invariant: graveyard ∩ allg = ∅).
-    {
-        let mut allg = sched().allg.lock().unwrap();
-        if let Some(pos) = allg.iter().position(|&p| p == gp) {
-            allg.swap_remove(pos);
-        }
-    }
-    // A woken-then-reaped G may still have select-loser sudogs enqueued on
-    // channels (selectgo cleans those up after resuming — which this G
-    // never will).  unregister_drained_g unlinks and releases them.
-    unsafe { unregister_drained_g(gp) };
-    GRAVEYARD.lock().unwrap().push(gp as usize);
-    true
-}
 
-/// Park-time variant of the reaper, called by `park_fn` BEFORE the
-/// `GRUNNING → GWAITING` transition — i.e. while the parking M still has
-/// exclusive ownership of `gp`.  A goroutine of a dead invocation that was
-/// still running when its `run_impl` exited (so the exit drain's CAS missed
-/// it) is caught here the moment it tries to park, instead of waiting
-/// forever for a waker that will never come.
-///
-/// The pre-transition placement is load-bearing: once the G is GWAITING, a
-/// waker can resume it on another M and `goexit0` can free it, so any later
-/// dereference of `gp` on this M would be a use-after-free (observed on
-/// macOS arm64 CI as a garbage `(*gp).inv` value inside the reaper).
-/// Going `GRUNNING → GDEAD` directly means no waker can ever claim the G
-/// (`goready`'s status loop returns on GDEAD), and ownership never leaves
-/// this M until the G is safely in the graveyard.
-///
-/// `unlock_fn`/`unlock_arg` are the parking goroutine's commit-park lock
-/// release (see [`gopark_commit`]).  A `selectgo`/`chansend`/`chanrecv` parks
-/// while **still holding** its channel lock(s) — they are released, from g0, by
-/// `unlock_fn` only after the park commits.  When we reap such a goroutine we
-/// MUST release those locks here, *after* the `GRUNNING → GDEAD` transition but
-/// *before* [`unregister_drained_g`], because `unregister_drained_g` re-acquires
-/// each channel's lock to unlink the sudogs — and `RawMutex` is non-reentrant,
-/// so re-locking a lock this goroutine already holds spins forever (a
-/// self-deadlock that surfaced as a 100%-hang in `stress_drain_select` once the
-/// drain started taking the *real* channel lock).  Releasing before the unlink
-/// is safe: the G is already GDEAD (any peer that now dequeues a sudog and
-/// `goready`s it is a no-op), and the channel lock still serialises that peer's
-/// select-slot stack access against the unlink + later stack free.
-pub(crate) unsafe fn reap_parking_if_dead(
-    gp:         *mut G,
-    unlock_fn:  Option<unsafe fn(*mut u8)>,
-    unlock_arg: *mut u8,
-) -> bool {
-    let inv = unsafe { (*gp).inv };
-    if inv.is_null() || !unsafe { (*inv).dead.load(Acquire) } {
-        return false;
-    }
-    // We own the G (GRUNNING) — the transition cannot be contended.
-    unsafe {
-        casgstatus(gp, GRUNNING, GDEAD);
-        (*gp).m = ptr::null_mut();
-    }
-    // See reap_if_dead_invocation: graveyard ∩ allg must be empty.
-    {
-        let mut allg = sched().allg.lock().unwrap();
-        if let Some(pos) = allg.iter().position(|&p| p == gp) {
-            allg.swap_remove(pos);
-        }
-    }
-    // Release the commit-park channel lock(s) BEFORE unlinking the sudogs (which
-    // re-locks each channel) — see the doc-comment's self-deadlock note.
-    if let Some(f) = unlock_fn {
-        unsafe { f(unlock_arg) };
-    }
-    unsafe { unregister_drained_g(gp) };
-    GRAVEYARD.lock().unwrap().push(gp as usize);
-    true
+    unsafe { execute(gp) }; // -> !, never returns
 }
 
 // ---------------------------------------------------------------------------
@@ -459,8 +333,8 @@ pub(crate) unsafe fn findrunnable() -> Option<*mut G> {
             let ready = unsafe { super::netpoll::netpoll_wait(0) };
             // Singleton scheduler: every harvested goroutine belongs to this
             // Rt, so plain goready is always correct (goready's GDEAD check
-            // handles entries whose invocation has already been drained).
-            for (gp, _inv) in ready {
+            // handles entries whose goroutine has already exited).
+            for gp in ready {
                 unsafe { super::park::goready(gp) };
             }
         }
@@ -774,13 +648,6 @@ pub(crate) unsafe extern "C" fn goexit0(gp: *mut G) {
 
     let m = current_m();
 
-    // Snapshot stack bounds while we still own the G (GRUNNING).  The G is
-    // about to go GDEAD and have its stack freed; snapshot now so the
-    // `stack_free` below does not depend on re-reading `(*gp).stack` after the
-    // status transition (the descriptor itself is immortal and survives, but
-    // taking the snapshot up front keeps the ownership story simple).
-    let stack: Stack = unsafe { (*gp).stack };
-
     unsafe {
         casgstatus(gp, GRUNNING, GDEAD);
         (*gp).m   = ptr::null_mut();
@@ -806,18 +673,13 @@ pub(crate) unsafe extern "C" fn goexit0(gp: *mut G) {
         }
     }
 
-    // Free the mmap'd stack (guard page + usable region).  stack_free computes
-    // base = stack.lo − page_size() and munmaps / VirtualFrees the whole region.
-    // Safe: gp is the only owner of this stack; it is GDEAD and off all queues.
-    unsafe { stack_free(&stack) };
-
-    // Retire the G descriptor to the free pool — the allocation is NEVER
-    // returned to the heap (see `gfree_put`): sysmon's `preemptone` reads
-    // `m.curg` and blindly writes `preempt`/`stackguard0` through it without
-    // any liveness synchronisation, exactly like Go — and Go is only sound
-    // because G structs are immortal (`gfree` lists).  Freeing the Box here
-    // let that write land in recycled heap memory (observed as corrupted
-    // sudogs/Gobufs under the many_goroutines SIGURG storm).
+    // Retire the G descriptor to the gFree pool, recycling it (and its stack)
+    // for a future `new_goroutine`.  `gfree_put` keeps the stack mapped (it is
+    // pooled with the descriptor) — so, unlike before, goexit0 does NOT
+    // `stack_free` here.  Safe to recycle: this G ran to completion while
+    // GRUNNING, was never parked, and is now GDEAD and off every queue, so no
+    // peer holds a reference to it.  (Under `GOLIB_GPOOL_OFF=1`, `gfree_put`
+    // frees the stack and leaks the descriptor instead.)
     unsafe { gfree_put(gp) };
 
     // Re-enter the scheduler on g0's stack.  Returns only on Rt shutdown, in
@@ -2208,33 +2070,87 @@ static NEXT_GOID: AtomicU64 = AtomicU64::new(1);
 
 /// Free pool of retired G descriptors — the port of Go's `gfree` lists.
 ///
-/// G allocations are IMMORTAL: once created, a `G` struct is never returned
-/// to the heap, only recycled through this pool.  This is load-bearing, not
-/// an optimisation: `sysmon`'s `preemptone` dereferences `m.curg` and writes
-/// `preempt` / `stackguard0` through it with no synchronisation against
-/// goroutine exit (mirroring Go).  If the Box were freed, that write would
-/// land in recycled heap memory — observed as corrupted sudogs, channel
-/// elements, and Gobufs in debug-build `many_goroutines` runs.  With the
-/// pool, the worst case is a stray `preempt = true` on a dormant or reused
-/// G, which the SIGURG guards and `G::reinit` handle harmlessly.
+/// G allocations are IMMORTAL: once created, a `G` struct's heap allocation is
+/// never returned to the heap, only recycled through this pool.  Immortality is
+/// load-bearing, not an optimisation: `sysmon`'s `preemptone` dereferences
+/// `m.curg` and writes `preempt` / `stackguard0` through it with no
+/// synchronisation against goroutine exit (mirroring Go).  If the Box were
+/// freed, that write would land in unmapped/recycled heap memory.  With the
+/// pool the memory stays valid, so the worst case is a stray `preempt = true`
+/// or `stackguard0` write on a dormant or reused G, which is overwritten by the
+/// `G::value` reinit on reuse and otherwise handled by the SIGURG guards.
 ///
-/// Retire a dead G's descriptor.  The descriptor is *leaked on purpose*: G
-/// structs are immortal so that sysmon's `preemptone` can read `m.curg` and
-/// write `gp.preempt`/`gp.stackguard0` without racing goroutine teardown (a
-/// freed descriptor would be a use-after-free; observed as corrupted sudogs,
-/// channel elements, and Gobufs in debug-build `many_goroutines` runs).
+/// Reuse is safe ONLY because the kill paths are gone: every descriptor that
+/// reaches this pool was retired by `goexit0`, i.e. its goroutine ran to
+/// completion while `GRUNNING` and was never parked on a channel — so no peer
+/// ever held a reference to it (no leaked `sudog.g`, no pending `gp.param`
+/// write).  The earlier reuse attempt that hit a double-free recycled
+/// force-killed (parked) descriptors, which DID have live external references;
+/// those paths no longer exist.
 ///
-/// The caller must already have freed the G's mmap'd stack and removed it
-/// from `allg` and every queue; only the (small) `G` descriptor leaks.
+/// Each entry carries its mmap'd stack intact (the stack is pooled with the
+/// descriptor, as in Go), so a reused G also skips a `stack_alloc`/`stack_free`
+/// pair.  Stored as `usize` addresses because `*mut G` is not `Send`.
+static G_FREE: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+/// Whether descriptor reuse is disabled (`GOLIB_GPOOL_OFF=1`).  Ablation lever
+/// for A/B-bisecting any reuse-related regression: when set, retired
+/// descriptors free their stack and drop the Box (the historical leak-only
+/// behaviour) and `new_goroutine` always allocates fresh.  0 = reuse on (default),
+/// 1 = off, `u8::MAX` sentinel = not yet read.
+static GPOOL_OFF: AtomicU8 = AtomicU8::new(u8::MAX);
+
+#[inline]
+fn gpool_off() -> bool {
+    let mut v = GPOOL_OFF.load(Relaxed);
+    if v == u8::MAX {
+        v = match std::env::var("GOLIB_GPOOL_OFF") {
+            Ok(s) if s == "1" => 1,
+            _ => 0,
+        };
+        GPOOL_OFF.store(v, Relaxed);
+    }
+    v == 1
+}
+
+/// Retire a dead G's descriptor, recycling it (and its stack) through [`G_FREE`].
 ///
-/// NOTE: descriptors are not recycled.  Go bounds memory by reusing g structs
-/// off a gFree list, but safe reuse needs a stale-reference-clearing protocol
-/// (a leaked `sudog.g` or a late `gp.param` write must never reach a recycled
-/// descriptor).  Reuse without that protocol corrupted unrelated goroutines
-/// in `ping_pong` after the `many_goroutines` churn; it is a tracked
-/// follow-up.  `gfree_put` therefore simply drops the owning pointer.
-unsafe fn gfree_put(_gp: *mut G) {
-    // Intentionally empty: the descriptor is immortal (leaked).
+/// The caller (`goexit0`) must already have transitioned the G to `GDEAD`,
+/// cleared `m.curg` / `current_g`, and removed it from `allg` and every queue.
+/// The G's stack is retained for reuse — the caller must NOT `stack_free` it.
+///
+/// With `GOLIB_GPOOL_OFF=1`, frees the stack and drops the owning Box instead
+/// (leak-only ablation: the Box is dropped, so the descriptor IS freed here —
+/// acceptable because the no-kill-path guarantee means no stale reference can
+/// reach it; the immortality requirement is purely about reuse correctness, and
+/// the historical leak avoided the freed-descriptor sysmon UAF by never freeing).
+unsafe fn gfree_put(gp: *mut G) {
+    if gpool_off() {
+        // Ablation: behave like the historical leak path — free the stack and
+        // leak the descriptor (never recycle, never free) so sysmon's blind
+        // write can never hit freed memory.
+        let stack = unsafe { (*gp).stack };
+        unsafe { stack_free(&stack) };
+        // Leak the descriptor on purpose (immortal); do not drop the Box.
+        return;
+    }
+    // Reuse path: keep the stack, push the descriptor address onto the pool.
+    // `m_lock` pins this M so SIGURG cannot migrate us mid-`MutexGuard` (a std
+    // MutexGuard must unlock on the thread that locked it).
+    let _lk = super::m::m_lock();
+    G_FREE.lock().unwrap().push(gp as usize);
+}
+
+/// Pop a retired descriptor from [`G_FREE`], or `None` if the pool is empty.
+///
+/// The returned descriptor still owns its pooled stack; the caller reinitialises
+/// the `G` in place (via `G::value`) for the new goroutine.
+unsafe fn gfree_get() -> Option<*mut G> {
+    if gpool_off() {
+        return None;
+    }
+    let _lk = super::m::m_lock();
+    G_FREE.lock().unwrap().pop().map(|a| a as *mut G)
 }
 
 /// Monotonically-increasing M ID counter.
@@ -2393,32 +2309,38 @@ unsafe extern "C" fn goexit_trampoline() -> ! {
 /// - Returning from `goroutine_entry` lands in `goexit_trampoline`.
 /// - `G.sched.ctxt` holds a thin pointer to the heap-allocated closure.
 ///
-/// Returns a raw pointer to a freshly leaked, immortal `Box<G>`.  The pointer
-/// is owned by the scheduler from here on and is retired via [`gfree_put`]
-/// at goroutine exit — never freed (see `gfree_put` for why).
+/// Returns a raw pointer to an immortal `G` — either a freshly heap-allocated
+/// one or a descriptor recycled from the gFree pool (see [`gfree_get`]).  The
+/// pointer is owned by the scheduler from here on and is retired via
+/// [`gfree_put`] at goroutine exit.
 ///
-/// Ported from `newproc1` in `runtime/proc.go`.
+/// Ported from `newproc1` + `gfget` in `runtime/proc.go`.
 pub(crate) fn new_goroutine(f: impl FnOnce() + Send + 'static) -> *mut G {
-    let stack = unsafe { stack_alloc().expect("new_goroutine: stack_alloc failed") };
-    let goid  = NEXT_GOID.fetch_add(1, Relaxed);
+    let goid = NEXT_GOID.fetch_add(1, Relaxed);
 
-    // Reuse a retired descriptor when available.  m_lock spans the pool
-    // Mutex so SIGURG cannot preempt (and migrate) us while the std
-    // MutexGuard is held — a MutexGuard must unlock on the thread that
-    // locked it.
-    // Every G descriptor is heap-allocated and *immortal*: it is never freed
-    // and never recycled (see `gfree_put`).  Immortality is what makes
-    // sysmon's `preemptone` sound — it reads `m.curg` and writes
-    // `gp.preempt`/`gp.stackguard0` without synchronising against goroutine
-    // exit, so the descriptor must outlive every possible racing access.
-    //
-    // Descriptor *reuse* (an earlier design) is intentionally NOT done here:
-    // recycling an address while a stale reference to its previous tenant is
-    // still live (a leaked `sudog.g`, a waker about to write `gp.param`)
-    // corrupts the new tenant.  Under no-reuse those stale writes land on a
-    // dead, never-rescheduled descriptor and are harmless.  Safe reuse (to
-    // bound memory the way Go's gFree list does) is a tracked follow-up.
-    let gp: *mut G = Box::into_raw(G::new(stack, goid));
+    // Reuse a retired descriptor (and its pooled stack) when one is available;
+    // otherwise allocate a fresh stack + `Box<G>`.  Reuse is sound because the
+    // pool only ever holds descriptors retired by `goexit0` — goroutines that
+    // ran to completion while GRUNNING and were never parked, so no stale
+    // external reference (a leaked `sudog.g`, a pending `gp.param` write) can
+    // exist.  Reinitialising in place via `G::value` overwrites every field
+    // (`param`, `waiting_*`, `preempt`, `atomicstatus`, …), clearing any stray
+    // sysmon write the dormant descriptor may have received.
+    let gp: *mut G = match unsafe { gfree_get() } {
+        Some(gp) => {
+            // Recycle: reuse the pooled stack, reset all fields in place, then
+            // re-point the self-referential `sched.g` at this allocation (the
+            // reuse contract documented on `G::value`).
+            let stack = unsafe { (*gp).stack };
+            unsafe { ptr::write(gp, G::value(stack, goid)) };
+            unsafe { (*gp).sched.g = gp };
+            gp
+        }
+        None => {
+            let stack = unsafe { stack_alloc().expect("new_goroutine: stack_alloc failed") };
+            Box::into_raw(G::new(stack, goid))
+        }
+    };
     let g: &mut G = unsafe { &mut *gp };
 
     // Heap-allocate the closure behind a thin pointer and store it in ctxt.
@@ -2473,17 +2395,6 @@ pub(crate) fn spawn_goroutine(f: impl FnOnce() + Send + 'static) {
         "spawn_goroutine called without an active Rt; call run_impl first"
     );
     let g_ptr = new_goroutine(f);
-    // Tag the new G with its invocation: inherit from the spawning
-    // goroutine, or — when spawned from the run_impl calling thread (the
-    // wrapper goroutine) — from the thread-local set by run_impl.
-    unsafe {
-        let parent = current_g();
-        (*g_ptr).inv = if !parent.is_null() {
-            (*parent).inv
-        } else {
-            CURRENT_INV.with(|c| c.get())
-        };
-    }
     // SAFETY: g_ptr is a freshly-allocated, uniquely-owned G.  push_batch and
     // startm are unsafe because they manipulate the scheduler's internal queues
     // without a typed lock; their preconditions (non-null pointer, valid G
@@ -2643,200 +2554,6 @@ unsafe fn spawn_m(rt: &'static Rt, id: i64, p: *mut P) {
     });
 }
 
-// ---------------------------------------------------------------------------
-// Phase 2b helper — unregister a doomed G from every waker that holds it
-// ---------------------------------------------------------------------------
-
-/// Walk the `waiting_*` tracking on `gp` and remove the stale `*mut G`
-/// pointer from every waker that is registered with it.  Called by the
-/// Phase 2b drain in `run_impl` exactly once per drained goroutine,
-/// immediately after the GWAITING → GDEAD CAS and before the `DrainSync`
-/// barrier.
-///
-/// After this function returns:
-/// * No `Sudog.g == gp` in any channel's `sendq` / `recvq`.
-/// * No `WaitGroup.waiters` entry equals `gp`.
-/// * No `Cond.waitq` entry equals `gp`.
-/// * `gp.waiting_sudogs`, `gp.waiting_wg`, `gp.waiting_cond` are cleared.
-///
-/// # Safety
-/// `gp` must be a live `*mut G` whose `atomicstatus` is already `GDEAD` (so
-/// no normal waker can transition it again).  Callers in `run_impl` ensure
-/// this via the CAS done immediately before invoking this helper.
-unsafe fn unregister_drained_g(gp: *mut G) {
-
-    // ── Channel sudogs ──────────────────────────────────────────────────────
-    //
-    // Walk gp.waiting_sudogs (intrusive list via Sudog.g_link_next).  Each
-    // sudog has `c` pointing at its `Hchan` and `unlink_for_drain` pointing
-    // at a monomorphised helper that knows the channel's `T`.  We lock the
-    // channel by its mutex (at offset 0 of `Hchan<T>`), call the helper to
-    // remove the sudog from its sendq/recvq, then release the sudog.
-    // Detach the whole list FIRST, before releasing any sudog.  Each
-    // `release_sudog` below puts the sudog back on the free pool, where another
-    // live goroutine may immediately re-acquire it and `push_waiting_sudog` it
-    // onto ITS list.  If we left `gp.waiting_sudogs` (and the `g_link_next`
-    // chain) pointing at sudogs we are concurrently releasing, that re-acquired
-    // sudog would momentarily be reachable from two lists at once — tangling
-    // them and double-releasing the sudog (observed as a sudog free-list
-    // double-free / "double-acquire" under the select+drain stress harness).
-    // Snapshotting + detaching the head up front guarantees a released sudog is
-    // never reachable from `gp` again.  We also sever `g_link_next` as we
-    // snapshot so the chain cannot be walked into after release.
-    let mut snapshot: Vec<*mut super::sudog::Sudog> = Vec::new();
-    {
-        let mut cur = unsafe { (*gp).waiting_sudogs };
-        unsafe { (*gp).waiting_sudogs = std::ptr::null_mut() };
-        while !cur.is_null() {
-            let next = unsafe { (*cur).g_link_next };
-            unsafe { (*cur).g_link_next = std::ptr::null_mut() };
-            snapshot.push(cur);
-            cur = next;
-        }
-    }
-
-    for sg in snapshot {
-        let chan_ptr = unsafe { (*sg).c };
-        let unlink_fn = unsafe { (*sg).unlink_for_drain };
-        let drop_fn   = unsafe { (*sg).drop_elem_for_drain };
-        if !chan_ptr.is_null() {
-            let mu = chan_ptr as *const super::rawmutex::RawMutex;
-            // SAFETY: the user-side Hchan<T> Arc is held by goroutines we
-            // have just CAS'd to GDEAD, but the Arc allocation itself stays
-            // mapped (closure-capture leak — see run_impl doc-comment).
-            //
-            // Everything that touches this sudog's channel state — unlinking
-            // it from the sendq/recvq AND dropping/clearing its `elem` payload
-            // box — happens UNDER the channel lock, atomically.  A live peer
-            // completing a rendezvous on this sudog (`chansend` Case 1,
-            // `recv_from_sender`, or `selectgo`'s try-path) does the symmetric
-            // work — consume the value, free the box, null `elem` — under the
-            // SAME lock.  Performing the drain's drop outside the lock (the old
-            // structure) let the peer and the drain both free the same payload
-            // box: a double-free of the `Box<ManuallyDrop<T>>` (caught by
-            // `stress_drain_select` as `try_recv_chan` vs
-            // `drop_send_elem_for_drain`).  Holding the lock across unlink +
-            // drop + null makes the two mutually exclusive: whoever takes the
-            // lock first either consumes-and-nulls or unlinks-and-drops, and
-            // the other then observes a nulled `elem` / a missing sudog.
-            unsafe { (*mu).lock() };
-            // Box ownership rule: only the party that actually REMOVES the
-            // sudog from the channel's wait queue owns its `elem` payload box.
-            // `unlink_sudog_for_drain` returns `true` iff it removed the sudog.
-            // If it returns `false`, a live peer (chansend/recv/select try-path)
-            // already dequeued it under this same lock and now owns the box —
-            // the drain must NOT free it (doing so is the `try_recv_chan` vs
-            // `drop_send_elem_for_drain` double-free).  Tying box ownership to
-            // queue removal makes the two mutually exclusive even if the
-            // sudog's cached channel pointer were ever stale, because removal
-            // happens under the channel lock that both sides take.
-            let removed = match unlink_fn {
-                // SAFETY: monomorphised `chan::unlink_sudog_for_drain::<T>`
-                // stored at enqueue; valid for this channel and sudog.
-                Some(unlink_fn) => unsafe { unlink_fn(chan_ptr, sg) },
-                None => false,
-            };
-            // Drop the heap `elem` box (send: `Box<ManuallyDrop<T>>`, recv:
-            // `Box<Option<T>>`) only if WE removed the sudog.  `None` drop_fn
-            // for select sudogs whose `elem` points into a stack frame.  Null
-            // `elem` first so it is freed at most once.
-            let elem = unsafe { (*sg).elem };
-            if removed
-                && let Some(drop_fn) = drop_fn
-                && !elem.is_null()
-            {
-                unsafe { (*sg).elem = std::ptr::null_mut() };
-                unsafe { drop_fn(elem) };
-            }
-            unsafe { (*mu).unlock() };
-        } else {
-            // No channel — a select sudog whose `elem` points into a stack
-            // frame; it carries no heap box to drop.
-            debug_assert!(drop_fn.is_none(),
-                "unregister_drained_g: sudog with drop_elem_for_drain but null channel");
-        }
-
-        unsafe {
-            (*sg).g    = std::ptr::null_mut();
-            (*sg).c    = std::ptr::null_mut();
-            (*sg).elem = std::ptr::null_mut();
-            // g_link_next was already severed during the snapshot above.
-            (*sg).unlink_for_drain    = None;
-            (*sg).drop_elem_for_drain = None;
-            // Deliberately LEAK the sudog instead of `release_sudog(sg)`.
-            //
-            // A force-drained goroutine's sudog may still be referenced by a
-            // peer that is concurrently completing a channel rendezvous on it
-            // (a select peer that won `selectdone`, or a sender/receiver whose
-            // handoff is mid-flight) — the peer accesses it under the channel
-            // lock but does not own its release.  Returning such a sudog to the
-            // shared free pool let it be re-acquired by a live goroutine while
-            // the peer (or a second drain that also reached it through a
-            // momentarily-tangled `waiting_sudogs` list) still touched it,
-            // corrupting the free list (observed as a sudog double-free /
-            // double-acquire under `stress_drain_select`).  Leaking drained
-            // sudogs makes them immortal, exactly as `gfree_put` does for the
-            // `G` descriptor and for the same reason — the leak is bounded by
-            // the number of goroutines force-drained per invocation.
-            let _leaked = sg;
-        }
-    }
-    // `gp.waiting_sudogs` was detached to null before the release loop.
-
-    // ── WaitGroup ──────────────────────────────────────────────────────────
-    let wg_ptr = unsafe { (*gp).waiting_wg };
-    if !wg_ptr.is_null() {
-        let wg = wg_ptr as *const crate::sync::WaitGroup;
-        unsafe { (*wg).remove_waiter(gp) };
-        unsafe { (*gp).waiting_wg = std::ptr::null_mut() };
-    }
-
-    // ── Cond ───────────────────────────────────────────────────────────────
-    let cond_ptr = unsafe { (*gp).waiting_cond };
-    if !cond_ptr.is_null() {
-        let cond = cond_ptr as *const crate::sync::Cond;
-        unsafe { (*cond).remove_waiter(gp) };
-        unsafe { (*gp).waiting_cond = std::ptr::null_mut() };
-    }
-
-    // ── Timer heap & netpoll ────────────────────────────────────────────────
-    //
-    // A zombie goroutine (dead invocation, still running) can push a timer
-    // entry or arm netpoll AFTER its invocation's bulk filters
-    // (`drain_timer_heap_for_shutdown` / `netpoll_clear_reg`) ran, and only
-    // then hit the park-time reaper.  Scrub by-G so no waker entry can
-    // outlive the `Box<G>` free that follows this call.
-    super::time::remove_timer_entries_for(gp);
-    super::netpoll::netpoll_remove_entries_for(gp);
-}
-
-/// Test-only widener for the Phase 2b drain's unregister→stack_free window.
-///
-/// When `GOLIB_DRAIN_WIDEN_US` is set to a positive integer, the drain sleeps
-/// that many microseconds between unlinking a drained goroutine's select
-/// sudogs and munmapping its stack.  This amplifies any (hypothetical)
-/// ordering bug in the channel-lock happens-before argument that lets a
-/// channel writer touch a select-waiter's stack after the unlink: with the
-/// window widened, such a writer faults on the munmapped page deterministically
-/// instead of in a vanishingly small race window.  Used by the
-/// `stress_drain_select` reproducer; a no-op unless the env var is set.
-#[inline]
-fn maybe_widen_drain_window() {
-    use std::sync::atomic::AtomicU64;
-    // Cache the parsed value: 0 = disabled, u64::MAX sentinel = "not yet read".
-    static WIDEN_US: AtomicU64 = AtomicU64::new(u64::MAX);
-    let mut us = WIDEN_US.load(Relaxed);
-    if us == u64::MAX {
-        us = std::env::var("GOLIB_DRAIN_WIDEN_US")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0);
-        WIDEN_US.store(us, Relaxed);
-    }
-    if us > 0 {
-        std::thread::sleep(std::time::Duration::from_micros(us));
-    }
-}
 
 // ---------------------------------------------------------------------------
 // run_impl — public entry point (exposed as go_lib::run)
@@ -2868,12 +2585,6 @@ fn maybe_widen_drain_window() {
 /// even when the goroutine panics.
 ///
 /// Ported from the Go runtime bootstrap (`runtime·rt0_go` → `main.main`).
-/// Total number of goroutines transitioned `GWAITING → GDEAD` by Phase 2b
-/// drains across all `run_impl` exits.  Used by `phase_2b_drain_reclaims_gwaiting`
-/// to verify the drain code path executed at least once during the test run.
-#[cfg(test)]
-pub(crate) static PHASE_2B_DRAINED_COUNT: AtomicU64 = AtomicU64::new(0);
-
 pub(crate) fn run_impl<F, R>(f: F) -> R
 where
     F: FnOnce() -> R + Send + 'static,
@@ -2885,19 +2596,11 @@ where
 
     // Attach to the process-wide singleton Rt, creating it on first use.
     // GOMAXPROCS is fixed by the first caller (or the env var); later calls
-    // share the same Ps and M-threads — invocations are isolated by
-    // `InvState` tagging, not by separate schedulers.
+    // share the same Ps and M-threads.  Goroutines are process-global and are
+    // never force-reclaimed — `run()` returning only unblocks the caller (see
+    // the Go-faithful semantics note after `park()` below).
     let rt: &'static Rt = *GLOBAL_RT.get_or_init(|| schedinit(nprocs));
     set_current_rt(rt as *const Rt);
-
-    // Identity for this invocation.  Leaked (16 bytes) because reaped
-    // zombie goroutines may check `inv.dead` long after this call returns.
-    let inv: &'static super::g::InvState = Box::leak(Box::new(super::g::InvState {
-        id:   INV_COUNTER.fetch_add(1, Relaxed) + 1,
-        dead: AtomicBool::new(false),
-    }));
-    let inv_ptr = inv as *const super::g::InvState;
-    CURRENT_INV.with(|c| c.set(inv_ptr));
 
     // Drop guard: unparks the calling thread whether `f` returns or panics.
     struct UnparkOnDrop(std::thread::Thread);
@@ -2924,145 +2627,17 @@ where
     // Block until the goroutine's drop-guard fires caller.unpark().
     std::thread::park();
 
-    // Mark this invocation dead BEFORE the drain: from here on, the
-    // scheduler's reaper retires this invocation's runnable goroutines
-    // instead of executing them, and `park_fn` retires any of its
-    // still-running goroutines the moment they park.
-    inv.dead.store(true, Release);
-
-    // Purge stale netpoll registrations for this invocation.
-    super::netpoll::netpoll_clear_reg(inv_ptr as usize);
-
-    // ── Phase 2b: drain GWAITING goroutines ──────────────────────────────────
-    //
-    // The singleton `rt.allg` holds every invocation's goroutines, so the
-    // CAS pass filters by invocation.  Two categories are reclaimed:
-    //   * this invocation's parked goroutines, and
-    //   * parked goroutines of any OTHER invocation already marked dead
-    //     (zombies that parked after their own exit drain ran) — making
-    //     leaks self-healing across invocations.
-    //
-    // Safety protocol is unchanged from before:
-    //   1. CAS GWAITING → GDEAD (goready sees GDEAD and returns early)
-    //   2. Unregister each gp from every waker (channel waitq, WG, Cond)
-    //   3. Free stacks (descriptors are immortal, so nothing else to free)
-    //
-    // No reader/drainer barrier is needed between steps 2 and 3.  The only
-    // operation that touches a *parked* goroutine's stack is a channel handoff
-    // writing/reading a select-waiter's `sudog.elem` (which points into that
-    // goroutine's `selectgo` frame).  Every such access happens under the
-    // channel lock, in the same critical section as the dequeue of the peer's
-    // sudog.  `unregister_drained_g` (step 2) unlinks each select sudog under
-    // that same channel lock, so for any (writer, drainer) pair on a channel:
-    // whoever takes the lock first wins — either the writer completes its elem
-    // access before the drainer unlinks (and only then do we `stack_free`), or
-    // the drainer unlinks first and the writer never finds the sudog to touch
-    // the stack.  Either way the munmap in step 3 cannot race a live writer.
-    // (This replaced the old `DrainSync` barrier + per-site `RcuGuard`s, which
-    // existed to protect a now-immortal `Box<G>` free.)
-    {
-        // Claim (CAS) and remove from `allg` in one locked pass.  Removal
-        // must happen BEFORE the frees below: `allg` is shared by every
-        // invocation, and a concurrent exit drain iterating it dereferences
-        // each entry — it must never observe a G we are about to free.
-        let drained: Vec<*mut G> = {
-            let mut drained = Vec::new();
-            let mut allg = rt.allg.lock().unwrap();
-            allg.retain(|&gp| {
-                let g_inv = unsafe { (*gp).inv };
-                let mine = g_inv == inv_ptr;
-                let orphaned = !g_inv.is_null()
-                    && unsafe { (*g_inv).dead.load(Acquire) };
-                if !mine && !orphaned {
-                    return true;
-                }
-                let ok = unsafe {
-                    (*gp).atomicstatus
-                        .compare_exchange(
-                            super::g::GWAITING,
-                            GDEAD,
-                            AcqRel,
-                            Relaxed,
-                        )
-                        .is_ok()
-                };
-                if ok {
-                    drained.push(gp);
-                    false // claimed — drop from allg now
-                } else {
-                    true
-                }
-            });
-            drained
-        };
-
-        // Drain pending timers for this Rt AFTER the CAS pass, not before.
-        // A goroutine that is still GRUNNING inside `sleep()` while the
-        // filter runs can push its timer entry and gopark immediately
-        // afterwards; a pre-CAS filter misses that entry, the CAS then
-        // drains (and frees) the goroutine, and the stale entry left in the
-        // timer shard makes a later `fire_expired` dereference a freed G
-        // (caught by guard-malloc as a fault inside the timer thread).
-        // Running the filter after the CAS is sufficient: any entry whose G
-        // we just drained was pushed *before* that G reached GWAITING, so it
-        // is in its shard by the time the CAS succeeds — and `fire_expired`
-        // holds each shard's lock across its whole pop→wake sequence, so an
-        // in-flight entry cannot escape the filter either (the filter blocks
-        // until the fire completes; the G's status is GDEAD by then and the
-        // fire drops it without waking).
-        super::time::drain_timer_heap_for_shutdown(inv_ptr as usize);
-
-        // Collect scheduler-reaped zombies (any invocation's).  They are
-        // already GDEAD and unregistered; they only need freeing, which
-        // must happen under the DrainSync below.
-        let graveyard: Vec<usize> = std::mem::take(&mut *GRAVEYARD.lock().unwrap());
-
-        if !drained.is_empty() || !graveyard.is_empty() {
-            for &gp in &drained {
-                unsafe { unregister_drained_g(gp) };
-            }
-
-            // No barrier here — `unregister_drained_g` has already unlinked
-            // every select sudog under its channel lock, which is the
-            // happens-before edge that makes the `stack_free` below safe
-            // against any concurrent channel writer (see the drain protocol
-            // comment above).
-            //
-            // Test-only widener: artificially stretch the window between the
-            // unregister-unlink and the `stack_free` munmap so a stress run can
-            // flush out any ordering bug in the happens-before argument (the
-            // same technique as the #37 800µs widener).  Gated on an env var so
-            // it costs a single relaxed-ordered check on the rare drain path
-            // and never fires in production.
-            maybe_widen_drain_window();
-
-            for &gp in &drained {
-                let stack = unsafe { (*gp).stack };
-                unsafe { super::stack::stack_free(&stack) };
-                // Free the mmap'd stack but leak the descriptor — G structs are
-                // immortal so sysmon can't UAF them.  See `gfree_put`.
-                unsafe { gfree_put(gp) };
-            }
-            for &gp_addr in &graveyard {
-                let gp = gp_addr as *mut G;
-                let stack = unsafe { (*gp).stack };
-                unsafe { super::stack::stack_free(&stack) };
-                unsafe { gfree_put(gp) };
-            }
-            // No allg cleanup needed here: drained Gs were removed during
-            // the claim pass above, and graveyard Gs were removed by the
-            // reaper before they entered the graveyard.
-
-            #[cfg(test)]
-            PHASE_2B_DRAINED_COUNT
-                .fetch_add((drained.len() + graveyard.len()) as u64, Relaxed);
-        }
-    }
+    // Go-faithful semantics: goroutines are process-global and are NEVER
+    // force-reclaimed.  When the top-level `f` returns we simply unblock the
+    // caller and return its value; any goroutine `f` left blocked persists for
+    // the process lifetime, exactly like a leaked goroutine in Go.  Use
+    // `scope()` for structured, deterministic cleanup.  (The former Phase 2b
+    // drain + reapers — which force-killed parked goroutines mid-rendezvous and
+    // made their descriptors unsafe to recycle — have been removed.)
 
     // The singleton Rt, its Ps, and its M-threads stay alive for the
     // process lifetime (mirroring Go's never-torn-down runtime); there is
-    // no shutdown signal.  Only this invocation's identity is retired.
-    CURRENT_INV.with(|c| c.set(ptr::null()));
+    // no shutdown signal.
 
     match slot.lock().unwrap().take() {
         Some(Ok(v))        => v,
@@ -3370,131 +2945,4 @@ mod tests {
         );
     }
 
-    /// Phase 2b drain: a goroutine that parks on an unreachable channel
-    /// gets removed from `allg` by `run_impl` exit (when this is the last
-    /// in-flight run).
-    ///
-    /// Spawns goroutines that block on `rx.recv()` of a buffered channel
-    /// whose `tx` is captured by the wrapper but never written to.  They
-    /// have no path to be woken, so they stay GWAITING when the wrapper
-    /// returns.  After `run_impl` returns, the drain should have
-    /// transitioned them to GDEAD and reclaimed their stacks.
-    ///
-    /// With the singleton scheduler and per-invocation tagging, the drain
-    /// fires for this invocation's goroutines on every `run_impl` exit —
-    /// concurrent tests no longer suppress it.  We still observe the global
-    /// `PHASE_2B_DRAINED_COUNT` counter (rather than `allg`, which is
-    /// shared and noisy) and keep the retry loop as belt-and-braces; it
-    /// normally succeeds on the first iteration.
-    #[test]
-    fn phase_2b_drain_reclaims_gwaiting() {
-        use crate::chan::chan;
-
-        let baseline = PHASE_2B_DRAINED_COUNT.load(Ordering::Acquire);
-        let deadline =
-            std::time::Instant::now() + std::time::Duration::from_secs(10);
-
-        loop {
-            run_impl(|| {
-                let (tx, rx) = chan::<i32>(0);
-                // Keep the sender alive in the wrapper's closure so the
-                // channel is not dropped (which would drop its waitq).  The
-                // receiver(s) below will park on a live channel that no one
-                // ever sends to.
-                let _tx_alive = tx;
-
-                for _ in 0..3 {
-                    let rx2 = rx.clone();
-                    spawn_goroutine(move || {
-                        // Parks in GWAITING and is never woken — Phase 2b
-                        // drain transitions it to GDEAD.
-                        let _ = rx2.recv();
-                    });
-                }
-                // Give the children quanta to reach gopark.
-                for _ in 0..50 {
-                    unsafe { gosched() };
-                }
-            });
-
-            // If the drain fired (we were the last in-flight run_impl),
-            // we should see the counter advance by at least 3.
-            let now = PHASE_2B_DRAINED_COUNT.load(Ordering::Acquire);
-            if now >= baseline + 3 {
-                return;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "Phase 2b drain did not fire within deadline: \
-                 baseline={baseline}, observed={now}",
-            );
-            // Try again — another test may have been concurrently in
-            // run_impl, blocking our drain.
-        }
-    }
-
-    /// Phase 2b also drops the heap-allocated `elem` payloads on parked
-    /// channel sudogs — `Box<ManuallyDrop<T>>` for sends and
-    /// `Box<Option<T>>` for recvs.  Without that drop, the `T`'s destructor
-    /// would not run and any owned heap allocations inside `T` would leak.
-    ///
-    /// This test spawns a goroutine that blocks in `tx.send(value)` where
-    /// `value` is a wrapper around a counter-incrementing Drop.  After
-    /// `run_impl` returns and the drain runs, the counter must have been
-    /// incremented — i.e. `T`'s Drop ran.
-    #[test]
-    fn phase_2b_drain_drops_send_elem() {
-        use crate::chan::chan;
-
-        // T's Drop bumps this counter — visible across run_impl.
-        static DROP_COUNT: AtomicU64 = AtomicU64::new(0);
-
-        struct DropCounter;
-        impl Drop for DropCounter {
-            fn drop(&mut self) {
-                DROP_COUNT.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-
-        let baseline = DROP_COUNT.load(Ordering::Acquire);
-        let drain_baseline = PHASE_2B_DRAINED_COUNT.load(Ordering::Acquire);
-        let deadline =
-            std::time::Instant::now() + std::time::Duration::from_secs(10);
-
-        loop {
-            run_impl(|| {
-                // Unbuffered channel — every send must rendezvous with a
-                // recv, and we'll provide none.  Use capacity 0 so the
-                // sender immediately blocks.
-                let (tx, _rx) = chan::<DropCounter>(0);
-                spawn_goroutine(move || {
-                    // Parks forever in `chansend`'s Case 4 with a
-                    // `Box<ManuallyDrop<DropCounter>>` as `sudog.elem`.
-                    // Phase 2b's drop_elem_for_drain runs DropCounter's
-                    // Drop and frees the Box.
-                    tx.send(DropCounter);
-                });
-                // Give the sender a few quanta to reach gopark.
-                for _ in 0..50 {
-                    unsafe { gosched() };
-                }
-            });
-
-            // We need the drain to have fired (advanced PHASE_2B_DRAINED_COUNT)
-            // before we check DROP_COUNT — otherwise we're racing with a
-            // concurrent test that prevented our drain from running.
-            let drain_now = PHASE_2B_DRAINED_COUNT.load(Ordering::Acquire);
-            let drop_now  = DROP_COUNT.load(Ordering::Acquire);
-            if drain_now > drain_baseline && drop_now > baseline {
-                return;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "Phase 2b drain did not drop send elem in time: \
-                 drains advanced by {}, drops advanced by {}",
-                drain_now - drain_baseline,
-                drop_now  - baseline,
-            );
-        }
-    }
 }

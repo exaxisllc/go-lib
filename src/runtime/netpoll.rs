@@ -67,20 +67,18 @@ struct GRaw(usize);
 // serialised by either the scheduler Mutex or the Mutex below.
 unsafe impl Send for GRaw {}
 
-/// Global registration table: maps file descriptor → (G pointer, poll mode,
-/// owning `Rt` as a raw usize).
+/// Global registration table: maps file descriptor → (G pointer, poll mode).
 ///
 /// Mode bit 1 = read; bit 2 = write.
 ///
-/// The invocation tag mirrors `TimerEntry.inv` in `time.rs`: multiple
-/// `run_impl` invocations (one per concurrent `#[test]`) share this table
-/// and the process-wide poll fd on the singleton scheduler, so
-/// `netpoll_clear_reg` must only purge its own invocation's entries.
-static REG: Mutex<Option<HashMap<RawFd, (GRaw, u32, usize)>>> = Mutex::new(None);
+/// The table and the process-wide poll fd are shared by every goroutine on the
+/// singleton scheduler; a ready fd's goroutine is removed on harvest in
+/// `netpoll_wait`.
+static REG: Mutex<Option<HashMap<RawFd, (GRaw, u32)>>> = Mutex::new(None);
 
 fn with_reg<F, R>(f: F) -> R
 where
-    F: FnOnce(&mut HashMap<RawFd, (GRaw, u32, usize)>) -> R,
+    F: FnOnce(&mut HashMap<RawFd, (GRaw, u32)>) -> R,
 {
     let mut guard = REG.lock().unwrap();
     f(guard.get_or_insert_with(HashMap::new))
@@ -156,13 +154,8 @@ pub(crate) unsafe fn netpoll_arm(fd: RawFd, mode: u32, gp: *mut G) {
         return;
     }
 
-    // Tag the entry with the goroutine's run_impl invocation so that the
-    // invocation's exit drain (`netpoll_clear_reg`) can purge exactly its
-    // own registrations.  (The scheduler is a process-wide singleton, so no
-    // Rt routing tag is needed any more.)
-    let inv_tag = unsafe { (*gp).inv as usize };
     with_reg(|reg| {
-        reg.insert(fd, (GRaw(gp as usize), mode, inv_tag));
+        reg.insert(fd, (GRaw(gp as usize), mode));
     });
 
     #[cfg(not(windows))]
@@ -187,106 +180,6 @@ pub(crate) fn netpoll_unarm(fd: RawFd) {
 }
 
 // ---------------------------------------------------------------------------
-// netpoll_clear_reg — purge all stale registrations after go_lib::run() exits
-// ---------------------------------------------------------------------------
-
-/// Deregister every file descriptor from the epoll/kqueue backend and clear
-/// the registration table.
-///
-/// ## When to call
-///
-/// Call this once, from the caller's thread, immediately after `run_impl`'s
-/// `std::thread::park()` returns — i.e. after the main goroutine has finished
-/// but before `run_impl` returns to the user.
-///
-/// ## Why this is necessary
-///
-/// `go_lib::run()` can be called multiple times in the same process (e.g.
-/// each `#[test]` function calls it independently).  When the main closure
-/// exits, background goroutines spawned with `go!()` — such as HTTP server
-/// goroutines blocked in `listen_and_serve()` — continue running: they are
-/// parked in `gopark` with their `(fd, *mut G)` entry still live in `REG`
-/// and their fd still registered with epoll/kqueue.
-///
-/// The next `go_lib::run()` call in the same process reuses:
-/// * the same `POLL_FD` (epoll/kqueue fd, created once via `netpoll_init`)
-/// * the same `REG` global registration table
-///
-/// Without cleanup, `netpoll_wait` can then return stale `*mut G` pointers
-/// from the previous run.  `goready` dereferences those pointers, causing:
-/// * **Linux/epoll**: SIGSEGV (invalid memory reference)
-/// * **Windows/IOCP**: hang (IOCP threads from run N conflict with run N+1)
-///
-/// macOS/kqueue silently discards events for abandoned goroutines, so no
-/// crash is observed there, but the stale table entries are still incorrect.
-///
-/// ## What happens to abandoned goroutines
-///
-/// Goroutines left running after this call can never be woken by netpoll
-/// again (their fd is removed from epoll/kqueue and their entry is gone from
-/// `REG`).  They remain parked forever — a memory leak.  Fixing this properly
-/// requires a "stop the world" mechanism (out of scope for this patch).
-///
-/// ## Safety
-///
-/// Must be called from outside any goroutine (i.e. from the OS thread that
-/// called `run_impl`, after `park()` returns).  No M thread must be executing
-/// `netpoll_arm` or `netpoll_wait` concurrently; this is guaranteed because
-/// the main goroutine has already exited and no new goroutine can be spawned
-/// once `park()` has returned.
-pub(crate) fn netpoll_clear_reg(my_inv: usize) {
-    let pfd = POLL_FD.load(Acquire);
-    // Only purge entries belonging to THIS run_impl invocation.  Invocations
-    // run concurrently (one per parallel #[test]) on the singleton Rt;
-    // clearing the whole table would strand every other invocation's parked
-    // I/O goroutines — their fds vanish from the kernel poll set and they
-    // sleep forever (observed as simultaneous hangs of all parallel net
-    // tests on macOS CI).  Mirrors `drain_timer_heap_for_shutdown`.
-    with_reg(|reg| {
-        // Deregister this invocation's fds from epoll/kqueue before removing
-        // them.  Without this, stale kernel-level registrations can
-        // accumulate.  When an old fd number is reused by a new socket,
-        // EPOLL_CTL_ADD would fail with EEXIST (the kernel sees the fd as
-        // already registered), falling through to EPOLL_CTL_MOD — subtle but
-        // harmless.  Explicit removal keeps the kernel poll table clean.
-        #[cfg(not(windows))]
-        if pfd >= 0 {
-            for (fd, (_, _, inv_tag)) in reg.iter() {
-                if *inv_tag == my_inv {
-                    unsafe { poll_del(pfd, *fd) };
-                }
-            }
-        }
-        reg.retain(|_, (_, _, inv_tag)| *inv_tag != my_inv);
-    });
-}
-
-/// Remove every registration whose goroutine is `gp` and deregister the
-/// corresponding fds from the kernel poll set.
-///
-/// Called by `unregister_drained_g` before a reclaimed goroutine's `Box<G>`
-/// is freed — a zombie goroutine can arm netpoll *after* its invocation's
-/// `netpoll_clear_reg` ran, and the stale entry would otherwise make a later
-/// harvest dereference freed memory.
-pub(crate) fn netpoll_remove_entries_for(gp: *mut G) {
-    let gp_addr = gp as usize;
-    with_reg(|reg| {
-        #[cfg(not(windows))]
-        {
-            let pfd = POLL_FD.load(Acquire);
-            if pfd >= 0 {
-                for (fd, (g_raw, _, _)) in reg.iter() {
-                    if g_raw.0 == gp_addr {
-                        unsafe { poll_del(pfd, *fd) };
-                    }
-                }
-            }
-        }
-        reg.retain(|_, (g_raw, _, _)| g_raw.0 != gp_addr);
-    });
-}
-
-// ---------------------------------------------------------------------------
 // netpoll_wait — collect goroutines whose I/O is ready or complete
 // ---------------------------------------------------------------------------
 
@@ -305,16 +198,14 @@ pub(crate) fn netpoll_remove_entries_for(gp: *mut G) {
 /// operation and returns the goroutine that was waiting on it.
 ///
 /// The caller calls [`goready`][super::park::goready] on each returned
-/// goroutine; the second tuple element is the owning invocation tag
-/// (informational — with the singleton scheduler all goroutines share one
-/// Rt, and goready's GDEAD check handles entries whose invocation has
-/// already been drained).
+/// goroutine.  With the singleton scheduler all goroutines share one Rt, so no
+/// routing tag is returned; `goready`'s GDEAD check drops any entry whose
+/// goroutine has already exited.
 ///
 /// # Safety
 /// Must not be called concurrently with itself on the same poll handle.
-pub(crate) unsafe fn netpoll_wait(timeout_ms: i32) -> Vec<(*mut G, usize)> {
-    // Windows: drain the IOCP.  Each IocpOp carries the Rt captured when the
-    // operation was submitted on the goroutine's own M.
+pub(crate) unsafe fn netpoll_wait(timeout_ms: i32) -> Vec<*mut G> {
+    // Windows: drain the IOCP.
     #[cfg(windows)]
     return unsafe { iocp_win_wait(timeout_ms) };
 
@@ -329,8 +220,8 @@ pub(crate) unsafe fn netpoll_wait(timeout_ms: i32) -> Vec<(*mut G, usize)> {
         let mut goroutines = Vec::with_capacity(ready_fds.len());
         with_reg(|reg| {
             for fd in &ready_fds {
-                if let Some((g_raw, _mode, inv_tag)) = reg.remove(fd) {
-                    goroutines.push((g_raw.0 as *mut G, inv_tag));
+                if let Some((g_raw, _mode)) = reg.remove(fd) {
+                    goroutines.push(g_raw.0 as *mut G);
                     unsafe { poll_del(pfd, *fd) };
                 }
             }
@@ -555,11 +446,6 @@ pub(crate) struct IocpOp {
     pub overlapped:        WinOverlapped,
     /// Goroutine waiting for this operation.
     pub gp:                *mut G,
-    /// The `Rt` that owns `gp`, captured at submission time (the op is
-    /// created on the goroutine's own M).  The IOCP handle is process-wide
-    /// and shared between concurrent `run_impl` invocations, so completions
-    /// must carry their owner — same rationale as the Unix `REG` rt tagging.
-    pub rt_ptr:            usize,
     /// Bytes transferred; written by `netpoll_wait` on completion.
     pub bytes_transferred: u32,
     /// NTSTATUS completion code (0 = STATUS_SUCCESS).
@@ -674,12 +560,12 @@ pub(crate) fn netpoll_iocp_associate(socket: usize) -> bool {
 
 // ── Completion drain ────────────────────────────────────────────────────────
 
-/// Drain the IOCP and return `(goroutine, invocation tag)` pairs for every
-/// completed operation.
+/// Drain the IOCP and return the goroutine waiting on every completed
+/// operation.
 ///
 /// Follows the same `timeout_ms` convention as `netpoll_wait`.
 #[cfg(windows)]
-unsafe fn iocp_win_wait(timeout_ms: i32) -> Vec<(*mut G, usize)> {
+unsafe fn iocp_win_wait(timeout_ms: i32) -> Vec<*mut G> {
     let iocp = netpoll_iocp_handle();
     if iocp.is_null() {
         return Vec::new();
@@ -717,7 +603,7 @@ unsafe fn iocp_win_wait(timeout_ms: i32) -> Vec<(*mut G, usize)> {
         unsafe {
             (*op).bytes_transferred = entries[i].bytes_transferred;
             (*op).ntstatus          = entries[i].internal as u32;
-            goroutines.push(((*op).gp, (*op).rt_ptr));
+            goroutines.push((*op).gp);
         }
     }
     goroutines
