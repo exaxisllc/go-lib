@@ -331,12 +331,12 @@ const _: () = {
     //                                        (7 GPRs + 10 × 128-bit XMM6–15)
     //   AArch64 (all OS):                    18 callee-save regs → Gobuf 200 B → G 296 B
     //
-    // The 120-byte non-Gobuf portion is the same on every platform: the
-    // original 72, plus the three Phase 2b waiter-tracking fields
+    // The 112-byte non-Gobuf portion is the same on every platform: the
+    // original 72, plus the three waiter-tracking fields
     // (`waiting_sudogs`, `waiting_wg`, `waiting_cond` — 24 bytes), plus the
-    // invocation tag (`inv` — 8 bytes), plus the gopark_commit unlock
-    // handoff (`park_unlock_fn` + `park_unlock_arg` — 16 bytes).
-    const NON_GOBUF: usize = 120;
+    // gopark_commit unlock handoff (`park_unlock_fn` + `park_unlock_arg` —
+    // 16 bytes).
+    const NON_GOBUF: usize = 112;
     const GOBUF: usize = 56 + CALLEE_SAVED_GPR_COUNT * 8;
     assert!(size_of::<G>() == NON_GOBUF + GOBUF,
         "G struct size changed — update layout table and this assertion");
@@ -422,18 +422,6 @@ pub(crate) struct G {
     /// `Cond::remove_waiter` through this pointer.
     pub waiting_cond: *mut u8,
 
-    /// The `run_impl` invocation this goroutine belongs to, or `null` for
-    /// scheduler-internal Gs (g0s) that belong to no invocation.
-    ///
-    /// Points to a `Box::leak`'d [`InvState`] allocated by `run_impl`;
-    /// inherited from the spawning goroutine in `spawn_goroutine`, so every
-    /// goroutine transitively belongs to the invocation whose closure
-    /// spawned it.  The exit drain reclaims parked goroutines whose
-    /// invocation matches (or whose invocation is marked dead), and the
-    /// scheduler's reaper discards runnable goroutines of dead invocations
-    /// instead of executing them.
-    pub inv: *const InvState,
-
     // ── gopark_commit unlock handoff ──────────────────────────────────────
     //
     // Set by `gopark_commit` before its `mcall`; consumed by `park_fn` on
@@ -453,23 +441,6 @@ pub(crate) struct G {
     /// Opaque argument for `park_unlock_fn`.  If it points into the
     /// goroutine's own stack, `copystack` adjusts it during stack growth.
     pub park_unlock_arg: *mut u8,
-}
-
-/// Identity of one `run_impl` invocation on the process-wide singleton `Rt`.
-///
-/// One instance is `Box::leak`'d per `run_impl` call (16 bytes — replaces
-/// the old per-call leak of an entire `Rt` + M-threads + g0 stacks).  All
-/// goroutines spawned by that invocation carry a pointer to it in
-/// [`G::inv`].
-pub(crate) struct InvState {
-    /// Monotonic invocation id (diagnostics only).
-    #[allow(dead_code)]
-    pub id: u64,
-    /// Set by `run_impl` when the invocation's main goroutine has returned
-    /// and the exit drain has begun.  Checked by the scheduler before
-    /// executing a popped G (reap instead of run) and by `park_fn` when a
-    /// zombie parks.
-    pub dead: std::sync::atomic::AtomicBool,
 }
 
 // SAFETY: The scheduler guarantees at most one M executes a given G at any
@@ -517,7 +488,6 @@ impl G {
             waiting_sudogs: std::ptr::null_mut(),
             waiting_wg:     std::ptr::null_mut(),
             waiting_cond:   std::ptr::null_mut(),
-            inv:            std::ptr::null(),
             park_unlock_fn:  None,
             park_unlock_arg: std::ptr::null_mut(),
         }

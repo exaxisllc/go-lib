@@ -170,22 +170,6 @@ impl WaitGroup {
         }
     }
 
-    /// Phase 2b drain helper: remove `gp` from this WaitGroup's `waiters`
-    /// vector.  Called when the Phase 2b drainer is about to reclaim a
-    /// goroutine that was parked here.  Idempotent: no-op if `gp` is not in
-    /// the list (e.g. a concurrent `add(0)` already removed it).
-    ///
-    /// # Safety
-    /// `gp` must be a `*mut G` that this `WaitGroup` may have stored in its
-    /// waiters list.
-    pub(crate) unsafe fn remove_waiter(&self, gp: *mut G) {
-        let _lk = crate::runtime::m::m_lock();
-        self.mu.lock();
-        // SAFETY: `mu` is held.
-        unsafe { (*self.state.get()).waiters.retain(|&g| g != gp) };
-        unsafe { self.mu.unlock() };
-    }
-
     /// Decrement the counter by one.
     ///
     /// Shorthand for `self.add(-1)`.

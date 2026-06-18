@@ -216,21 +216,6 @@ impl Cond {
         }
     }
 
-    /// Phase 2b drain helper: remove `gp` from this Cond's `waitq`.  Called
-    /// when the Phase 2b drainer is about to reclaim a goroutine that was
-    /// parked here.  Idempotent: no-op if `gp` is not in the queue (e.g. a
-    /// concurrent `notify_one` already drained it).
-    ///
-    /// # Safety
-    /// `gp` must be a `*mut G` that this `Cond` may have stored in its
-    /// `waitq`.
-    pub(crate) unsafe fn remove_waiter(&self, gp: *mut G) {
-        let _lk = crate::runtime::m::m_lock();
-        self.mu.lock();
-        // SAFETY: `mu` is held.
-        unsafe { (*self.waitq.get()).retain(|&g| g != gp) };
-        unsafe { self.mu.unlock() };
-    }
 }
 
 impl Default for Cond {
