@@ -132,12 +132,11 @@ fn sysmon_loop(rt_addr: usize) {
         // Use a non-blocking poll here (0 ms timeout); sysmon must not block
         // indefinitely or it will miss retake/preempt duties.
         //
-        // No drain synchronisation: the harvested entries are `*mut G`
-        // descriptors, which are immortal (`gfree_put` leaks them), and we wake
-        // each one purely via `goready`, which never touches the goroutine's
-        // stack.  A goroutine drained by a concurrent Phase 2b pass is GDEAD by
-        // the time we `goready` it, and `goready`'s GDEAD arm drops it without
-        // dereferencing its stack or rescheduling it.
+        // The harvested entries are `*mut G` descriptors that stay live while
+        // parked, and we wake each one purely via `goready`, which never
+        // touches the goroutine's stack.  A goroutine that has already exited
+        // is GDEAD by the time we `goready` it, and `goready`'s GDEAD arm drops
+        // it without dereferencing its stack or rescheduling it.
         {
             let ready = unsafe { super::netpoll::netpoll_wait(0) };
             if !ready.is_empty() {

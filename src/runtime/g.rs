@@ -331,12 +331,10 @@ const _: () = {
     //                                        (7 GPRs + 10 × 128-bit XMM6–15)
     //   AArch64 (all OS):                    18 callee-save regs → Gobuf 200 B → G 296 B
     //
-    // The 112-byte non-Gobuf portion is the same on every platform: the
-    // original 72, plus the three waiter-tracking fields
-    // (`waiting_sudogs`, `waiting_wg`, `waiting_cond` — 24 bytes), plus the
-    // gopark_commit unlock handoff (`park_unlock_fn` + `park_unlock_arg` —
-    // 16 bytes).
-    const NON_GOBUF: usize = 112;
+    // The 88-byte non-Gobuf portion is the same on every platform: the
+    // original 72, plus the gopark_commit unlock handoff
+    // (`park_unlock_fn` + `park_unlock_arg` — 16 bytes).
+    const NON_GOBUF: usize = 88;
     const GOBUF: usize = 56 + CALLEE_SAVED_GPR_COUNT * 8;
     assert!(size_of::<G>() == NON_GOBUF + GOBUF,
         "G struct size changed — update layout table and this assertion");
@@ -394,33 +392,6 @@ pub(crate) struct G {
     /// Mirrors setting `stackguard0 = STACK_PREEMPT`.
     pub preempt:     bool,
     // 6 bytes implicit padding here (repr(C) aligns the next 8 B fields).
-
-    // ── Phase 2b waiter tracking ──────────────────────────────────────────
-    //
-    // The next three fields let `run_impl`'s Phase 2b drain remove this G
-    // from every waker that holds a `*mut G` pointing at it BEFORE freeing
-    // the `Box<G>`.  Without this tracking the Box must be leaked because a
-    // stale waker (e.g. a Sender held by user code across `run_impl` calls)
-    // could load the pointer in a future operation and dereference into
-    // freed memory inside `goready`.
-
-    /// Head of an intrusive linked list of `Sudog`s registering this G in
-    /// channel send/recv wait queues.  `null` if not waiting on any channel.
-    ///
-    /// A goroutine entering a `select!` may have multiple `Sudog`s (one per
-    /// case) linked through `Sudog.g_link_next`.  A goroutine in a plain
-    /// channel send/recv has at most one.  The waker that wakes this G
-    /// (peer handoff, close, drain) unlinks its `Sudog` here.
-    pub waiting_sudogs: *mut crate::runtime::sudog::Sudog,
-    /// `*const crate::sync::WaitGroup` (type-erased to avoid a cross-crate
-    /// generic dependency) if this G is parked in `WaitGroup::wait`, else
-    /// `null`.  The Phase 2b drain calls `WaitGroup::remove_waiter` through
-    /// this pointer to clear the stale `*mut G` from the WG's waiters list.
-    pub waiting_wg: *mut u8,
-    /// `*const crate::sync::Cond` (type-erased) if this G is parked in
-    /// `Cond::wait`, else `null`.  The Phase 2b drain calls
-    /// `Cond::remove_waiter` through this pointer.
-    pub waiting_cond: *mut u8,
 
     // ── gopark_commit unlock handoff ──────────────────────────────────────
     //
@@ -485,9 +456,6 @@ impl G {
             param:        std::ptr::null_mut(),
             waitreason:   WaitReason::Zero,
             preempt:      false,
-            waiting_sudogs: std::ptr::null_mut(),
-            waiting_wg:     std::ptr::null_mut(),
-            waiting_cond:   std::ptr::null_mut(),
             park_unlock_fn:  None,
             park_unlock_arg: std::ptr::null_mut(),
         }
@@ -576,66 +544,6 @@ pub(crate) fn g0_sched() -> *mut Gobuf {
 }
 
 // ---------------------------------------------------------------------------
-// Waiter tracking — link/unlink Sudogs into G.waiting_sudogs
-// ---------------------------------------------------------------------------
-
-/// Push `sudog` onto the head of `gp`'s waiting-sudog list.
-///
-/// Used by channel send/recv park paths and by `selectgo` when enqueuing a
-/// sudog for each case.  The list is intrusive via `Sudog.g_link_next` and
-/// is owned exclusively by `gp` while parked — no concurrent access exists
-/// because no other thread mutates `gp.waiting_sudogs` while `gp` is parked
-/// (gp is single-threaded by the scheduler).
-///
-/// # Safety
-/// `gp` must be a valid `*mut G` whose owning thread is currently parking
-/// or already parked.  `sudog` must be a valid `*mut Sudog`.
-#[inline]
-pub(crate) unsafe fn push_waiting_sudog(
-    gp:    *mut G,
-    sudog: *mut super::sudog::Sudog,
-) {
-    unsafe {
-        (*sudog).g_link_next = (*gp).waiting_sudogs;
-        (*gp).waiting_sudogs = sudog;
-    }
-}
-
-/// Remove `sudog` from `gp`'s waiting-sudog list.  No-op if the sudog is
-/// not in the list (e.g. the Phase 2b drain raced ahead and already
-/// unlinked it).
-///
-/// Used by channel send/recv resume paths and by `selectgo` cleanup.
-///
-/// # Safety
-/// `gp` must be a valid `*mut G`.  `sudog` must be a valid `*mut Sudog`.
-#[inline]
-pub(crate) unsafe fn remove_waiting_sudog(
-    gp:    *mut G,
-    sudog: *mut super::sudog::Sudog,
-) -> bool {
-    unsafe {
-        let mut cur = (*gp).waiting_sudogs;
-        let mut prev: *mut super::sudog::Sudog = std::ptr::null_mut();
-        while !cur.is_null() {
-            if cur == sudog {
-                let next = (*cur).g_link_next;
-                if prev.is_null() {
-                    (*gp).waiting_sudogs = next;
-                } else {
-                    (*prev).g_link_next = next;
-                }
-                (*cur).g_link_next = std::ptr::null_mut();
-                return true;
-            }
-            prev = cur;
-            cur = (*cur).g_link_next;
-        }
-    }
-    false
-}
-
-// ---------------------------------------------------------------------------
 // Goroutine state-transition helpers — ported from runtime/proc.go
 // ---------------------------------------------------------------------------
 
@@ -660,8 +568,6 @@ fn is_valid_transition(from: u32, to: u32) -> bool {
         | (GRUNNING,   GPREEMPTED)  // async preemption signal received
         | (GPREEMPTED, GRUNNABLE)   // scheduler re-enqueues preempted G
         | (GRUNNING,   GDEAD)       // goexit0: goroutine finished normally
-        | (GWAITING,   GDEAD)       // run_impl drain: goroutine cancelled at exit
-        | (GRUNNABLE,  GDEAD)       // reaper: runnable G of a dead invocation
     )
 }
 

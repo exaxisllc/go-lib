@@ -105,8 +105,7 @@ const TIMER_SHARDS: usize = 64;
 const NO_TIMER: u64 = u64::MAX;
 
 /// One timer heap shard: a min-heap plus a lockless cache of its earliest
-/// deadline so the timer thread (and the drain/remove sweeps) can skip it
-/// without taking the lock.
+/// deadline so the timer thread can skip it without taking the lock.
 struct TimerShard {
     heap:     Mutex<BinaryHeap<TimerEntry>>,
     /// Earliest `when` currently in `heap`, or [`NO_TIMER`] when empty.
@@ -245,21 +244,8 @@ fn fire_expired() {
     // Process each shard independently.  Skip shards not yet due via the
     // lockless `earliest` cache; for due shards, hold THAT shard's lock
     // across the ENTIRE pop → status-check → goready → retry-re-push
-    // sequence.  `drain_timer_heap_for_shutdown` and `remove_timer_entries_for`
-    // take the same per-shard lock, so a run_impl Phase 2b drain can never run
-    // its filter on this shard while we hold popped entries: either the filter
-    // runs first (removing that invocation's entries before we pop them), or it
-    // blocks until every entry we popped has been consumed or re-pushed into
-    // the shard (where the filter will see it).
-    //
-    // Without this per-shard serialisation an in-flight entry escapes the
-    // filter: the drain frees the sleeping G's Box while we still hold its
-    // pointer, and our later `readgstatus`/`goready` dereferences freed
-    // memory.  If the allocation has been reused for a new G parked on a
-    // channel, the spurious wake resumes it with `(*gp).param == null` and it
-    // crashes with a NULL dereference in chanrecv/selectgo's resumed path
-    // (the intermittent macOS arm64 CI SIGSEGV the original global-lock design
-    // was hardened against).
+    // sequence, so popped entries are never observed in an inconsistent
+    // intermediate state by another caller touching the same shard.
     //
     // Holding the lock across `goready` is safe: goready never touches a timer
     // shard, and its GRUNNING→GWAITING spin completes independently (the
@@ -292,13 +278,11 @@ fn fire_expired() {
                 // gopark call.  Re-insert a near-immediate timer rather than
                 // spinning or asserting; the retry delay (5 ms) is larger than
                 // the typical preemption-to-resume latency so the goroutine is
-                // almost certainly GWAITING by the time it fires.  The re-push
-                // happens under the shard lock, so a concurrent shutdown drain's
-                // filter is guaranteed to see (and remove) the entry.
+                // almost certainly GWAITING by the time it fires.
                 heap.push(TimerEntry { when: retry_when, gp: entry.gp });
             }
-            // GDEAD: the goroutine was cancelled by a run_impl shutdown drain —
-            // drop the entry, never wake or retry.
+            // GDEAD: the goroutine has already exited — drop the entry, never
+            // wake or retry.
         }
 
         refresh_earliest(shard, &heap);

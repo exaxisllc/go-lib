@@ -91,9 +91,9 @@ unsafe impl Send for SchedInner {}
 /// The scheduler.  A single instance is created (and leaked) by the first
 /// `run_impl` call and serves the whole process — mirroring Go, where one
 /// runtime instance is never torn down.  Concurrent `run_impl` invocations
-/// share its run queues, M-threads, and Ps; they are isolated from each
-/// other by per-invocation `InvState` tagging on their goroutines, not by
-/// separate schedulers.
+/// share its run queues, M-threads, and Ps; goroutines are process-global and
+/// never force-reclaimed, so an invocation's goroutines simply persist (Go's
+/// leaked-goroutine semantics) rather than being isolated to that call.
 pub(crate) struct Rt {
     /// Global run queue — goroutines that are runnable but not yet on any P.
     pub global_run_q: GlobalRunQueue,
@@ -325,11 +325,11 @@ pub(crate) unsafe fn findrunnable() -> Option<*mut G> {
 
         // ── 4. Non-blocking netpoll: check if any I/O goroutines are ready ──
         {
-            // No drain synchronisation: the harvested entries are immortal
-            // `*mut G` descriptors and we wake each only via `goready`, which
-            // never touches the goroutine's stack.  An entry whose invocation
-            // was concurrently drained is GDEAD by the time `goready` runs and
-            // is dropped by `goready`'s GDEAD arm.
+            // The harvested entries are `*mut G` descriptors that stay live
+            // while parked, and we wake each only via `goready`, which never
+            // touches the goroutine's stack.  An entry whose goroutine has
+            // already exited is GDEAD by the time `goready` runs and is dropped
+            // by `goready`'s GDEAD arm.
             let ready = unsafe { super::netpoll::netpoll_wait(0) };
             // Singleton scheduler: every harvested goroutine belongs to this
             // Rt, so plain goready is always correct (goready's GDEAD check
@@ -664,8 +664,8 @@ pub(crate) unsafe extern "C" fn goexit0(gp: *mut G) {
     // cannot start a preemption on this M anyway.
     unsafe { (*m).locks.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) };
 
-    // Remove from the live-goroutine registry before freeing so that the
-    // run_impl drain cannot observe a dangling pointer.
+    // Remove from the live-goroutine registry before retiring the descriptor
+    // to the gFree pool, so the registry never lists a recycled descriptor.
     {
         let mut allg = sched().allg.lock().unwrap();
         if let Some(pos) = allg.iter().position(|&p| p == gp) {
@@ -1900,7 +1900,9 @@ unsafe extern "system" fn windows_veh_handler(ep: *mut u8) -> i32 {
 /// has no more work to do.  The call terminates the OS thread immediately
 /// without unwinding the Rust stack; any `Drop` impls on live stack variables
 /// in the mcall-target frame are skipped.  This is safe because:
-/// * All goroutines have already been freed (Phase 2b drain ran before shutdown).
+/// * Any goroutines still parked at shutdown are process-lifetime allocations
+///   (Go-faithful: goroutines are never force-reclaimed), so nothing that
+///   required `Drop` is abandoned by terminating this thread.
 /// * g0's stack variables at exit time are POD types with no meaningful `Drop`.
 /// * The `Box::leak`'d `Rt` and mmap'd g0 stack are process-lifetime allocations.
 #[unsafe(no_mangle)]

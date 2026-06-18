@@ -65,20 +65,22 @@ pub(crate) struct Sudog {
     /// not in any queue.
     ///
     /// A sudog lives in **exactly one** queue at a time (a channel's `sendq` or
-    /// `recvq`).  The Phase 2b drain, however, does not know which one — it
-    /// calls [`WaitQ::dequeue_sudog`] on *both* a channel's queues.  Without an
-    /// owner record, `dequeue_sudog` cannot tell "this sudog is the tail of the
-    /// *other* queue" from "the tail of *this* queue" using only `prev`/`next`,
-    /// and would splice the node out using the wrong queue's head/tail — leaving
-    /// a queue's `last` dangling at a removed (and about-to-be-nulled) sudog
-    /// (observed as `chansend`/`try_recv_chan` dequeuing a sudog with a null
-    /// `g`/`elem`, plus lost-wakeup hangs, under `stress_drain_select`).  This
-    /// field makes queue membership authoritative: `enqueue` sets it, `dequeue`
-    /// / `dequeue_sudog` clear it, and `dequeue_sudog` is a no-op unless the
-    /// sudog actually belongs to the queue it was called on.
+    /// `recvq`).  `selectgo`'s cleanup pass calls [`WaitQ::dequeue_sudog`] on
+    /// every losing case to cancel its sudog — but a peer's `dequeue` (or a
+    /// lost `selectdone` race) may have already unlinked that sudog from the
+    /// queue concurrently.  Without an owner record, `dequeue_sudog` cannot
+    /// tell "this sudog is the tail of the *other* queue" from "the tail of
+    /// *this* queue" using only `prev`/`next`, and would splice the node out
+    /// using the wrong queue's head/tail — leaving a queue's `last` dangling at
+    /// a removed (and about-to-be-nulled) sudog (observed as `chansend` /
+    /// `try_recv_chan` dequeuing a sudog with a null `g`/`elem`, plus
+    /// lost-wakeup hangs).  This field makes queue membership authoritative:
+    /// `enqueue` sets it, `dequeue` / `dequeue_sudog` clear it, and
+    /// `dequeue_sudog` is a no-op unless the sudog actually belongs to the
+    /// queue it was called on.
     ///
-    /// Only ever mutated under the owning channel's lock (the same lock the
-    /// drain takes), so it is consistent for every reader.
+    /// Only ever mutated under the owning channel's lock, so it is consistent
+    /// for every reader.
     pub q: *mut WaitQ,
 
     /// Previous sudog in the doubly-linked wait queue.
@@ -128,46 +130,6 @@ pub(crate) struct Sudog {
     ///
     /// Typed `*mut u8` until `chan::Hchan` is defined (step 13).
     pub c: *mut u8,
-
-    /// Next Sudog in the **per-G** linked list rooted at `G.waiting_sudogs`.
-    ///
-    /// Distinct from `next` (which links sudogs within a single channel's
-    /// `WaitQ`).  This field links every sudog owned by the same goroutine —
-    /// usually just one for plain channel send/recv, but several for
-    /// `select!` (one per case).  Used by the Phase 2b drain to find every
-    /// channel waitq the doomed goroutine is registered with so the drain
-    /// can unlink each sudog before freeing the `Box<G>`.
-    pub g_link_next: *mut Sudog,
-
-    /// Type-erased channel-unlink function used by the Phase 2b drain.
-    ///
-    /// When a sudog is enqueued on a typed `Hchan<T>` channel, the channel
-    /// stores a monomorphised `unlink_sudog_for_drain::<T>` pointer here.
-    /// The drain calls it as `unlink_for_drain(c, sudog)` to remove `sudog`
-    /// from whichever queue it lives in without needing to know `T`.
-    ///
-    /// `None` if the sudog is not currently enqueued (e.g. fresh from
-    /// `acquire_sudog` or just `release_sudog`-bound).
-    pub unlink_for_drain:
-        Option<unsafe extern "C" fn(channel: *mut u8, sudog: *mut Sudog) -> bool>,
-
-    /// Type-erased function that drops this sudog's `elem` payload.  Used by
-    /// the Phase 2b drain to reclaim heap allocations that the original
-    /// channel-op would have consumed had the goroutine not been killed.
-    ///
-    /// * For a send sudog: `elem` is `Box::into_raw(Box<ManuallyDrop<T>>)`;
-    ///   the function runs `ManuallyDrop::drop` (executing T's destructor)
-    ///   and frees the Box.
-    /// * For a recv sudog: `elem` is `Box::into_raw(Box<Option<T>>)`; the
-    ///   function frees the Box (which drops `Some(T)` if a value had
-    ///   already been written, or no-op if still `None`).
-    ///
-    /// `None` if `elem` is not a typed heap allocation (e.g. select-cases
-    /// whose `elem` points at a stack-allocated `ManuallyDrop<T>` /
-    /// `Option<T>` owned by the user's `selectgo` frame — that storage is
-    /// reclaimed by the goroutine-stack munmap, not by us).
-    pub drop_elem_for_drain:
-        Option<unsafe extern "C" fn(elem: *mut u8)>,
 }
 
 // SAFETY: Sudog instances are exchanged between goroutines only through the
@@ -190,9 +152,6 @@ impl Sudog {
             success:    false,
             boxed_elem: false,
             c:          std::ptr::null_mut(),
-            g_link_next: std::ptr::null_mut(),
-            unlink_for_drain: None,
-            drop_elem_for_drain: None,
         }
     }
 }
@@ -227,7 +186,7 @@ impl WaitQ {
 
     /// Return `true` if the queue has no waiters.
     #[inline]
-    #[allow(dead_code)] // used by channel drain check; wired when chan drain lands
+    #[allow(dead_code)] // exercised by unit tests; no production caller yet
     pub(crate) fn is_empty(&self) -> bool {
         self.first.is_null()
     }
@@ -241,9 +200,9 @@ impl WaitQ {
     pub(crate) unsafe fn enqueue(&mut self, sgp: *mut Sudog) {
         unsafe {
             (*sgp).next = std::ptr::null_mut();
-            // Record the owning queue so the Phase 2b drain's `dequeue_sudog`
-            // can authoritatively tell which of a channel's two queues this
-            // sudog lives in (see the `Sudog.q` doc-comment).
+            // Record the owning queue so `dequeue_sudog` can authoritatively
+            // tell which of a channel's two queues this sudog lives in (see the
+            // `Sudog.q` doc-comment).
             (*sgp).q = self as *mut WaitQ;
 
             let last = self.last;
@@ -329,12 +288,12 @@ impl WaitQ {
     pub(crate) unsafe fn dequeue_sudog(&mut self, sgp: *mut Sudog) -> bool {
         // Authoritative membership check.  A sudog lives in exactly one queue;
         // `sgp.q` records which.  If it is not *this* queue, do nothing — the
-        // sudog was already dequeued (q == null) or it belongs to the channel's
-        // other queue (the Phase 2b drain tries both).  Relying on `prev`/`next`
+        // sudog was already dequeued (q == null, e.g. a racing peer's `dequeue`
+        // or a lost `selectdone` race claimed it).  Relying on `prev`/`next`
         // alone is unsound: those links belong to whatever queue the sudog is
         // really in, so splicing through them while operating on the wrong queue
         // corrupts that queue's head/tail and leaves a dangling `last` (see the
-        // `Sudog.q` doc-comment and `unlink_sudog_for_drain`).
+        // `Sudog.q` doc-comment).
         if unsafe { (*sgp).q } != self as *mut WaitQ {
             return false;
         }
@@ -373,8 +332,8 @@ impl WaitQ {
 /// * one per `P` (`P.sudog_cache`) — the fast path, almost always
 ///   uncontended; refilled from / flushed to the central list in batches;
 /// * one process-wide central list ([`SUDOG_CENTRAL`]) — the overflow tier
-///   and the path taken when there is no current `P` (the `run_impl` caller,
-///   the Phase 2b drain, and unit tests).
+///   and the path taken when there is no current `P` (the `run_impl` caller
+///   and unit tests).
 ///
 /// Mirrors Go's `pp.sudogcache` + `sched.sudogcache` split (`acquireSudog` /
 /// `releaseSudog` in `runtime/proc.go`).
@@ -444,13 +403,11 @@ static SUDOG_CENTRAL: Mutex<SudogCache> = Mutex::new(SudogCache::new());
 pub(crate) fn acquire_sudog() -> *mut Sudog {
     // Pin to this M (m.locks > 0) across the cache critical section.  The per-P
     // `sudog_cache` and `SUDOG_CENTRAL` are plain `Mutex`es; if SIGURG async-
-    // preempts a goroutine holding one and the scheduler then runs (or, at
-    // shutdown, reaps) another goroutine that touches the same cache, it
-    // deadlocks on the held lock — and a goroutine reaped GDEAD mid-section
-    // never releases it at all (observed as a residual `stress_drain_select`
-    // hang where every M spins/blocks on the sudog cache).  `m_lock` makes
-    // `sigurg_handler`'s Guard 0 skip preemption here (same contract the
-    // channel `RawMutex` path relies on).  Dropped last, after the cache lock.
+    // preempts a goroutine holding one and the scheduler then runs another
+    // goroutine that touches the same cache, it deadlocks on the held lock.
+    // `m_lock` makes `sigurg_handler`'s Guard 0 skip preemption here (same
+    // contract the channel `RawMutex` path relies on).  Dropped last, after the
+    // cache lock.
     let _mlk = super::m::m_lock();
     let p = super::sched::current_p();
     let s = if !p.is_null() {

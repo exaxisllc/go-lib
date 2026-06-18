@@ -1,29 +1,29 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Stress reproducer for the cross-Rt timer-wake use-after-free.
+//! Stress test for timer-wake / channel-churn overlap under short-lived
+//! scheduler invocations.
 //!
-//! Scenario under test: `run_impl` exits (Phase 2b drain frees GWAITING
-//! goroutines, including sleepers) at the same moment the global timer
-//! thread has popped those sleepers' expired entries off `TIMER_HEAP` but
-//! has not yet entered its RCU read-side critical section.  The drain then
-//! frees the `Box<G>`; the timer thread dereferences the freed pointer and
-//! can spuriously `goready` whatever new goroutine reuses the allocation —
-//! typically one parked on a channel, which then resumes with
-//! `(*gp).param == null` and dies with a NULL dereference in `chanrecv`.
+//! Historically this reproduced a cross-Rt timer-wake use-after-free: a
+//! `run_impl` exit drain freed GWAITING sleepers at the same moment the global
+//! timer thread had popped their expired entries but not yet dereferenced
+//! them, so the timer thread could `goready` a freed (and reused) `Box<G>` and
+//! crash a channel-parked goroutine with `(*gp).param == null`.  The exit
+//! drain has since been deleted: goroutines are process-global and never
+//! force-reclaimed, so a sleeper's descriptor stays live for the process
+//! lifetime and the timer thread can never observe a freed pointer.  The
+//! example is kept as a timer-vs-channel-churn stress test.
 //!
 //! Two thread pools:
 //!  * sleeper pool — run_impls that spawn short sleepers and return right
-//!    around their expiry, so the drain races the in-flight timer pop;
-//!  * churn pool — run_impls doing unbuffered channel ping-pong, recycling
-//!    freed G allocations into channel-parked goroutines.
+//!    around their expiry, so main exits during the in-flight timer pop;
+//!  * churn pool — run_impls doing unbuffered channel ping-pong, exercising
+//!    the G/sudog reuse pools concurrently with the timer thread.
 //!
 //! Run with: cargo run --release --example stress_drain_timer [seconds] [iters-per-worker]
 //!
-//! With the singleton scheduler, each `run_impl` invocation leaks only a
-//! 16-byte `InvState` (the per-call Rt/M-thread leak is gone), so memory
-//! stays flat even at tens of thousands of iterations per run.  The
+//! With the singleton scheduler the per-call Rt/M-thread leak is gone, so
+//! memory stays flat even at tens of thousands of iterations per run.  The
 //! per-worker iteration cap exists only to bound runtime on very fast
-//! machines; the drain/wake races this canary guards reproduce within ~10
-//! iterations on a buggy runtime.
+//! machines.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -38,7 +38,7 @@ fn sleeper_rt(seed: u64, max_iters: u64) {
     let mut iters = 0u64;
     while !STOP.load(Ordering::Relaxed) && iters < max_iters {
         iters += 1;
-        // Cheap xorshift to vary the overlap between expiry and drain.
+        // Cheap xorshift to vary the overlap between expiry and main's return.
         x ^= x << 13;
         x ^= x >> 7;
         x ^= x << 17;
@@ -51,8 +51,8 @@ fn sleeper_rt(seed: u64, max_iters: u64) {
                     go_lib::sleep(Duration::from_micros(sleep_us));
                 });
             }
-            // Busy-wait so the main goroutine returns (and the drain runs)
-            // right around the sleepers' expiry instant.
+            // Busy-wait so the main goroutine returns right around the
+            // sleepers' expiry instant.
             let t0 = Instant::now();
             while t0.elapsed() < Duration::from_micros(wait_us) {
                 std::hint::spin_loop();

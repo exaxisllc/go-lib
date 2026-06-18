@@ -136,12 +136,6 @@ impl Cond {
         // SAFETY: `mu` is held.
         unsafe { (*self.waitq.get()).push_back(gp) };
 
-        // Phase 2b: tag gp with this Cond so the run_impl drain can find and
-        // remove the stale `*mut G` from `self.waitq` if gp is reclaimed
-        // while parked.  Cleared by the waker (notify_one / notify_all) and
-        // again below after the park returns.
-        unsafe { (*gp).waiting_cond = self as *const Cond as *mut u8 };
-
         // Release the user's mutex *before* parking (Go semantics).  The
         // rendezvous with notifiers is protected by `mu`, which is held across
         // the park, so releasing the user lock here cannot lose a wakeup.
@@ -159,10 +153,6 @@ impl Cond {
             );
         }
 
-        // Phase 2b: clear the tag now that we have been woken (defence in
-        // depth — the notify path also clears it).
-        unsafe { (*gp).waiting_cond = std::ptr::null_mut() };
-
         // Woken — re-acquire the user's mutex.
         mu.lock().unwrap()
     }
@@ -174,19 +164,11 @@ impl Cond {
         // acquiring and releasing the spinlock could deschedule us while the
         // lock is held, deadlocking the next goroutine on this M.
         let _lk = crate::runtime::m::m_lock();
-        // No drain synchronisation: a Cond waiter is woken purely via
-        // `goready`, which touches only the immortal `G` descriptor — never
-        // the waiter's stack.  (The `gp` pop and `goready` are safe even if a
-        // Phase 2b drain has concurrently CAS'd the waiter to GDEAD.)
+        // A Cond waiter is woken purely via `goready`, which touches only the
+        // `G` descriptor — never the waiter's stack.
         self.mu.lock();
         // SAFETY: `mu` is held.
         let gp = unsafe { (*self.waitq.get()).pop_front() };
-        if let Some(gp) = gp {
-            // Phase 2b: clear the gp.waiting_cond tag — the wake removes gp
-            // from our waitq, so the Phase 2b drain no longer needs to touch
-            // us for this gp.
-            unsafe { (*gp).waiting_cond = std::ptr::null_mut() };
-        }
         unsafe { self.mu.unlock() };
         // Wake outside the lock so we don't hold the spinlock across the
         // goready spin (which waits for GRUNNING → GWAITING).
@@ -199,15 +181,11 @@ impl Cond {
     /// Wake all waiting goroutines.
     pub fn notify_all(&self) {
         let _lk = crate::runtime::m::m_lock();
-        // No drain synchronisation needed — see `notify_one`: waiters are woken
-        // only via `goready`, which never touches a waiter's stack.
+        // See `notify_one`: waiters are woken only via `goready`, which never
+        // touches a waiter's stack.
         self.mu.lock();
         // SAFETY: `mu` is held.
         let waiters: Vec<*mut G> = unsafe { (*self.waitq.get()).drain(..).collect() };
-        for &gp in &waiters {
-            // Phase 2b: clear each waiter's tag (see notify_one).
-            unsafe { (*gp).waiting_cond = std::ptr::null_mut() };
-        }
         unsafe { self.mu.unlock() };
         // Wake outside the lock (see notify_one).
         for gp in waiters {
