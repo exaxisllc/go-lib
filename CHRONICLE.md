@@ -226,6 +226,14 @@ A separate crash class: SIGABRT from `_os_unfair_lock_recursive_abort` on macOS.
 
 **Fix:** `sigurg_handler` gained Guard 0.5: if the interrupted PC falls outside the binary's TEXT segment (checked via `|pc − goroutine_entry| < 256 MiB`), preemption is deferred. The goroutine continues through the library call, exits back into our code, and the next SIGURG attempt preempts it safely.
 
+### The getaddrinfo Stack Overflow (release-only)
+
+Surfaced by the go-http port: any client connecting to a *hostname* (`TcpStream::connect("example.com:80")`) crashed with `[go-lib SIGSEGV] non-stack fault` — but only in **release** builds, and only for names that needed the real resolver (numeric IPs and `localhost` were fine). Debug builds never crashed.
+
+The culprit was stack size, not optimization. `TcpStream::connect` / `TcpListener::bind` resolve their argument with `std::net::ToSocketAddrs::to_socket_addrs`, which calls the platform `getaddrinfo` — a C function that loads the system resolver configuration and allocates tens of KiB of stack in a single deep call chain. Goroutine stacks are fixed and small (macOS debug 64 KiB, **release 32 KiB**), and without compiler-emitted `morestack` checks the guard page only catches incremental frame growth. `getaddrinfo`'s prologue jumps clean past the guard into unmapped memory, so the SIGSEGV handler classifies it as a non-stack fault and cannot grow-and-retry. 64 KiB happened to be enough for the resolver, 32 KiB was not — hence debug-passes / release-crashes.
+
+**Fix:** resolution moved off the goroutine stack entirely. `resolve_first_addr` runs `to_socket_addrs` on a freshly spawned OS thread (full ≈8 MiB system stack) via `std::thread::scope`, mirroring Go's use of a dedicated thread for blocking `cgo`/resolver calls. The calling goroutine's M blocks in `join()` for the brief lookup. Regression test: `net_connect_hostname_does_not_overflow_stack` drives a `*.invalid` name (offline per RFC 6761) through `connect` and asserts a clean error instead of a crash.
+
 ### The Callee-Saved Register False Positive
 
 With async preemption working, the stress test at 75 000 workers surfaced a new crash pattern: `drop_in_place<Box<dyn Any>>` crashing because the vtable pointer was actually the bytes of an `i64` partial sum. The `Result<i64, Box<dyn Any>>` in a channel buffer had its discriminant flipped from 0 (Ok) to non-zero (Err).

@@ -348,3 +348,30 @@ fn net_large_payload() {
 
     done_rx.recv();
 }
+
+// ---------------------------------------------------------------------------
+// N. Hostname resolution does not overflow the goroutine stack
+//
+// Regression test for a release-only SIGSEGV: `TcpStream::connect` /
+// `TcpListener::bind` resolve their address argument with the platform
+// resolver (`getaddrinfo`), which consumes far more stack than a goroutine's
+// small fixed stack (32 KiB in release builds).  go-lib has no compiler
+// `morestack` checks, so a stack-hungry C call whose prologue jumps past the
+// guard page faults unrecoverably — crashing any hostname connect in release.
+// The fix runs resolution on a dedicated full-stack OS thread; this test
+// drives a hostname through that path and must complete without crashing.
+//
+// `*.invalid` (RFC 6761) never resolves and is answered locally, so the test
+// exercises the resolver without depending on external network connectivity.
+// ---------------------------------------------------------------------------
+#[test]
+#[go_lib::main]
+fn net_connect_hostname_does_not_overflow_stack() {
+    // Pre-fix this line crashed (SIGSEGV) in release builds; post-fix it
+    // returns a normal resolution error.
+    let result = TcpStream::connect("go-lib-nonexistent-host.invalid:80");
+    assert!(
+        result.is_err(),
+        "connecting to an unresolvable hostname should return Err, not succeed",
+    );
+}
