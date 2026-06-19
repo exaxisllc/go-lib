@@ -355,7 +355,6 @@ pub(crate) unsafe fn goroutine_sleep(d: Duration) {
 #[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
-    use crate::runtime::sched::run_impl;
     use std::sync::atomic::{AtomicI32, Ordering};
     use std::sync::Arc;
 
@@ -378,55 +377,53 @@ mod tests {
     /// a real G into the heap, the timer thread fires it, and the goroutine
     /// resumes after the expected delay.
     #[test]
+    #[go_lib::main]
     fn fire_expired_wakes_goroutine() {
         use std::time::Instant;
-        run_impl(|| {
-            let t0 = Instant::now();
-            unsafe { sleep(Duration::from_millis(10)) };
-            let elapsed = t0.elapsed();
-            assert!(
-                elapsed >= Duration::from_millis(8),
-                "timer did not fire: elapsed only {:?}", elapsed
-            );
-        });
+        let t0 = Instant::now();
+        unsafe { sleep(Duration::from_millis(10)) };
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(8),
+            "timer did not fire: elapsed only {:?}", elapsed
+        );
     }
 
     /// sleep(0) yields without blocking.
     #[test]
+    #[go_lib::main]
     fn sleep_zero_yields() {
-        run_impl(|| {
-            unsafe { sleep(Duration::ZERO) };
-        });
+        unsafe { sleep(Duration::ZERO) };
     }
 
     /// sleep(short) completes within a reasonable wall-clock window.
     #[test]
+    #[go_lib::main]
     fn sleep_short_duration() {
         use crate::runtime::sched::spawn_goroutine;
         use crate::sync::WaitGroup;
 
-        run_impl(|| {
-            // WaitGroup parks the main goroutine via gopark, releasing M+P so
-            // the sleeper goroutine can be scheduled.  Using std::thread::sleep
-            // in the polling loop would hold the M without releasing its P,
-            // potentially starving the sleeper under concurrent test load.
-            let wg  = Arc::new(WaitGroup::new());
-            let wg2 = Arc::clone(&wg);
-            wg.add(1);
+        // WaitGroup parks the main goroutine via gopark, releasing M+P so
+        // the sleeper goroutine can be scheduled.  Using std::thread::sleep
+        // in the polling loop would hold the M without releasing its P,
+        // potentially starving the sleeper under concurrent test load.
+        let wg  = Arc::new(WaitGroup::new());
+        let wg2 = Arc::clone(&wg);
+        wg.add(1);
 
-            spawn_goroutine(move || {
-                unsafe { sleep(Duration::from_millis(5)) };
-                wg2.done();
-            });
-
-            wg.wait();
+        spawn_goroutine(move || {
+            unsafe { sleep(Duration::from_millis(5)) };
+            wg2.done();
         });
+
+        wg.wait();
     }
 
     /// Many goroutines sleeping concurrently all wake — exercises timer
     /// entries spread across multiple shards (more sleepers than there are
     /// Ps, so shard reuse and cross-shard firing are both covered).
     #[test]
+    #[go_lib::main]
     fn many_sleepers_across_shards() {
         use crate::runtime::sched::spawn_goroutine;
         use crate::sync::WaitGroup;
@@ -435,28 +432,27 @@ mod tests {
         let awoke = Arc::new(AtomicI32::new(0));
         let awoke2 = Arc::clone(&awoke);
 
-        run_impl(move || {
-            let wg = Arc::new(WaitGroup::new());
-            for k in 0..N {
-                let awoke3 = Arc::clone(&awoke2);
-                let wg2 = Arc::clone(&wg);
-                wg.add(1);
-                spawn_goroutine(move || {
-                    // Vary the delay so entries interleave within and across
-                    // shards rather than all expiring at once.
-                    unsafe { sleep(Duration::from_millis(5 + (k % 7) as u64)) };
-                    awoke3.fetch_add(1, Ordering::Relaxed);
-                    wg2.done();
-                });
-            }
-            wg.wait();
-        });
+        let wg = Arc::new(WaitGroup::new());
+        for k in 0..N {
+            let awoke3 = Arc::clone(&awoke2);
+            let wg2 = Arc::clone(&wg);
+            wg.add(1);
+            spawn_goroutine(move || {
+                // Vary the delay so entries interleave within and across
+                // shards rather than all expiring at once.
+                unsafe { sleep(Duration::from_millis(5 + (k % 7) as u64)) };
+                awoke3.fetch_add(1, Ordering::Relaxed);
+                wg2.done();
+            });
+        }
+        wg.wait();
 
         assert_eq!(awoke.load(Ordering::Acquire), N);
     }
 
     /// Multiple goroutines sleeping concurrently all wake.
     #[test]
+    #[go_lib::main]
     fn concurrent_sleepers() {
         use crate::runtime::sched::spawn_goroutine;
         use crate::sync::WaitGroup;
@@ -465,27 +461,25 @@ mod tests {
         let awoke = Arc::new(AtomicI32::new(0));
         let awoke2 = Arc::clone(&awoke);
 
-        run_impl(move || {
-            // WaitGroup parks the main goroutine (releases M+P) while the N
-            // sleeper goroutines run.  Polling with std::thread::sleep would
-            // hold the M's P, leaving no idle P for the timer-woken goroutines
-            // under concurrent test pressure, causing an indefinite hang on
-            // macOS where scheduler-tick preemption is SIGURG-based.
-            let wg = Arc::new(WaitGroup::new());
+        // WaitGroup parks the main goroutine (releases M+P) while the N
+        // sleeper goroutines run.  Polling with std::thread::sleep would
+        // hold the M's P, leaving no idle P for the timer-woken goroutines
+        // under concurrent test pressure, causing an indefinite hang on
+        // macOS where scheduler-tick preemption is SIGURG-based.
+        let wg = Arc::new(WaitGroup::new());
 
-            for _ in 0..N {
-                let awoke3 = Arc::clone(&awoke2);
-                let wg2   = Arc::clone(&wg);
-                wg.add(1);
-                spawn_goroutine(move || {
-                    unsafe { sleep(Duration::from_millis(10)) };
-                    awoke3.fetch_add(1, Ordering::Relaxed);
-                    wg2.done();
-                });
-            }
+        for _ in 0..N {
+            let awoke3 = Arc::clone(&awoke2);
+            let wg2   = Arc::clone(&wg);
+            wg.add(1);
+            spawn_goroutine(move || {
+                unsafe { sleep(Duration::from_millis(10)) };
+                awoke3.fetch_add(1, Ordering::Relaxed);
+                wg2.done();
+            });
+        }
 
-            wg.wait();
-        });
+        wg.wait();
 
         assert_eq!(awoke.load(Ordering::Acquire), N);
     }

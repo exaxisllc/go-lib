@@ -23,7 +23,8 @@
 //! ```no_run
 //! use std::io::{Read, Write};
 //!
-//! go_lib::run(|| {
+//! #[go_lib::main]
+//! fn main() {
 //!     let listener = go_lib::net::TcpListener::bind("127.0.0.1:8080").unwrap();
 //!     loop {
 //!         let mut stream = listener.accept().unwrap();
@@ -33,7 +34,7 @@
 //!             stream.write_all(&buf[..n]).unwrap();     // via impl Write
 //!         });
 //!     }
-//! });
+//! }
 //! ```
 
 use std::ffi::c_void;
@@ -686,7 +687,7 @@ impl Write for &TcpStream {
 #[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
-    use crate::runtime::sched::{run_impl, spawn_goroutine};
+    use crate::runtime::sched::spawn_goroutine;
     use std::sync::{
         atomic::{AtomicU8, Ordering},
         Arc,
@@ -694,16 +695,16 @@ mod tests {
 
     /// Bind to port 0 and verify the OS assigns a non-zero port.
     #[test]
+    #[go_lib::main]
     fn bind_port_zero() {
-        run_impl(|| {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            let addr = listener.local_addr().unwrap();
-            assert_ne!(addr.port(), 0, "OS should assign a non-zero port");
-        });
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        assert_ne!(addr.port(), 0, "OS should assign a non-zero port");
     }
 
     /// A goroutine connects; the listener accepts; they exchange a payload.
     #[test]
+    #[go_lib::main]
     fn connect_accept_echo() {
         use std::time::{Duration, Instant};
 
@@ -711,45 +712,44 @@ mod tests {
         let done = Arc::new(AtomicU8::new(0));
         let done2 = Arc::clone(&done);
 
-        run_impl(move || {
-            // Bind the listener on the loopback interface.
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            let addr = listener.local_addr().unwrap();
+        // Bind the listener on the loopback interface.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
 
-            // Spawn a client goroutine.
-            spawn_goroutine(move || {
-                let mut stream = TcpStream::connect(addr).unwrap();
-                stream.write(PAYLOAD).unwrap();
+        // Spawn a client goroutine.
+        spawn_goroutine(move || {
+            let mut stream = TcpStream::connect(addr).unwrap();
+            stream.write(PAYLOAD).unwrap();
 
-                let mut buf = [0u8; 64];
-                let n = stream.read(&mut buf).unwrap();
-                assert_eq!(&buf[..n], PAYLOAD, "echo mismatch");
-
-                done2.store(1, Ordering::Release);
-            });
-
-            // Accept the connection and echo the payload back.
-            let mut stream = listener.accept().unwrap();
             let mut buf = [0u8; 64];
             let n = stream.read(&mut buf).unwrap();
-            stream.write(&buf[..n]).unwrap();
+            assert_eq!(&buf[..n], PAYLOAD, "echo mismatch");
 
-            // Wait for the client goroutine to confirm the echo.
-            let deadline = Instant::now() + Duration::from_secs(5);
-            loop {
-                if done.load(Ordering::Acquire) == 1 {
-                    break;
-                }
-                assert!(Instant::now() < deadline, "echo test timed out");
-                crate::gosched();
-                std::thread::sleep(Duration::from_millis(5));
-            }
+            done2.store(1, Ordering::Release);
         });
+
+        // Accept the connection and echo the payload back.
+        let mut stream = listener.accept().unwrap();
+        let mut buf = [0u8; 64];
+        let n = stream.read(&mut buf).unwrap();
+        stream.write(&buf[..n]).unwrap();
+
+        // Wait for the client goroutine to confirm the echo.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if done.load(Ordering::Acquire) == 1 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "echo test timed out");
+            crate::gosched();
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     /// Multiple concurrent goroutines each sleep via overlapped I/O and
     /// all complete within the expected window.
     #[test]
+    #[go_lib::main]
     fn concurrent_connections() {
         use std::time::{Duration, Instant};
 
@@ -757,40 +757,38 @@ mod tests {
         let awoke = Arc::new(AtomicU8::new(0));
         let awoke2 = Arc::clone(&awoke);
 
-        run_impl(move || {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            let addr = listener.local_addr().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
 
-            // Spawn N client goroutines.
-            for _ in 0..N {
-                let awoke3 = Arc::clone(&awoke2);
-                spawn_goroutine(move || {
-                    let mut stream = TcpStream::connect(addr).unwrap();
-                    let mut buf = [0u8; 1];
-                    stream.read(&mut buf).unwrap(); // wait for server byte
-                    awoke3.fetch_add(1, Ordering::Relaxed);
-                });
-            }
+        // Spawn N client goroutines.
+        for _ in 0..N {
+            let awoke3 = Arc::clone(&awoke2);
+            spawn_goroutine(move || {
+                let mut stream = TcpStream::connect(addr).unwrap();
+                let mut buf = [0u8; 1];
+                stream.read(&mut buf).unwrap(); // wait for server byte
+                awoke3.fetch_add(1, Ordering::Relaxed);
+            });
+        }
 
-            // Accept N connections and send one byte each.
-            for _ in 0..N {
-                let mut stream = listener.accept().unwrap();
-                spawn_goroutine(move || {
-                    stream.write(&[42u8]).unwrap();
-                });
-            }
+        // Accept N connections and send one byte each.
+        for _ in 0..N {
+            let mut stream = listener.accept().unwrap();
+            spawn_goroutine(move || {
+                stream.write(&[42u8]).unwrap();
+            });
+        }
 
-            // Wait for all clients.
-            let deadline = Instant::now() + Duration::from_secs(5);
-            loop {
-                if awoke2.load(Ordering::Acquire) == N {
-                    break;
-                }
-                assert!(Instant::now() < deadline, "concurrent_connections timed out");
-                crate::gosched();
-                std::thread::sleep(Duration::from_millis(5));
+        // Wait for all clients.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if awoke2.load(Ordering::Acquire) == N {
+                break;
             }
-        });
+            assert!(Instant::now() < deadline, "concurrent_connections timed out");
+            crate::gosched();
+            std::thread::sleep(Duration::from_millis(5));
+        }
         assert_eq!(awoke.load(Ordering::Acquire), N);
     }
 }

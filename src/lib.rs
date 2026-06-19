@@ -12,6 +12,8 @@
 //! scheduler-safe.
 //!
 //! ## Public surface
+//! - `#[go_lib::main]` — entry-point attribute; runs the body as the program's
+//!   first goroutine on the process-wide scheduler (replaces the old `run`)
 //! - `go!` / `select!` macros — spawn goroutines, multiplex channel ops
 //! - [`chan`] — buffered and unbuffered channels
 //! - [`net`] — goroutine-aware `TcpListener` / `TcpStream` *(v0.2.0)*
@@ -93,10 +95,15 @@
 // Each `unsafe fn`'s contract is documented in its `# Safety` section instead.
 #![allow(unsafe_op_in_unsafe_fn)]
 
-/// Attribute macro that wraps a function body in [`run`].
+// Let the crate refer to itself as `go_lib` so the `#[go_lib::main]` attribute
+// macro — which expands to `go_lib::__main_entry(…)` — works in this crate's
+// own unit tests, doctests, and examples without a special in-crate spelling.
+extern crate self as go_lib;
+
+/// Attribute macro that runs a function body as the program's first goroutine.
 ///
 /// ```rust,ignore
-/// #[go_lib::run]
+/// #[go_lib::main]
 /// fn main() {
 ///     let (tx, rx) = go_lib::chan::chan::<i32>(0);
 ///     go_lib::go!(move || tx.send(42));
@@ -104,9 +111,11 @@
 /// }
 /// ```
 ///
-/// See the [`go_lib_macros::run`][`main`] documentation for the full
-/// expansion rules and return-type support.
-pub use go_lib_macros::run;
+/// The scheduler is a process-wide singleton, initialised on first use; the
+/// attribute promotes the body into the "main goroutine" and blocks the
+/// calling thread until it returns.  See the [`go_lib_macros::main`][`main`]
+/// documentation for the full expansion rules and return-type support.
+pub use go_lib_macros::main;
 
 pub mod chan;
 pub mod context;
@@ -131,39 +140,19 @@ pub mod sync;
 mod go_macro;
 pub(crate) mod loom_shim;
 
-/// Initialise the go-lib scheduler, run `f` as the first goroutine, and
-/// return whatever `f` returns.
+/// Internal entry point that the [`main`] attribute macro expands to.
 ///
-/// Blocks the calling thread until `f` returns.  The scheduler threads
-/// (one per logical CPU) continue running in the background after `run`
-/// returns; they park themselves when there is no more work.
+/// Initialises the process-wide singleton scheduler (on first use), runs `f`
+/// as the program's first goroutine, and returns whatever `f` returns,
+/// blocking the calling thread until then.  The scheduler threads (one per
+/// logical CPU) keep running in the background afterwards; they park
+/// themselves when there is no more work.
 ///
-/// # Parameters
-///
-/// `f` can capture any values it needs from the surrounding scope via a
-/// `move` closure — there is no need to pass parameters directly to `run`:
-///
-/// ```no_run
-/// let base = 10_i32;
-/// let result = go_lib::run(move || base * 2);
-/// assert_eq!(result, 20);
-/// ```
-///
-/// # Return values
-///
-/// The closure's return value is propagated back to the caller:
-///
-/// ```no_run
-/// let sum = go_lib::run(|| {
-///     let (tx, rx) = go_lib::chan::chan::<i32>(4);
-///     for i in 1..=4 { let t = tx.clone(); go_lib::__spawn(move || t.send(i)); }
-///     (0..4).filter_map(|_| rx.recv()).sum::<i32>()
-/// });
-/// assert_eq!(sum, 10);
-/// ```
-///
-/// When the closure returns `()` (the default), `run` behaves exactly as
-/// before — the return value can simply be ignored.
+/// This is not part of the public API — application code should use
+/// `#[go_lib::main]` instead of calling this directly.  It is exposed
+/// (`#[doc(hidden)]`) only so the attribute expansion, integration tests, and
+/// multi-entry stress harnesses can reach the bootstrap from outside the
+/// crate.
 ///
 /// # Panics
 ///
@@ -171,7 +160,8 @@ pub(crate) mod loom_shim;
 /// goroutine is caught by the scheduler's `catch_unwind`; the panic payload
 /// is forwarded to [`set_panic_handler`] and the calling thread is woken
 /// with an `expect` failure.
-pub fn run<F, R>(f: F) -> R
+#[doc(hidden)]
+pub fn __main_entry<F, R>(f: F) -> R
 where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
@@ -187,7 +177,8 @@ where
 /// # Quick example
 ///
 /// ```no_run
-/// go_lib::run(|| {
+/// #[go_lib::main]
+/// fn main() {
 ///     let data = vec![1_i64, 2, 3, 4, 5];
 ///
 ///     let sum = go_lib::scope(|s| {
@@ -197,7 +188,7 @@ where
 ///     });
 ///
 ///     assert_eq!(sum, 15);
-/// });
+/// }
 /// ```
 pub fn scope<'env, F, R>(f: F) -> R
 where
@@ -220,18 +211,19 @@ where
 /// # Panics
 ///
 /// Panics if called from outside a goroutine (e.g. from `main` before
-/// calling [`run`]).
+/// the [`macro@main`] attribute's first goroutine starts).
 ///
 /// # Example
 ///
 /// ```no_run
-/// go_lib::run(|| {
+/// #[go_lib::main]
+/// fn main() {
 ///     for i in 0..1_000_000 {
 ///         if i % 10_000 == 0 {
 ///             go_lib::gosched(); // let other goroutines run
 ///         }
 ///     }
-/// });
+/// }
 /// ```
 pub fn gosched() {
     // SAFETY: we are on a goroutine stack (enforced by the debug_assert inside
@@ -245,14 +237,16 @@ pub fn gosched() {
 ///
 /// Calls [`entersyscall`][runtime::syscall::entersyscall] before `f` and
 /// [`exitsyscall`][runtime::syscall::exitsyscall] after `f` returns.  This is
-/// a no-op when called outside the scheduler (before [`run`]).
+/// a no-op when called outside the scheduler (before the [`macro@main`]
+/// entry point runs).
 ///
 /// # Example
 ///
 /// ```no_run
-/// go_lib::run(|| {
+/// #[go_lib::main]
+/// fn main() {
 ///     let data = go_lib::with_syscall(|| std::fs::read("file.txt"));
-/// });
+/// }
 /// ```
 pub fn with_syscall<F, R>(f: F) -> R
 where
@@ -275,9 +269,10 @@ where
 /// # Example
 ///
 /// ```no_run
-/// go_lib::run(|| {
+/// #[go_lib::main]
+/// fn main() {
 ///     go_lib::sleep(std::time::Duration::from_millis(10));
-/// });
+/// }
 /// ```
 pub fn sleep(d: std::time::Duration) {
     // SAFETY: called from a goroutine context (checked by debug_assert in sleep).
@@ -286,7 +281,8 @@ pub fn sleep(d: std::time::Duration) {
 
 /// Spawn a goroutine.  Called by the [`go!`] macro; not for direct use.
 ///
-/// Must be called from within a running goroutine (i.e. inside [`run`]).
+/// Must be called from within a running goroutine (i.e. under the
+/// [`macro@main`] entry point).
 ///
 /// # Panics
 ///

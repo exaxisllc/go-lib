@@ -263,7 +263,6 @@ where
 mod tests {
     use super::*;
     use crate::runtime::p::{P, PIDLE, PRUNNING, PSYSCALL};
-    use crate::runtime::sched::run_impl;
     use std::sync::atomic::Ordering::Relaxed;
     use std::sync::Arc;
 
@@ -364,6 +363,7 @@ mod tests {
 
     /// with_syscall inside a goroutine: P transitions through PSYSCALL and back.
     #[test]
+    #[go_lib::main]
     fn with_syscall_in_goroutine() {
         use std::sync::atomic::{AtomicU32, Ordering};
         let saw_psyscall = Arc::new(AtomicU32::new(0));
@@ -372,29 +372,27 @@ mod tests {
         let saw_gsyscall = Arc::new(AtomicU32::new(0));
         let saw_gsyscall2 = Arc::clone(&saw_gsyscall);
 
-        run_impl(move || {
-            // Capture P and G status during the "syscall".
-            let status_during = with_syscall(|| {
-                // Peek at our P's status from inside the syscall.
-                let m = current_m();
-                if m.is_null() { return PIDLE; }
-                // After entersyscall, M.p is null; oldp has the P.
-                let p = unsafe { (*m).oldp };
-                if p.is_null() { return PIDLE; }
+        // Capture P and G status during the "syscall".
+        let status_during = with_syscall(|| {
+            // Peek at our P's status from inside the syscall.
+            let m = current_m();
+            if m.is_null() { return PIDLE; }
+            // After entersyscall, M.p is null; oldp has the P.
+            let p = unsafe { (*m).oldp };
+            if p.is_null() { return PIDLE; }
 
-                // Also check G status: should be GSYSCALL.
-                let gp = crate::runtime::g::current_g();
-                if !gp.is_null() {
-                    saw_gsyscall2.store(
-                        unsafe { (*gp).atomicstatus.load(Ordering::Acquire) },
-                        Ordering::Relaxed,
-                    );
-                }
+            // Also check G status: should be GSYSCALL.
+            let gp = crate::runtime::g::current_g();
+            if !gp.is_null() {
+                saw_gsyscall2.store(
+                    unsafe { (*gp).atomicstatus.load(Ordering::Acquire) },
+                    Ordering::Relaxed,
+                );
+            }
 
-                unsafe { (*p).status.load(Ordering::Acquire) }
-            });
-            saw2.store(status_during, Ordering::Relaxed);
+            unsafe { (*p).status.load(Ordering::Acquire) }
         });
+        saw2.store(status_during, Ordering::Relaxed);
 
         assert_eq!(
             saw_psyscall.load(std::sync::atomic::Ordering::Acquire),

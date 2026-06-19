@@ -14,32 +14,31 @@
 //! cargo run --example scope_channel
 //! ```
 
+#[go_lib::main]
 fn main() {
-    let sum = go_lib::run(|| {
-        let (tx, rx) = go_lib::chan::chan::<i32>(0); // unbuffered
+    let (tx, rx) = go_lib::chan::chan::<i32>(0); // unbuffered
 
-        go_lib::scope(|s| {
-            // Producer: send 0..10, then close so the consumer terminates.
-            s.go(move || {
-                for i in 0..10 {
-                    tx.send(i);
-                }
-                tx.close();
-            });
+    let sum = go_lib::scope(|s| {
+        // Producer: send 0..10, then close so the consumer terminates.
+        s.go(move || {
+            for i in 0..10 {
+                tx.send(i);
+            }
+            tx.close();
+        });
 
-            // Consumer: drain until the channel is closed and empty.
-            s.go(move || {
-                let mut total = 0_i32;
-                while let Some(v) = rx.recv() {
-                    total += v;
-                }
-                total
-            })
-            .join()
-            .expect("consumer goroutine panicked")
+        // Consumer: drain until the channel is closed and empty.
+        s.go(move || {
+            let mut total = 0_i32;
+            while let Some(v) = rx.recv() {
+                total += v;
+            }
+            total
         })
-        // scope() blocks here until both goroutines have finished.
+        .join()
+        .expect("consumer goroutine panicked")
     });
+    // scope() blocks until both goroutines have finished.
 
     println!("sum 0..10 = {sum}");
     assert_eq!(sum, 45); // 0+1+…+9 = 45

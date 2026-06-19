@@ -7,7 +7,8 @@
 //! use go_lib::context;
 //! use std::time::Duration;
 //!
-//! go_lib::run(|| {
+//! #[go_lib::main]
+//! fn main() {
 //!     // Root context — never cancels on its own.
 //!     let bg = context::background();
 //!
@@ -26,7 +27,7 @@
 //!
 //!     go_lib::sleep(Duration::from_millis(10));
 //!     cancel.cancel(); // signal the worker to stop
-//! });
+//! }
 //! ```
 //!
 //! ## Design
@@ -45,9 +46,9 @@
 //! ## Requirements
 //!
 //! `with_deadline` / `with_timeout` spawn a timer goroutine and therefore
-//! require the go-lib scheduler to be running (i.e. called from inside
-//! [`go_lib::run`]).  `background()` and `with_cancel()` are safe to call
-//! from anywhere.
+//! require the go-lib scheduler to be running (i.e. called from inside a
+//! `#[go_lib::main]` entry point).  `background()` and `with_cancel()` are
+//! safe to call from anywhere.
 
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
@@ -213,7 +214,7 @@ pub fn with_cancel(parent: &Context) -> (Context, CancelFn) {
 ///
 /// # Requirements
 ///
-/// Must be called from within a goroutine (inside `go_lib::run`) because it
+/// Must be called from within a goroutine (under `#[go_lib::main]`) because it
 /// spawns a timer goroutine.
 pub fn with_deadline(parent: &Context, deadline: Instant) -> (Context, CancelFn) {
     let (ctx, cancel) = make_child(parent, Some(deadline));
@@ -244,7 +245,7 @@ pub fn with_deadline(parent: &Context, deadline: Instant) -> (Context, CancelFn)
 ///
 /// # Requirements
 ///
-/// Same as `with_deadline` — must be called from within `go_lib::run`.
+/// Same as `with_deadline` — must be called from within `#[go_lib::main]`.
 pub fn with_timeout(parent: &Context, timeout: Duration) -> (Context, CancelFn) {
     with_deadline(parent, Instant::now() + timeout)
 }
@@ -291,7 +292,6 @@ fn make_child(parent: &Context, deadline: Option<Instant>) -> (Context, CancelFn
 #[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
-    use crate::runtime::sched::run_impl;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     /// background() context is never done.
@@ -359,55 +359,52 @@ mod tests {
 
     /// done() channel fires after cancel inside a goroutine.
     #[test]
+    #[go_lib::main]
     fn done_channel_fires_in_goroutine() {
         let fired = std::sync::Arc::new(AtomicBool::new(false));
         let fired2 = std::sync::Arc::clone(&fired);
 
-        run_impl(move || {
-            let bg = background();
-            let (ctx, cancel) = with_cancel(&bg);
+        let bg = background();
+        let (ctx, cancel) = with_cancel(&bg);
 
-            crate::runtime::sched::spawn_goroutine(move || {
-                ctx.done().recv(); // blocks until cancelled
-                fired2.store(true, Ordering::Release);
-            });
-
-            // Let the goroutine park on the done channel.
-            for _ in 0..20 { crate::gosched(); }
-            cancel.cancel();
-
-            // Wait for the goroutine to record the wakeup.
-            let deadline = Instant::now() + Duration::from_millis(500);
-            loop {
-                if fired.load(Ordering::Acquire) { break; }
-                assert!(Instant::now() < deadline, "done channel did not fire");
-                crate::gosched();
-            }
+        crate::runtime::sched::spawn_goroutine(move || {
+            ctx.done().recv(); // blocks until cancelled
+            fired2.store(true, Ordering::Release);
         });
+
+        // Let the goroutine park on the done channel.
+        for _ in 0..20 { crate::gosched(); }
+        cancel.cancel();
+
+        // Wait for the goroutine to record the wakeup.
+        let deadline = Instant::now() + Duration::from_millis(500);
+        loop {
+            if fired.load(Ordering::Acquire) { break; }
+            assert!(Instant::now() < deadline, "done channel did not fire");
+            crate::gosched();
+        }
     }
 
     /// with_timeout cancels after the given duration.
     #[test]
+    #[go_lib::main]
     fn with_timeout_cancels_after_duration() {
-        run_impl(|| {
-            let bg = background();
-            let (ctx, _cancel) = with_timeout(&bg, Duration::from_millis(20));
+        let bg = background();
+        let (ctx, _cancel) = with_timeout(&bg, Duration::from_millis(20));
 
-            // Wait for the timeout to fire.
-            ctx.done().recv(); // blocks until deadline exceeded
-            assert_eq!(ctx.err(), Some(ContextError::DeadlineExceeded));
-        });
+        // Wait for the timeout to fire.
+        ctx.done().recv(); // blocks until deadline exceeded
+        assert_eq!(ctx.err(), Some(ContextError::DeadlineExceeded));
     }
 
     /// with_deadline in the past cancels immediately.
     #[test]
+    #[go_lib::main]
     fn with_deadline_in_past_cancels_immediately() {
-        run_impl(|| {
-            let bg = background();
-            let past = Instant::now() - Duration::from_secs(1);
-            let (ctx, _cancel) = with_deadline(&bg, past);
-            assert!(ctx.is_done(), "past deadline must cancel immediately");
-        });
+        let bg = background();
+        let past = Instant::now() - Duration::from_secs(1);
+        let (ctx, _cancel) = with_deadline(&bg, past);
+        assert!(ctx.is_done(), "past deadline must cancel immediately");
     }
 
     /// CancelFn is Clone and either clone can cancel.

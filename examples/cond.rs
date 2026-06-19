@@ -58,55 +58,54 @@ impl<T: Send + 'static> BoundedQueue<T> {
     }
 }
 
+#[go_lib::main]
 fn main() {
-    go_lib::run(|| {
-        let queue: Arc<BoundedQueue<String>> =
-            Arc::new(BoundedQueue::new(CAPACITY));
-        let total = PRODUCERS * ITEMS_PER_PRODUCER;
+    let queue: Arc<BoundedQueue<String>> =
+        Arc::new(BoundedQueue::new(CAPACITY));
+    let total = PRODUCERS * ITEMS_PER_PRODUCER;
 
-        let wg = Arc::new(WaitGroup::new());
+    let wg = Arc::new(WaitGroup::new());
 
-        // Producers
-        for p in 0..PRODUCERS {
-            let q   = Arc::clone(&queue);
-            let wg2 = Arc::clone(&wg);
-            wg.add(1);
-            go_lib::go!(move || {
-                for i in 0..ITEMS_PER_PRODUCER {
-                    go_lib::sleep(Duration::from_millis(2));
-                    let msg = format!("p{p}:item{i}");
-                    println!("  produce {msg}");
-                    q.push(msg);
-                }
-                wg2.done();
-            });
-        }
+    // Producers
+    for p in 0..PRODUCERS {
+        let q   = Arc::clone(&queue);
+        let wg2 = Arc::clone(&wg);
+        wg.add(1);
+        go_lib::go!(move || {
+            for i in 0..ITEMS_PER_PRODUCER {
+                go_lib::sleep(Duration::from_millis(2));
+                let msg = format!("p{p}:item{i}");
+                println!("  produce {msg}");
+                q.push(msg);
+            }
+            wg2.done();
+        });
+    }
 
-        // Consumers
-        let received = Arc::new(Mutex::new(Vec::<String>::new()));
-        let cwg = Arc::new(WaitGroup::new());
-        for _ in 0..CONSUMERS {
-            let q         = Arc::clone(&queue);
-            let received2 = Arc::clone(&received);
-            let cwg2      = Arc::clone(&cwg);
-            cwg.add(1);
-            go_lib::go!(move || {
-                // Each consumer takes `total / CONSUMERS` items.
-                for _ in 0..total / CONSUMERS {
-                    let item = q.pop();
-                    println!("consume {item}");
-                    received2.lock().unwrap().push(item);
-                }
-                cwg2.done();
-            });
-        }
+    // Consumers
+    let received = Arc::new(Mutex::new(Vec::<String>::new()));
+    let cwg = Arc::new(WaitGroup::new());
+    for _ in 0..CONSUMERS {
+        let q         = Arc::clone(&queue);
+        let received2 = Arc::clone(&received);
+        let cwg2      = Arc::clone(&cwg);
+        cwg.add(1);
+        go_lib::go!(move || {
+            // Each consumer takes `total / CONSUMERS` items.
+            for _ in 0..total / CONSUMERS {
+                let item = q.pop();
+                println!("consume {item}");
+                received2.lock().unwrap().push(item);
+            }
+            cwg2.done();
+        });
+    }
 
-        wg.wait();   // all producers done
-        cwg.wait();  // all consumers done
+    wg.wait();   // all producers done
+    cwg.wait();  // all consumers done
 
-        let r = received.lock().unwrap();
-        println!("\nTotal items consumed: {}", r.len());
-        assert_eq!(r.len(), total, "all items must be consumed exactly once");
-        println!("OK — all {total} items passed through the bounded queue.");
-    });
+    let r = received.lock().unwrap();
+    println!("\nTotal items consumed: {}", r.len());
+    assert_eq!(r.len(), total, "all items must be consumed exactly once");
+    println!("OK — all {total} items passed through the bounded queue.");
 }

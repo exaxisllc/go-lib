@@ -310,8 +310,8 @@ mod tests {
     /// This version uses `run_impl` with a real goroutine so execution is safe,
     /// and verifies the observable outcome: the goroutine body ran.
     #[test]
+    #[go_lib::main]
     fn goready_pushes_to_global_queue() {
-        use crate::runtime::sched::run_impl;
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
 
@@ -319,23 +319,21 @@ mod tests {
         let ran2 = Arc::clone(&ran);
         let ran3 = Arc::clone(&ran); // checked inside run_impl to bound the loop
 
-        run_impl(move || {
-            // spawn_goroutine calls goready internally (via push_batch + startm).
-            // Verify that the goroutine runs, which proves the ready path works.
-            crate::runtime::sched::spawn_goroutine(move || {
-                ran2.store(true, Ordering::Release);
-            });
-            // Yield until the spawned goroutine runs.  A fixed iteration count
-            // is fragile under heavy parallel test load; use a wall-clock
-            // deadline instead so the test passes even on slow CI runners.
-            let deadline =
-                std::time::Instant::now() + std::time::Duration::from_secs(5);
-            while !ran3.load(Ordering::Acquire)
-                && std::time::Instant::now() < deadline
-            {
-                crate::gosched();
-            }
+        // spawn_goroutine calls goready internally (via push_batch + startm).
+        // Verify that the goroutine runs, which proves the ready path works.
+        crate::runtime::sched::spawn_goroutine(move || {
+            ran2.store(true, Ordering::Release);
         });
+        // Yield until the spawned goroutine runs.  A fixed iteration count
+        // is fragile under heavy parallel test load; use a wall-clock
+        // deadline instead so the test passes even on slow CI runners.
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !ran3.load(Ordering::Acquire)
+            && std::time::Instant::now() < deadline
+        {
+            crate::gosched();
+        }
 
         assert!(ran.load(Ordering::Acquire), "goroutine should have run via goready path");
     }

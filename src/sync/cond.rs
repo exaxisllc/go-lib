@@ -11,26 +11,27 @@
 //! use std::sync::{Arc, Mutex};
 //! use go_lib::sync::Cond;
 //!
-//! let mu  = Arc::new(Mutex::new(false));
-//! let cnd = Arc::new(Cond::new());
+//! #[go_lib::main]
+//! fn main() {
+//!     let mu  = Arc::new(Mutex::new(false));
+//!     let cnd = Arc::new(Cond::new());
 //!
-//! // Producer goroutine
-//! let mu2  = Arc::clone(&mu);
-//! let cnd2 = Arc::clone(&cnd);
-//! go_lib::run(move || {
-//!     let mut ready = mu2.lock().unwrap();
-//!     *ready = true;
-//!     drop(ready);
-//!     cnd2.notify_one();
-//! });
+//!     // Producer goroutine
+//!     let mu2  = Arc::clone(&mu);
+//!     let cnd2 = Arc::clone(&cnd);
+//!     go_lib::go!(move || {
+//!         let mut ready = mu2.lock().unwrap();
+//!         *ready = true;
+//!         drop(ready);
+//!         cnd2.notify_one();
+//!     });
 //!
-//! // Consumer
-//! go_lib::run(move || {
+//!     // Consumer (runs on the main goroutine)
 //!     let mut ready = mu.lock().unwrap();
 //!     while !*ready {
 //!         ready = cnd.wait(&mu, ready);
 //!     }
-//! });
+//! }
 //! ```
 //!
 //! ## Implementation
@@ -72,7 +73,7 @@ use crate::runtime::rawmutex::RawMutex;
 /// so other goroutines sharing the same M continue to be scheduled while
 /// waiters sleep.
 ///
-/// Must be used from within a [`go_lib::run`] context.
+/// Must be used from within a `#[go_lib::main]` context.
 pub struct Cond {
     /// Spinlock protecting `waitq`.  A `RawMutex` (not `std::sync::Mutex`) so
     /// the goroutine `wait()` path can hold the queue lock ACROSS the park via
@@ -217,12 +218,12 @@ unsafe fn unlock_cond_mutex(arg: *mut u8) {
 #[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
-    use crate::runtime::sched::run_impl;
     use std::sync::{Arc, Mutex};
     use std::sync::atomic::{AtomicI32, Ordering};
 
     /// A single waiter is woken by notify_one.
     #[test]
+    #[go_lib::main]
     fn single_waiter_notify_one() {
         let mu   = Arc::new(Mutex::new(false));
         let cnd  = Arc::new(Cond::new());
@@ -233,8 +234,48 @@ mod tests {
         let woke2 = Arc::clone(&woke);
         let woke3 = Arc::clone(&woke);
 
-        run_impl(move || {
-            // Spawn a waiter goroutine.
+        // Spawn a waiter goroutine.
+        crate::runtime::sched::spawn_goroutine(move || {
+            let mut guard = mu2.lock().unwrap();
+            while !*guard {
+                guard = cnd2.wait(&mu2, guard);
+            }
+            woke2.fetch_add(1, Ordering::Relaxed);
+        });
+
+        // Yield so the waiter parks, then signal.
+        for _ in 0..20 { crate::gosched(); }
+        {
+            let mut g = mu.lock().unwrap();
+            *g = true;
+        }
+        cnd.notify_one();
+
+        // Spin-wait for the waiter to record the wakeup.
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_millis(500);
+        loop {
+            if woke3.load(Ordering::Acquire) == 1 { break; }
+            assert!(std::time::Instant::now() < deadline, "waiter did not wake");
+            crate::gosched();
+        }
+
+        assert_eq!(woke.load(Ordering::Acquire), 1);
+    }
+
+    /// All waiters are woken by notify_all.
+    #[test]
+    #[go_lib::main]
+    fn multiple_waiters_notify_all() {
+        const N: i32 = 4;
+        let mu   = Arc::new(Mutex::new(false));
+        let cnd  = Arc::new(Cond::new());
+        let woke = Arc::new(AtomicI32::new(0));
+
+        for _ in 0..N {
+            let mu2   = Arc::clone(&mu);
+            let cnd2  = Arc::clone(&cnd);
+            let woke2 = Arc::clone(&woke);
             crate::runtime::sched::spawn_goroutine(move || {
                 let mut guard = mu2.lock().unwrap();
                 while !*guard {
@@ -242,68 +283,20 @@ mod tests {
                 }
                 woke2.fetch_add(1, Ordering::Relaxed);
             });
+        }
 
-            // Yield so the waiter parks, then signal.
-            for _ in 0..20 { crate::gosched(); }
-            {
-                let mut g = mu.lock().unwrap();
-                *g = true;
-            }
-            cnd.notify_one();
+        for _ in 0..40 { crate::gosched(); }
+        *mu.lock().unwrap() = true;
+        cnd.notify_all();
 
-            // Spin-wait for the waiter to record the wakeup.
-            let deadline = std::time::Instant::now()
-                + std::time::Duration::from_millis(500);
-            loop {
-                if woke3.load(Ordering::Acquire) == 1 { break; }
-                assert!(std::time::Instant::now() < deadline, "waiter did not wake");
-                crate::gosched();
-            }
-        });
-
-        assert_eq!(woke.load(Ordering::Acquire), 1);
-    }
-
-    /// All waiters are woken by notify_all.
-    #[test]
-    fn multiple_waiters_notify_all() {
-        const N: i32 = 4;
-        let mu   = Arc::new(Mutex::new(false));
-        let cnd  = Arc::new(Cond::new());
-        let woke = Arc::new(AtomicI32::new(0));
-
-        run_impl({
-            let mu   = Arc::clone(&mu);
-            let cnd  = Arc::clone(&cnd);
-            let woke = Arc::clone(&woke);
-            move || {
-                for _ in 0..N {
-                    let mu2   = Arc::clone(&mu);
-                    let cnd2  = Arc::clone(&cnd);
-                    let woke2 = Arc::clone(&woke);
-                    crate::runtime::sched::spawn_goroutine(move || {
-                        let mut guard = mu2.lock().unwrap();
-                        while !*guard {
-                            guard = cnd2.wait(&mu2, guard);
-                        }
-                        woke2.fetch_add(1, Ordering::Relaxed);
-                    });
-                }
-
-                for _ in 0..40 { crate::gosched(); }
-                *mu.lock().unwrap() = true;
-                cnd.notify_all();
-
-                let deadline = std::time::Instant::now()
-                    + std::time::Duration::from_millis(500);
-                loop {
-                    if woke.load(Ordering::Acquire) == N { break; }
-                    assert!(std::time::Instant::now() < deadline,
-                        "not all waiters woke: {}/{N}", woke.load(Ordering::Relaxed));
-                    crate::gosched();
-                }
-            }
-        });
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_millis(500);
+        loop {
+            if woke.load(Ordering::Acquire) == N { break; }
+            assert!(std::time::Instant::now() < deadline,
+                "not all waiters woke: {}/{N}", woke.load(Ordering::Relaxed));
+            crate::gosched();
+        }
 
         assert_eq!(woke.load(Ordering::Acquire), N);
     }

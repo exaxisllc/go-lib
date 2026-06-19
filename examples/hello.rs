@@ -9,27 +9,26 @@
 
 use go_lib::{chan::chan, go};
 
+#[go_lib::main]
 fn main() {
     const N: usize = 5;
 
-    go_lib::run(|| {
-        let (tx, rx) = chan::<String>(0); // unbuffered (synchronous)
+    let (tx, rx) = chan::<String>(0); // unbuffered (synchronous)
 
-        // Spawn N goroutines, each sending a greeting.
-        for i in 0..N {
-            let tx = tx.clone();
-            go!(move || {
-                tx.send(format!("hello from goroutine {i}"));
-            });
-        }
-        drop(tx); // drop the original; goroutine clones are still live
+    // Spawn N goroutines, each sending a greeting.
+    for i in 0..N {
+        let tx = tx.clone();
+        go!(move || {
+            tx.send(format!("hello from goroutine {i}"));
+        });
+    }
+    drop(tx); // drop the original; goroutine clones are still live
 
-        // Receive exactly N greetings (order is non-deterministic).
-        for _ in 0..N {
-            if let Some(msg) = rx.recv() {
-                println!("{msg}");
-            }
+    // Receive exactly N greetings (order is non-deterministic).
+    for _ in 0..N {
+        if let Some(msg) = rx.recv() {
+            println!("{msg}");
         }
-        println!("all goroutines finished");
-    });
+    }
+    println!("all goroutines finished");
 }

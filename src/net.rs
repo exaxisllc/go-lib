@@ -12,7 +12,8 @@
 //! ```no_run
 //! use std::io::{Read, Write};
 //!
-//! go_lib::run(|| {
+//! #[go_lib::main]
+//! fn main() {
 //!     let listener = go_lib::net::TcpListener::bind("127.0.0.1:8080").unwrap();
 //!     loop {
 //!         let mut stream = listener.accept().unwrap();
@@ -22,7 +23,7 @@
 //!             stream.write_all(&buf[..n]).unwrap();
 //!         });
 //!     }
-//! });
+//! }
 //! ```
 //!
 //! ## `std::io` trait implementations
@@ -39,7 +40,8 @@
 //! ```no_run
 //! use std::io::{Read, Write};
 //!
-//! go_lib::run(|| {
+//! #[go_lib::main]
+//! fn main() {
 //!     let listener = go_lib::net::TcpListener::bind("127.0.0.1:9000").unwrap();
 //!     let stream = listener.accept().unwrap();
 //!     let mut writer = stream.try_clone().unwrap();
@@ -49,7 +51,7 @@
 //!         let n = (&stream).read(&mut buf).unwrap();   // via &TcpStream impl
 //!         writer.write_all(&buf[..n]).unwrap();
 //!     });
-//! });
+//! }
 //! ```
 //!
 //! ## Porting note

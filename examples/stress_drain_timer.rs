@@ -24,6 +24,10 @@
 //! memory stays flat even at tens of thousands of iterations per run.  The
 //! per-worker iteration cap exists only to bound runtime on very fast
 //! machines.
+//!
+//! Because each worker OS thread drives its own bootstrap, this harness calls
+//! the internal `go_lib::__main_entry` (what `#[go_lib::main]` expands to)
+//! directly rather than the entry attribute, which only fits a single `main`.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -45,7 +49,7 @@ fn sleeper_rt(seed: u64, max_iters: u64) {
         let sleep_us = 200 + (x % 600); // 200–800 µs
         let wait_us = 100 + (x % 1200); // main returns 100–1300 µs in
 
-        go_lib::run(move || {
+        go_lib::__main_entry(move || {
             for _ in 0..8 {
                 go_lib::go!(move || {
                     go_lib::sleep(Duration::from_micros(sleep_us));
@@ -67,7 +71,7 @@ fn churn_rt(max_iters: u64) {
     let mut iters = 0u64;
     while !STOP.load(Ordering::Relaxed) && iters < max_iters {
         iters += 1;
-        go_lib::run(|| {
+        go_lib::__main_entry(|| {
             const PAIRS: usize = 8;
             let (done_tx, done_rx) = go_lib::chan::chan::<()>(PAIRS);
             for _ in 0..PAIRS {

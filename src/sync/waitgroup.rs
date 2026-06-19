@@ -69,15 +69,18 @@ unsafe impl Send for WgState {}
 /// use std::sync::Arc;
 /// use go_lib::sync::WaitGroup;
 ///
-/// let wg = Arc::new(WaitGroup::new());
-/// for i in 0..5 {
-///     let wg = Arc::clone(&wg);
-///     go_lib::run(move || {
-///         wg.add(1);
-///         // ... spawn goroutine that calls wg.done() when finished ...
-///     });
+/// #[go_lib::main]
+/// fn main() {
+///     let wg = Arc::new(WaitGroup::new());
+///     for i in 0..5 {
+///         let wg = Arc::clone(&wg);
+///         go_lib::go!(move || {
+///             wg.add(1);
+///             // ... do work, then call wg.done() when finished ...
+///         });
+///     }
+///     // wg.wait();  // blocks until all done() calls have been made
 /// }
-/// // wg.wait();  // blocks until all Done() calls have been made
 /// ```
 pub struct WaitGroup {
     /// Spinlock protecting `state`.  A `RawMutex` (not `std::sync::Mutex`)
@@ -262,7 +265,6 @@ unsafe fn unlock_wg_mutex(arg: *mut u8) {
 #[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
-    use crate::runtime::sched::run_impl;
     use std::sync::atomic::{AtomicI32, Ordering};
     use std::sync::Arc;
 
@@ -275,118 +277,114 @@ mod tests {
 
     /// add + done in a single goroutine; wait unblocks after done.
     #[test]
+    #[go_lib::main]
     fn single_worker() {
-        run_impl(|| {
-            let wg = Arc::new(WaitGroup::new());
-            let done = Arc::new(AtomicI32::new(0));
+        let wg = Arc::new(WaitGroup::new());
+        let done = Arc::new(AtomicI32::new(0));
 
-            wg.add(1);
-            let wg2   = Arc::clone(&wg);
-            let done2 = Arc::clone(&done);
-            crate::runtime::sched::spawn_goroutine(move || {
-                done2.fetch_add(1, Ordering::Relaxed);
-                wg2.done();
-            });
-
-            wg.wait();
-            assert_eq!(done.load(Ordering::Acquire), 1);
+        wg.add(1);
+        let wg2   = Arc::clone(&wg);
+        let done2 = Arc::clone(&done);
+        crate::runtime::sched::spawn_goroutine(move || {
+            done2.fetch_add(1, Ordering::Relaxed);
+            wg2.done();
         });
+
+        wg.wait();
+        assert_eq!(done.load(Ordering::Acquire), 1);
     }
 
     /// Five workers; wait unblocks only after all five call done.
     #[test]
+    #[go_lib::main]
     fn multiple_workers() {
         const N: i32 = 5;
         let count = Arc::new(AtomicI32::new(0));
         let count2 = Arc::clone(&count);
 
-        run_impl(move || {
-            let wg = Arc::new(WaitGroup::new());
+        let wg = Arc::new(WaitGroup::new());
 
-            for _ in 0..N {
-                wg.add(1);
-                let wg2    = Arc::clone(&wg);
-                let count3 = Arc::clone(&count2);
-                crate::runtime::sched::spawn_goroutine(move || {
-                    count3.fetch_add(1, Ordering::Relaxed);
-                    wg2.done();
-                });
-            }
+        for _ in 0..N {
+            wg.add(1);
+            let wg2    = Arc::clone(&wg);
+            let count3 = Arc::clone(&count2);
+            crate::runtime::sched::spawn_goroutine(move || {
+                count3.fetch_add(1, Ordering::Relaxed);
+                wg2.done();
+            });
+        }
 
-            wg.wait();
-            assert_eq!(count2.load(Ordering::Acquire), N);
-        });
+        wg.wait();
+        assert_eq!(count2.load(Ordering::Acquire), N);
 
         assert_eq!(count.load(Ordering::Acquire), N);
     }
 
     /// Two goroutines both wait; both unblock when the counter reaches zero.
     #[test]
+    #[go_lib::main]
     fn multiple_waiters() {
         let woke = Arc::new(AtomicI32::new(0));
         let woke2 = Arc::clone(&woke);
 
-        run_impl(move || {
-            let wg = Arc::new(WaitGroup::new());
-            wg.add(1);
+        let wg = Arc::new(WaitGroup::new());
+        wg.add(1);
 
-            // Spawn two waiters.
-            for _ in 0..2 {
-                let wg3   = Arc::clone(&wg);
-                let woke3 = Arc::clone(&woke2);
-                crate::runtime::sched::spawn_goroutine(move || {
-                    wg3.wait();
-                    woke3.fetch_add(1, Ordering::Relaxed);
-                });
-            }
+        // Spawn two waiters.
+        for _ in 0..2 {
+            let wg3   = Arc::clone(&wg);
+            let woke3 = Arc::clone(&woke2);
+            crate::runtime::sched::spawn_goroutine(move || {
+                wg3.wait();
+                woke3.fetch_add(1, Ordering::Relaxed);
+            });
+        }
 
-            // Yield so the waiters have a chance to call wg.wait() and park.
-            for _ in 0..20 { crate::gosched(); }
-            wg.done();
+        // Yield so the waiters have a chance to call wg.wait() and park.
+        for _ in 0..20 { crate::gosched(); }
+        wg.done();
 
-            // Poll until both waiter goroutines have run past wg.wait() and
-            // incremented woke.  A fixed gosched-loop is not deterministic
-            // under parallel test load; polling on the atomic is race-free.
-            let deadline = std::time::Instant::now()
-                + std::time::Duration::from_millis(500);
-            loop {
-                if woke2.load(Ordering::Acquire) >= 2 { break; }
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "timed out: only {} of 2 waiters woke",
-                    woke2.load(Ordering::Relaxed),
-                );
-                crate::gosched();
-            }
-        });
+        // Poll until both waiter goroutines have run past wg.wait() and
+        // incremented woke.  A fixed gosched-loop is not deterministic
+        // under parallel test load; polling on the atomic is race-free.
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_millis(500);
+        loop {
+            if woke2.load(Ordering::Acquire) >= 2 { break; }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out: only {} of 2 waiters woke",
+                woke2.load(Ordering::Relaxed),
+            );
+            crate::gosched();
+        }
 
         assert_eq!(woke.load(Ordering::Acquire), 2, "both waiters must wake");
     }
 
     /// WaitGroup is reusable: after wait() the counter can be incremented again.
     #[test]
+    #[go_lib::main]
     fn reuse_after_wait() {
-        run_impl(|| {
-            let wg = Arc::new(WaitGroup::new());
+        let wg = Arc::new(WaitGroup::new());
 
-            // Round 1.
-            wg.add(1);
-            let wg2 = Arc::clone(&wg);
-            crate::runtime::sched::spawn_goroutine(move || { wg2.done(); });
-            wg.wait();
+        // Round 1.
+        wg.add(1);
+        let wg2 = Arc::clone(&wg);
+        crate::runtime::sched::spawn_goroutine(move || { wg2.done(); });
+        wg.wait();
 
-            // Round 2.
-            let done = Arc::new(AtomicI32::new(0));
-            wg.add(1);
-            let wg3   = Arc::clone(&wg);
-            let done2 = Arc::clone(&done);
-            crate::runtime::sched::spawn_goroutine(move || {
-                done2.store(1, Ordering::Relaxed);
-                wg3.done();
-            });
-            wg.wait();
-            assert_eq!(done.load(Ordering::Acquire), 1);
+        // Round 2.
+        let done = Arc::new(AtomicI32::new(0));
+        wg.add(1);
+        let wg3   = Arc::clone(&wg);
+        let done2 = Arc::clone(&done);
+        crate::runtime::sched::spawn_goroutine(move || {
+            done2.store(1, Ordering::Relaxed);
+            wg3.done();
         });
+        wg.wait();
+        assert_eq!(done.load(Ordering::Acquire), 1);
     }
 
     /// add(-1) below zero panics.

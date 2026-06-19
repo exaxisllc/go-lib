@@ -2740,7 +2740,7 @@ unsafe fn spawn_m(rt: &'static Rt, id: i64, p: *mut P) {
 
 
 // ---------------------------------------------------------------------------
-// run_impl — public entry point (exposed as go_lib::run)
+// run_impl — public entry point (exposed via go_lib::__main_entry / #[go_lib::main])
 // ---------------------------------------------------------------------------
 
 /// Initialise the scheduler and run `f` as the first goroutine, returning
@@ -2829,7 +2829,7 @@ where
             let msg = extract_panic_msg(payload.as_ref());
             std::panic::panic_any(format!("goroutine panicked: {msg}"))
         }
-        None => panic!("go_lib::run: first goroutine exited without storing a result"),
+        None => panic!("go_lib::__main_entry: first goroutine exited without storing a result"),
     }
 }
 
@@ -2916,45 +2916,51 @@ mod tests {
     /// switches, and verifies that the goroutine body executes and the scheduler
     /// returns control to the calling thread.
     #[test]
+    #[go_lib::main]
     fn run_single_goroutine() {
         use std::sync::atomic::{AtomicBool, Ordering};
         static RAN: AtomicBool = AtomicBool::new(false);
 
-        run_impl(|| {
-            RAN.store(true, Ordering::Release);
-        });
+        RAN.store(true, Ordering::Release);
 
         assert!(RAN.load(Ordering::Acquire), "goroutine body did not execute");
     }
 
-    /// Run two goroutines sequentially via `run_impl` (the scheduler is already
-    /// initialised by the first call; the second call just spawns a new goroutine).
+    /// An entry attaches to the already-running process-wide scheduler and can
+    /// spawn a goroutine onto it.
+    ///
+    /// The scheduler is a process singleton: only the first entry to run in this
+    /// binary calls `schedinit`; every later one — this test included, whenever
+    /// it is scheduled — reuses the existing Ps and Ms.  `global_rt_ptr()` being
+    /// non-null inside the body confirms the runtime is up, and the spawned
+    /// `go!` running to completion confirms it is functional.  (This replaces the
+    /// old two-`run_impl`-call `run_second_goroutine`, whose reuse check is now
+    /// implicit in every `#[go_lib::main]` test sharing the one scheduler.)
     #[test]
-    fn run_second_goroutine() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        static COUNT: AtomicUsize = AtomicUsize::new(0);
+    #[go_lib::main]
+    fn entry_reuses_running_scheduler() {
+        assert!(
+            !global_rt_ptr().is_null(),
+            "the singleton scheduler must be running inside an entry body"
+        );
 
-        // First call initialises (or reuses) the scheduler.
-        run_impl(|| { COUNT.fetch_add(1, Ordering::AcqRel); });
-        // Second call reuses the already-running scheduler.
-        run_impl(|| { COUNT.fetch_add(1, Ordering::AcqRel); });
-
-        assert_eq!(COUNT.load(Ordering::Acquire), 2);
+        let (tx, rx) = crate::chan::chan::<i32>(0);
+        crate::go!(move || { tx.send(99); });
+        assert_eq!(rx.recv(), Some(99), "spawned goroutine did not run");
     }
 
     /// `gosched()` must complete without panicking and execution must continue
     /// after the call site.
     #[test]
+    #[go_lib::main]
     fn gosched_returns_to_caller() {
         use std::sync::atomic::{AtomicBool, Ordering};
         static AFTER_YIELD: AtomicBool = AtomicBool::new(false);
 
-        run_impl(|| {
-            // Yield mid-goroutine.
-            unsafe { gosched() };
-            // Execution must resume here after rescheduling.
-            AFTER_YIELD.store(true, Ordering::Release);
-        });
+        // Yield mid-goroutine.
+        unsafe { gosched() };
+        // Execution must resume here after rescheduling.
+        AFTER_YIELD.store(true, Ordering::Release);
 
         assert!(
             AFTER_YIELD.load(Ordering::Acquire),
@@ -2966,6 +2972,7 @@ mod tests {
     /// set by the second.  Without the yield the first goroutine would starve
     /// the second on a single-P build; with the yield they interleave.
     #[test]
+    #[go_lib::main]
     fn gosched_allows_other_goroutines_to_run() {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
@@ -2973,15 +2980,13 @@ mod tests {
         let flag = Arc::new(AtomicBool::new(false));
         let flag_setter = Arc::clone(&flag);
 
-        run_impl(move || {
-            // Goroutine 1: spawn goroutine 2 then yield until it sets the flag.
-            spawn_goroutine(move || {
-                flag_setter.store(true, Ordering::Release);
-            });
-            while !flag.load(Ordering::Acquire) {
-                unsafe { gosched() };
-            }
+        // Goroutine 1: spawn goroutine 2 then yield until it sets the flag.
+        spawn_goroutine(move || {
+            flag_setter.store(true, Ordering::Release);
         });
+        while !flag.load(Ordering::Acquire) {
+            unsafe { gosched() };
+        }
     }
 
     /// Regression test: retiring a goroutine must not leave `m.locks`
@@ -3000,6 +3005,7 @@ mod tests {
     /// checker scheduled onto an M that retired a first-batch goroutine
     /// observes `locks >= 1`.
     #[test]
+    #[go_lib::main]
     fn goroutine_exit_releases_m_locks() {
         use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
         use std::sync::Arc;
@@ -3020,36 +3026,34 @@ mod tests {
         let max_locks1_w = Arc::clone(&max_locks1);
         let max_locks2_w = Arc::clone(&max_locks2);
 
-        run_impl(move || {
-            // Batch 1: N goroutines that record their M's `locks` and exit.
-            for _ in 0..N {
-                let exited     = Arc::clone(&exited_w);
-                let max_locks1 = Arc::clone(&max_locks1_w);
-                spawn_goroutine(move || {
-                    let locks = unsafe { (*current_m()).locks.load(Ordering::Relaxed) };
-                    max_locks1.fetch_max(locks, Ordering::AcqRel);
-                    exited.fetch_add(1, Ordering::AcqRel);
-                });
-            }
-            while exited_w.load(Ordering::Acquire) < N {
-                unsafe { gosched() };
-            }
+        // Batch 1: N goroutines that record their M's `locks` and exit.
+        for _ in 0..N {
+            let exited     = Arc::clone(&exited_w);
+            let max_locks1 = Arc::clone(&max_locks1_w);
+            spawn_goroutine(move || {
+                let locks = unsafe { (*current_m()).locks.load(Ordering::Relaxed) };
+                max_locks1.fetch_max(locks, Ordering::AcqRel);
+                exited.fetch_add(1, Ordering::AcqRel);
+            });
+        }
+        while exited_w.load(Ordering::Acquire) < N {
+            unsafe { gosched() };
+        }
 
-            // Batch 2: N checkers recording their M's `locks` at entry,
-            // after every batch-1 goroutine has run the goexit path.
-            for _ in 0..N {
-                let checked    = Arc::clone(&checked_w);
-                let max_locks2 = Arc::clone(&max_locks2_w);
-                spawn_goroutine(move || {
-                    let locks = unsafe { (*current_m()).locks.load(Ordering::Relaxed) };
-                    max_locks2.fetch_max(locks, Ordering::AcqRel);
-                    checked.fetch_add(1, Ordering::AcqRel);
-                });
-            }
-            while checked_w.load(Ordering::Acquire) < N {
-                unsafe { gosched() };
-            }
-        });
+        // Batch 2: N checkers recording their M's `locks` at entry,
+        // after every batch-1 goroutine has run the goexit path.
+        for _ in 0..N {
+            let checked    = Arc::clone(&checked_w);
+            let max_locks2 = Arc::clone(&max_locks2_w);
+            spawn_goroutine(move || {
+                let locks = unsafe { (*current_m()).locks.load(Ordering::Relaxed) };
+                max_locks2.fetch_max(locks, Ordering::AcqRel);
+                checked.fetch_add(1, Ordering::AcqRel);
+            });
+        }
+        while checked_w.load(Ordering::Acquire) < N {
+            unsafe { gosched() };
+        }
 
         let m1 = max_locks1.load(Ordering::Acquire);
         let m2 = max_locks2.load(Ordering::Acquire);
@@ -3077,6 +3081,7 @@ mod tests {
     /// The companion `goroutine_exit_releases_m_locks` test covers the dual
     /// failure (a torn acquire leaking/mis-applying a count).
     #[test]
+    #[go_lib::main]
     fn m_lock_pins_current_m_under_load() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
@@ -3089,35 +3094,33 @@ mod tests {
         let violations_w = Arc::clone(&violations);
         let done_w       = Arc::clone(&done);
 
-        run_impl(move || {
-            for _ in 0..N {
-                let v = Arc::clone(&violations_w);
-                let d = Arc::clone(&done_w);
-                spawn_goroutine(move || {
-                    for _ in 0..2_000 {
-                        let guard  = m_lock();
-                        let pinned = current_m();
-                        // Pinned: locks > 0 ⇒ Guard 0 suppresses preemption, so
-                        // current_m() must not move while we hold `guard`.
-                        for _ in 0..64 {
-                            if current_m() != pinned {
-                                v.fetch_add(1, Ordering::Relaxed);
-                                break;
-                            }
-                            std::hint::spin_loop();
+        for _ in 0..N {
+            let v = Arc::clone(&violations_w);
+            let d = Arc::clone(&done_w);
+            spawn_goroutine(move || {
+                for _ in 0..2_000 {
+                    let guard  = m_lock();
+                    let pinned = current_m();
+                    // Pinned: locks > 0 ⇒ Guard 0 suppresses preemption, so
+                    // current_m() must not move while we hold `guard`.
+                    for _ in 0..64 {
+                        if current_m() != pinned {
+                            v.fetch_add(1, Ordering::Relaxed);
+                            break;
                         }
-                        drop(guard);
-                        // Unpinned: yield so we genuinely migrate across Ms,
-                        // making the next acquire race a real migration window.
-                        unsafe { gosched() };
+                        std::hint::spin_loop();
                     }
-                    d.fetch_add(1, Ordering::Relaxed);
-                });
-            }
-            while done_w.load(Ordering::Acquire) < N {
-                unsafe { gosched() };
-            }
-        });
+                    drop(guard);
+                    // Unpinned: yield so we genuinely migrate across Ms,
+                    // making the next acquire race a real migration window.
+                    unsafe { gosched() };
+                }
+                d.fetch_add(1, Ordering::Relaxed);
+            });
+        }
+        while done_w.load(Ordering::Acquire) < N {
+            unsafe { gosched() };
+        }
 
         assert_eq!(
             violations.load(Ordering::Acquire),

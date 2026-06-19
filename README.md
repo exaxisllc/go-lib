@@ -5,7 +5,8 @@
 Go-style concurrency for Rust — goroutines, channels, `select!`, `WaitGroup`, `Cond`, and a `context` package — built on a rust-native direct port of the Go M:N scheduler.
 
 ```rust
-go_lib::run(|| {
+#[go_lib::main]
+fn main() {
     let (tx, rx) = go_lib::chan::chan::<String>(0);
 
     for i in 0..5 {
@@ -19,7 +20,7 @@ go_lib::run(|| {
             println!("{msg}");
         }
     }
-});
+}
 ```
 
 No `async`, no Tokio, no executor. Every goroutine starts with a **32 KiB stack** in release builds (sized to fit Rust's panic + libunwind unwind path; 16 KiB on Linux debug, 64 KiB on macOS and Windows debug) that grows automatically on demand (up to 1 GiB). The `G` descriptor is **128 B** — total per-goroutine memory is **~36 KiB** on Linux/Windows x86-64, ~48 KiB on macOS AArch64 (16 KiB OS guard page). The runtime is a work-stealing M:N scheduler ported verbatim from [`src/runtime/`](https://github.com/golang/go/tree/master/src/runtime) in the Go GitHub repository.
@@ -94,13 +95,14 @@ Add to `Cargo.toml`:
 go-lib = { path = "…" }   # local path until crates.io publication
 ```
 
-Every program entry point wraps its body in `go_lib::run`.
-Use the `#[go_lib::run]` attribute macro to do it automatically:
+Apply the `#[go_lib::main]` attribute to your entry point. It runs the
+function body as the program's first goroutine on the process-wide scheduler
+(initialised automatically on first use):
 
 ```rust
 use go_lib::{chan::chan, go};
 
-#[go_lib::run]
+#[go_lib::main]
 fn main() {
     let (tx, rx) = chan::<i32>(0); // unbuffered
 
@@ -112,15 +114,8 @@ fn main() {
 }
 ```
 
-Or call `go_lib::run` explicitly when you need more control:
-
-```rust
-fn main() {
-    go_lib::run(|| {
-        // body
-    });
-}
-```
+The body may return `()`, `ExitCode`, or `Result<_, E>`; the attribute
+forwards the return type to the first goroutine so `?` works naturally.
 
 Run the bundled examples:
 
@@ -133,7 +128,7 @@ cargo run --example scope           # scoped goroutines, safe borrows
 cargo run --example scope_channel   # scope + channel producer/consumer
 cargo run --example main_exitcode   # main() -> ExitCode
 cargo run --example main_result     # main() -> Result<(), E>
-cargo run --example attr_run        # all three #[go_lib::run] patterns
+cargo run --example attr_run        # all three #[go_lib::main] patterns
 ```
 
 ---
@@ -142,52 +137,42 @@ cargo run --example attr_run        # all three #[go_lib::run] patterns
 
 ### Entry point
 
-There are two equivalent ways to start the scheduler.
-
-#### Attribute macro (recommended)
+The scheduler is a process-wide singleton, initialised on first use. Apply
+the `#[go_lib::main]` attribute to your entry point to run its body as the
+program's first goroutine:
 
 ```rust
-#[go_lib::run]
+#[go_lib::main]
 fn main() { … }
 
-#[go_lib::run]
+#[go_lib::main]
 fn main() -> ExitCode { … }
 
-#[go_lib::run]
+#[go_lib::main]
 fn main() -> Result<(), MyError> { … }
 ```
 
-The macro expands the function body into `go_lib::run(move || [-> ReturnType] { … })`.
-It works on any function, not only `main`, and captures parameters via `move`.
+The attribute expands the function body into
+`go_lib::__main_entry(move || [-> ReturnType] { … })`, which initialises the
+scheduler (one M-thread per logical CPU, or the value of the `GOMAXPROCS`
+environment variable), runs the body as the first goroutine, and blocks until
+it returns — propagating the return value to the caller. The scheduler threads
+remain alive in the background for the process lifetime.
+
+It works on any function, not only `main`; the function's own parameters are
+captured into the first goroutine via `move`.
 
 An `async` function is rejected at compile time with a clear error message.
 
-#### Direct call
+If the first goroutine panics before returning, the entry point re-panics on
+the calling thread with a clear message.
 
-```rust
-pub fn run<F, R>(f: F) -> R
-where
-    F: FnOnce() -> R + Send + 'static,
-    R: Send + 'static,
-```
-
-Initialises the scheduler (one M-thread per logical CPU, or the value of the `GOMAXPROCS` environment variable), runs `f` as the first goroutine, and blocks until `f` returns — propagating `f`'s return value directly to the caller. The scheduler threads remain alive in the background; subsequent calls to `run` reuse them.
-
-**Parameters** are passed via `move` closures:
-
-```rust
-let threshold = 42_i32;
-go_lib::run(move || { /* threshold is in scope */ });
-```
-
-**Return values** propagate back to the caller:
-
-```rust
-let n: i32      = go_lib::run(|| compute_answer());
-let ok: bool    = go_lib::run(|| all_tasks_pass());
-```
-
-If the first goroutine panics before returning, `run` re-panics on the calling thread with a clear message.
+> **Note** — `#[go_lib::main]` is the only blessed entry point; the former
+> public `go_lib::run()` function and `#[go_lib::run]` attribute have been
+> removed. The attribute expands to `go_lib::__main_entry`, a `#[doc(hidden)]`
+> bootstrap that is also used directly by integration tests and multi-entry
+> stress harnesses that drive their own scheduler invocation from worker
+> threads.
 
 ---
 
@@ -197,15 +182,16 @@ If the first goroutine panics before returning, `run` re-panics on the calling t
 go!(closure)
 ```
 
-Spawns `closure` as a new goroutine. Must be called from inside `run`. Equivalent to Go's `go f()`.
+Spawns `closure` as a new goroutine. Must be called from inside a `#[go_lib::main]` entry point. Equivalent to Go's `go f()`.
 
 ```rust
-go_lib::run(|| {
+#[go_lib::main]
+fn main() {
     go!(|| println!("I run concurrently"));
     go!(move || {
         // captured variables are moved in
     });
-});
+}
 ```
 
 ---
@@ -223,11 +209,12 @@ go_lib::scope(|s| {
 Scoped goroutines work exactly like `std::thread::scope`: goroutines spawned inside the closure can borrow data from the enclosing stack frame because `scope` guarantees all spawned goroutines complete before it returns.  No `Arc`, no channels, and no `.clone()` are needed for read-only shared data.
 
 ```rust
-go_lib::run(|| {
+#[go_lib::main]
+fn main() {
     // `data` lives on the goroutine's stack.  Both goroutines borrow slices
     // of it directly — no Arc required.  `scope` enforces the lifetime at
-    // compile time; go_lib::run requires a 'static closure, so data that needs
-    // to be shared lives inside run (or is moved in).
+    // compile time; the first goroutine owns `data`, and `scope` guarantees
+    // the borrowers finish before it returns.
     let data = vec![1_i64, 2, 3, 4, 5, 6, 7, 8];
 
     let sum = go_lib::scope(|s| {
@@ -238,7 +225,7 @@ go_lib::run(|| {
     });
 
     assert_eq!(sum, 36);
-});
+}
 ```
 
 `s.go(f)` returns a `ScopedJoinHandle<'scope, R>`:
@@ -252,7 +239,8 @@ The `Err` payload from a panicking goroutine is the same `Box<dyn Any + Send>` y
 Channels work normally inside `s.go()` closures.  The scope lifetime guarantee means both goroutines finish before `scope` returns — no `Arc` or `WaitGroup` needed.  Call `tx.close()` after the last send so the consumer's `while let Some` loop terminates:
 
 ```rust
-go_lib::run(|| {
+#[go_lib::main]
+fn main() {
     let (tx, rx) = go_lib::chan::chan::<i32>(0); // unbuffered
 
     let sum = go_lib::scope(|s| {
@@ -278,7 +266,7 @@ go_lib::run(|| {
     // scope() returns here — both goroutines have finished.
 
     assert_eq!(sum, 45); // 0 + 1 + … + 9
-});
+}
 ```
 
 **When to prefer `scope` over `go!` + channel:**
@@ -311,7 +299,8 @@ let (tx, rx) = chan::<T>(capacity);  // capacity=0 → unbuffered
 `Sender<T>` and `Receiver<T>` are both `Clone`. Closing happens automatically when the last `Sender` clone is dropped, or explicitly via `tx.close()`. Sending on a closed channel panics (matching Go semantics).
 
 ```rust
-go_lib::run(|| {
+#[go_lib::main]
+fn main() {
     let (tx, rx) = chan::<u64>(8); // buffered, capacity 8
 
     go!(move || {
@@ -322,7 +311,7 @@ go_lib::run(|| {
     while let Some(n) = rx.recv() {
         println!("{n}");
     }
-});
+}
 ```
 
 ---
@@ -348,7 +337,8 @@ select! {
 - Arms may appear in any order.
 
 ```rust
-go_lib::run(|| {
+#[go_lib::main]
+fn main() {
     let (tx1, rx1) = chan::<i32>(0);
     let (tx2, rx2) = chan::<i32>(0);
 
@@ -359,7 +349,7 @@ go_lib::run(|| {
         recv(rx1) -> v => println!("from rx1: {:?}", v),
         recv(rx2) -> v => println!("from rx2: {:?}", v),
     }
-});
+}
 ```
 
 **Nonblocking poll:**
@@ -379,7 +369,8 @@ select! {
 use go_lib::sync::WaitGroup;
 use std::sync::Arc;
 
-go_lib::run(|| {
+#[go_lib::main]
+fn main() {
     let wg = Arc::new(WaitGroup::new());
 
     for i in 0..8 {
@@ -392,7 +383,7 @@ go_lib::run(|| {
     }
 
     wg.wait(); // blocks until counter reaches 0
-});
+}
 ```
 
 `WaitGroup` is reusable: `add` / `done` / `wait` may be called in multiple rounds on the same instance. Calling `done` when the counter is already 0 panics (matching Go semantics).
@@ -407,7 +398,8 @@ A goroutine-aware condition variable. `wait` parks the calling goroutine via the
 use go_lib::sync::Cond;
 use std::sync::{Arc, Mutex};
 
-go_lib::run(|| {
+#[go_lib::main]
+fn main() {
     let mu  = Arc::new(Mutex::new(false));
     let cnd = Arc::new(Cond::new());
 
@@ -426,7 +418,7 @@ go_lib::run(|| {
         guard = cnd.wait(&mu, guard);
     }
     println!("flag is set");
-});
+}
 ```
 
 | Method | Description |
@@ -448,7 +440,8 @@ A port of Go's `context` package. A `Context` carries a cancellation signal and 
 use go_lib::context;
 use std::time::Duration;
 
-go_lib::run(|| {
+#[go_lib::main]
+fn main() {
     let bg = context::background(); // root — never cancels
 
     // Derived context with explicit cancel
@@ -466,7 +459,7 @@ go_lib::run(|| {
 
     go_lib::sleep(Duration::from_millis(10));
     cancel.cancel(); // signal all workers
-});
+}
 ```
 
 | Constructor | Description |
@@ -484,7 +477,7 @@ go_lib::run(|| {
 | `ctx.is_done()` | `bool` — shorthand for `ctx.err().is_some()` |
 | `cancel.cancel()` | Cancel the context; idempotent, safe to call multiple times |
 
-`Context` and `CancelFn` are both `Clone`. `with_deadline` / `with_timeout` spawn a timer goroutine and must be called from within `run`.
+`Context` and `CancelFn` are both `Clone`. `with_deadline` / `with_timeout` spawn a timer goroutine and must be called from within a `#[go_lib::main]` entry point.
 
 ---
 
@@ -497,16 +490,17 @@ go_lib::gosched();                         // cooperative yield to scheduler
 
 `sleep` parks the calling goroutine and inserts a timer; the background timer thread calls `goready` when the duration elapses. `gosched` is the equivalent of Go's `runtime.Gosched()`.
 
-Both must be called from inside `run`.
+Both must be called from inside a `#[go_lib::main]` entry point.
 
 ---
 
 ### with_syscall
 
 ```rust
-go_lib::run(|| {
+#[go_lib::main]
+fn main() {
     let contents = go_lib::with_syscall(|| std::fs::read("data.bin"));
-});
+}
 ```
 
 Wraps a potentially-blocking operation so the scheduler can hand the current M's P to another M while the OS thread is blocked. Use this around any call that may park an OS thread (file I/O, blocking network, `std::thread::sleep`, etc.).
@@ -529,7 +523,8 @@ Wraps a potentially-blocking operation so the scheduler can hand the current M's
 use std::io::{BufRead, BufReader, Write};
 use go_lib::net::{TcpListener, TcpStream};
 
-go_lib::run(|| {
+#[go_lib::main]
+fn main() {
     let listener = TcpListener::bind("127.0.0.1:8080").unwrap();
     println!("listening on {}", listener.local_addr().unwrap());
 
@@ -543,13 +538,14 @@ go_lib::run(|| {
             write!(reader.get_mut(), "echo: {line}").unwrap();
         });
     }
-});
+}
 ```
 
 Use `try_clone` to split a connection into independent read and write halves without unsafe fd manipulation:
 
 ```rust
-go_lib::run(|| {
+#[go_lib::main]
+fn main() {
     let listener = TcpListener::bind("127.0.0.1:9000").unwrap();
     let stream   = listener.accept().unwrap();
     let mut writer = stream.try_clone().unwrap(); // dup(2) / DuplicateHandle
@@ -561,7 +557,7 @@ go_lib::run(|| {
         // Write half — owned clone.
         writer.write_all(&buf[..n]).unwrap();
     });
-});
+}
 ```
 
 | Type | Method | Description |
@@ -592,7 +588,7 @@ The number of logical processors defaults to `available_parallelism()` but can b
 GOMAXPROCS=4 cargo run
 ```
 
-**Runtime adjustment** — from inside `run`:
+**Runtime adjustment** — from inside a `#[go_lib::main]` entry point:
 
 ```rust
 let old = go_lib::set_gomaxprocs(4);
@@ -616,43 +612,43 @@ go_lib::set_panic_handler(|payload| {
     }
 });
 
-go_lib::run(|| {
+#[go_lib::main]
+fn main() {
     go!(|| panic!("oops")); // caught; other goroutines keep running
     go_lib::sleep(std::time::Duration::from_millis(10));
     println!("still running");
-});
+}
 ```
 
 ---
 
 ## Examples
 
-### attr\_main — `#[go_lib::run]` attribute
+### attr\_main — `#[go_lib::main]` attribute
 
-The attribute macro is the most concise entry point.  It rewrites the
-function body in-place, so the three `main` signatures work without any
-boilerplate:
+The attribute macro is the entry point.  It rewrites the function body
+in-place, so the three `main` signatures work without any boilerplate:
 
 ```rust
 // examples/attr_run.rs  (illustrative — see the real file for the full driver)
 
 // 1. Plain — no return value
-#[go_lib::run]
+#[go_lib::main]
 fn main() {
     let (tx, rx) = chan::<&str>(0);
-    go!(move || tx.send("hello from #[go_lib::run]"));
+    go!(move || tx.send("hello from #[go_lib::main]"));
     println!("{}", rx.recv().unwrap());
 }
 
 // 2. main() -> ExitCode
-#[go_lib::run]
+#[go_lib::main]
 fn main() -> ExitCode {
     let ok = run_all_tasks();
     if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE }
 }
 
-// 3. main() -> Result<(), E>   (? works inside the closure)
-#[go_lib::run]
+// 3. main() -> Result<(), E>   (? works inside the body)
+#[go_lib::main]
 fn main() -> Result<(), ParseIntError> {
     let (tx, rx) = chan::<Result<i64, _>>(4);
     for s in ["1","2","3","4"] {
@@ -666,8 +662,9 @@ fn main() -> Result<(), ParseIntError> {
 }
 ```
 
-The macro expands each of these into `go_lib::run(move || [-> R] { … })` —
-identical to writing it by hand, but without the wrapping ceremony.
+The macro expands each of these into
+`go_lib::__main_entry(move || [-> R] { … })` — the first goroutine runs the
+body, without the wrapping ceremony.
 
 ---
 
@@ -677,21 +674,20 @@ identical to writing it by hand, but without the wrapping ceremony.
 // examples/hello.rs
 use go_lib::{chan::chan, go};
 
+#[go_lib::main]
 fn main() {
     const N: usize = 5;
-    go_lib::run(|| {
-        let (tx, rx) = chan::<String>(0);
+    let (tx, rx) = chan::<String>(0);
 
-        for i in 0..N {
-            let tx = tx.clone();
-            go!(move || tx.send(format!("hello from goroutine {i}")));
-        }
-        drop(tx);
+    for i in 0..N {
+        let tx = tx.clone();
+        go!(move || tx.send(format!("hello from goroutine {i}")));
+    }
+    drop(tx);
 
-        for _ in 0..N {
-            if let Some(msg) = rx.recv() { println!("{msg}"); }
-        }
-    });
+    for _ in 0..N {
+        if let Some(msg) = rx.recv() { println!("{msg}"); }
+    }
 }
 ```
 
@@ -709,31 +705,30 @@ hello from goroutine 3
 // examples/pipeline.rs  (generate → square → print)
 use go_lib::{chan::chan, go};
 
+#[go_lib::main]
 fn main() {
-    go_lib::run(|| {
-        let (gen_tx, gen_rx) = chan::<u64>(0);
-        go!(move || {
-            for n in 1..=8 { gen_tx.send(n); }
-            gen_tx.close();
-        });
-
-        let (sq_tx, sq_rx) = chan::<u64>(0);
-        go!(move || {
-            loop {
-                match gen_rx.recv() {
-                    Some(n) => sq_tx.send(n * n),
-                    None    => { sq_tx.close(); break; }
-                }
-            }
-        });
-
-        let mut sum = 0u64;
-        while let Some(sq) = sq_rx.recv() {
-            println!("{sq}");
-            sum += sq;
-        }
-        assert_eq!(sum, 204); // 1+4+9+16+25+36+49+64
+    let (gen_tx, gen_rx) = chan::<u64>(0);
+    go!(move || {
+        for n in 1..=8 { gen_tx.send(n); }
+        gen_tx.close();
     });
+
+    let (sq_tx, sq_rx) = chan::<u64>(0);
+    go!(move || {
+        loop {
+            match gen_rx.recv() {
+                Some(n) => sq_tx.send(n * n),
+                None    => { sq_tx.close(); break; }
+            }
+        }
+    });
+
+    let mut sum = 0u64;
+    while let Some(sq) = sq_rx.recv() {
+        println!("{sq}");
+        sum += sq;
+    }
+    assert_eq!(sum, 204); // 1+4+9+16+25+36+49+64
 }
 ```
 
@@ -746,23 +741,22 @@ Two producers at different rates merged into one consumer:
 use go_lib::{chan::chan, go, select};
 use std::time::Duration;
 
+#[go_lib::main]
 fn main() {
-    go_lib::run(|| {
-        let (fast_tx, fast_rx) = chan::<i32>(8);
-        let (slow_tx, slow_rx) = chan::<i32>(4);
+    let (fast_tx, fast_rx) = chan::<i32>(8);
+    let (slow_tx, slow_rx) = chan::<i32>(4);
 
-        go!(move || { for i in 0..6   { go_lib::sleep(Duration::from_millis(5));  fast_tx.send(i); } });
-        go!(move || { for i in 10..13 { go_lib::sleep(Duration::from_millis(15)); slow_tx.send(i); } });
+    go!(move || { for i in 0..6   { go_lib::sleep(Duration::from_millis(5));  fast_tx.send(i); } });
+    go!(move || { for i in 10..13 { go_lib::sleep(Duration::from_millis(15)); slow_tx.send(i); } });
 
-        let mut received = Vec::new();
-        for _ in 0..9 {
-            select! {
-                recv(fast_rx) -> v => { if let Some(n) = v { received.push(('F', n)); } }
-                recv(slow_rx) -> v => { if let Some(n) = v { received.push(('S', n)); } }
-            }
+    let mut received = Vec::new();
+    for _ in 0..9 {
+        select! {
+            recv(fast_rx) -> v => { if let Some(n) = v { received.push(('F', n)); } }
+            recv(slow_rx) -> v => { if let Some(n) = v { received.push(('S', n)); } }
         }
-        println!("{received:?}");
-    });
+    }
+    println!("{received:?}");
 }
 ```
 
@@ -809,25 +803,24 @@ impl<T: Send + 'static> BoundedQueue<T> {
 
 ```rust
 // examples/scope.rs
+#[go_lib::main]
 fn main() {
-    let sum = go_lib::run(|| {
-        // `data` lives on the goroutine's stack.  Spawned goroutines borrow
-        // chunks of it — no Arc or Clone needed.
-        let data: Vec<i64> = (1..=100).collect();
+    // `data` lives on the goroutine's stack.  Spawned goroutines borrow
+    // chunks of it — no Arc or Clone needed.
+    let data: Vec<i64> = (1..=100).collect();
 
-        go_lib::scope(|s| {
-            let chunks: Vec<&[i64]> = data.chunks(data.len() / 4 + 1).collect();
+    let sum = go_lib::scope(|s| {
+        let chunks: Vec<&[i64]> = data.chunks(data.len() / 4 + 1).collect();
 
-            let handles: Vec<_> = chunks
-                .into_iter()
-                .map(|chunk| s.go(move || chunk.iter().sum::<i64>()))
-                .collect();
+        let handles: Vec<_> = chunks
+            .into_iter()
+            .map(|chunk| s.go(move || chunk.iter().sum::<i64>()))
+            .collect();
 
-            handles
-                .into_iter()
-                .map(|h| h.join().expect("chunk goroutine panicked"))
-                .sum::<i64>()
-        })
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("chunk goroutine panicked"))
+            .sum::<i64>()
     });
 
     println!("sum 1..=100 = {sum}");  // 5050
@@ -845,32 +838,31 @@ When goroutines need to stream values between each other, channels work normally
 
 ```rust
 // examples/scope_channel.rs
+#[go_lib::main]
 fn main() {
-    let sum = go_lib::run(|| {
-        let (tx, rx) = go_lib::chan::chan::<i32>(0); // unbuffered
+    let (tx, rx) = go_lib::chan::chan::<i32>(0); // unbuffered
 
-        go_lib::scope(|s| {
-            // Producer: send 0..10, then close so the consumer terminates.
-            s.go(move || {
-                for i in 0..10 {
-                    tx.send(i);
-                }
-                tx.close();
-            });
+    let sum = go_lib::scope(|s| {
+        // Producer: send 0..10, then close so the consumer terminates.
+        s.go(move || {
+            for i in 0..10 {
+                tx.send(i);
+            }
+            tx.close();
+        });
 
-            // Consumer: drain until the channel is closed and empty.
-            s.go(move || {
-                let mut total = 0_i32;
-                while let Some(v) = rx.recv() {
-                    total += v;
-                }
-                total
-            })
-            .join()
-            .expect("consumer goroutine panicked")
+        // Consumer: drain until the channel is closed and empty.
+        s.go(move || {
+            let mut total = 0_i32;
+            while let Some(v) = rx.recv() {
+                total += v;
+            }
+            total
         })
-        // scope() blocks here until both goroutines have finished.
+        .join()
+        .expect("consumer goroutine panicked")
     });
+    // scope() blocks until both goroutines have finished.
 
     println!("sum 0..10 = {sum}");
     assert_eq!(sum, 45); // 0 + 1 + … + 9 = 45
@@ -887,30 +879,28 @@ fn main() {
 // examples/main_exitcode.rs
 use std::process::ExitCode;
 
+#[go_lib::main]
 fn main() -> ExitCode {
-    let all_passed = go_lib::run(|| {
-        const N: usize = 5;
+    const N: usize = 5;
 
-        let results = go_lib::scope(|s| {
-            let handles: Vec<_> = (0..N)
-                .map(|id| s.go(move || (id, run_task(id))))
-                .collect();
-            handles
-                .into_iter()
-                .map(|h| h.join().expect("task goroutine panicked"))
-                .collect::<Vec<_>>()
-        });
-
-        let mut failures = 0_usize;
-        for (id, ok) in results {
-            println!("  task {id}: {}", if ok { "ok" } else { "FAIL" });
-            if !ok { failures += 1; }
-        }
-        println!("{}/{N} tasks passed", N - failures);
-        failures == 0   // ← return value of run()
+    let results = go_lib::scope(|s| {
+        let handles: Vec<_> = (0..N)
+            .map(|id| s.go(move || (id, run_task(id))))
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("task goroutine panicked"))
+            .collect::<Vec<_>>()
     });
 
-    if all_passed { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+    let mut failures = 0_usize;
+    for (id, ok) in results {
+        println!("  task {id}: {}", if ok { "ok" } else { "FAIL" });
+        if !ok { failures += 1; }
+    }
+    println!("{}/{N} tasks passed", N - failures);
+
+    if failures == 0 { ExitCode::SUCCESS } else { ExitCode::FAILURE }
 }
 ```
 
@@ -926,33 +916,33 @@ Exit code: `1`
 
 ### main\_result — `main() -> Result<(), E>`
 
-The closure can return `Result`; `main` returns it verbatim.  Rust's
-`Termination` trait prints the error and sets exit code `1` on `Err`.
-`go_lib::scope` lets each goroutine borrow its `&str` directly — no channel needed:
+The entry body can return `Result`; the attribute forwards the type to the
+first goroutine and Rust's `Termination` trait prints the error and sets exit
+code `1` on `Err`.  `go_lib::scope` lets each goroutine borrow its `&str`
+directly — no channel needed:
 
 ```rust
 // examples/main_result.rs
 use std::num::ParseIntError;
 
+#[go_lib::main]
 fn main() -> Result<(), ParseIntError> {
-    go_lib::run(|| -> Result<(), ParseIntError> {
-        let inputs = ["3", "1", "4", "1", "5", "9"];
+    let inputs = ["3", "1", "4", "1", "5", "9"];
 
-        // Parse concurrently; goroutines borrow `inputs` directly.
-        let sum: i64 = go_lib::scope(|scope| -> Result<i64, ParseIntError> {
-            let handles: Vec<_> = inputs
-                .iter()
-                .map(|s| scope.go(move || s.parse::<i64>()))
-                .collect();
-            // h.join().unwrap() strips the panic wrapper; ? propagates ParseIntError.
-            handles
-                .into_iter()
-                .try_fold(0_i64, |acc, h| Ok(acc + h.join().unwrap()?))
-        })?;
+    // Parse concurrently; goroutines borrow `inputs` directly.
+    let sum: i64 = go_lib::scope(|scope| -> Result<i64, ParseIntError> {
+        let handles: Vec<_> = inputs
+            .iter()
+            .map(|s| scope.go(move || s.parse::<i64>()))
+            .collect();
+        // h.join().unwrap() strips the panic wrapper; ? propagates ParseIntError.
+        handles
+            .into_iter()
+            .try_fold(0_i64, |acc, h| Ok(acc + h.join().unwrap()?))
+    })?;
 
-        println!("sum = {sum}");   // sum = 23
-        Ok(())
-    })
+    println!("sum = {sum}");   // sum = 23
+    Ok(())
 }
 ```
 
@@ -1036,7 +1026,7 @@ Go achieves ~6 KiB per goroutine (2 KiB stack + 392 B descriptor + 4 KiB OS guar
 Debug builds use 16 KiB on Linux (smaller to exercise the growth path under tests) and 64 KiB on macOS / Windows (non-optimised frames are 3–5× wider).
 
 ```
-go_lib::run(f)
+#[go_lib::main] fn f()  →  go_lib::__main_entry(f)
     │
     ├─ schedinit()          create GOMAXPROCS Ps; spawn one M per P
     │                       install SIGSEGV + SIGURG handlers
