@@ -425,3 +425,65 @@ fn net_try_clone_keepalive_loop() {
 
     done_rx.recv();
 }
+
+// ---------------------------------------------------------------------------
+// N+2. try_clone read/write split UNDER concurrent per-connection load
+//
+// go-lib already covers (a) concurrent connections without try_clone and
+// (b) single-connection try_clone splits.  go-http combines them: every
+// accepted connection is handled in its own goroutine that splits the socket
+// with try_clone (read on one dup handle, write on another), under concurrent
+// load.  This probe reproduces that combination to see whether it deadlocks
+// on Windows/IOCP.
+// ---------------------------------------------------------------------------
+#[test]
+#[go_lib::main]
+fn net_try_clone_split_concurrent() {
+    const N: usize = 8;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr     = listener.local_addr().unwrap();
+
+    let server_wg = Arc::new(WaitGroup::new());
+    let wg2 = Arc::clone(&server_wg);
+    go!(move || {
+        for _ in 0..N {
+            let conn = listener.accept().unwrap();
+            let wg3  = Arc::clone(&wg2);
+            wg3.add(1);
+            go!(move || {
+                // go-http serve_conn pattern: separate read/write dup handles.
+                let mut write_half = conn.try_clone().unwrap();
+                let mut read_half  = conn.try_clone().unwrap();
+                let mut buf = [0u8; 4];
+                read_half.read_exact(&mut buf).unwrap();
+                write_half.write_all(&buf).unwrap();
+                wg3.done();
+            });
+        }
+    });
+
+    let results   = Arc::new(Mutex::new(Vec::<bool>::new()));
+    let client_wg = Arc::new(WaitGroup::new());
+    for i in 0..N {
+        client_wg.add(1);
+        let results2   = Arc::clone(&results);
+        let client_wg2 = Arc::clone(&client_wg);
+        go!(move || {
+            let client = TcpStream::connect(addr).unwrap();
+            // Client splits too (round_trip pattern): write on one, read on a clone.
+            let mut wc = client.try_clone().unwrap();
+            let mut rc = client.try_clone().unwrap();
+            let tag = [i as u8; 4];
+            wc.write_all(&tag).unwrap();
+            let mut resp = [0u8; 4];
+            rc.read_exact(&mut resp).unwrap();
+            results2.lock().unwrap().push(resp == tag);
+            client_wg2.done();
+        });
+    }
+
+    client_wg.wait();
+    server_wg.wait();
+    assert_eq!(results.lock().unwrap().len(), N);
+}
