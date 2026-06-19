@@ -375,3 +375,53 @@ fn net_connect_hostname_does_not_overflow_stack() {
         "connecting to an unresolvable hostname should return Err, not succeed",
     );
 }
+
+// ---------------------------------------------------------------------------
+// N+1. try_clone in a keep-alive loop — repeated dup + overlapped I/O + close
+//
+// Regression probe for a Windows-only hang in the go-http integration tests.
+// go-lib's other try_clone tests dup a handle exactly once per connection.
+// go-http's server (and pooled client) instead re-clone a fresh read half on
+// *every* request of a keep-alive connection and drop it afterwards — i.e. a
+// repeated `try_clone` → overlapped read → `closesocket` cycle on a socket
+// that stays associated with the IOCP.  This test reproduces that pattern:
+// both ends loop, re-cloning a read half per iteration while reusing a single
+// cloned write half.  Must complete (not deadlock) on all platforms.
+// ---------------------------------------------------------------------------
+#[test]
+#[go_lib::main]
+fn net_try_clone_keepalive_loop() {
+    const N: usize = 8;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr     = listener.local_addr().unwrap();
+
+    let (done_tx, done_rx) = chan::<()>(1);
+    go!(move || {
+        let conn           = listener.accept().unwrap();
+        let mut write_half = conn.try_clone().expect("server write-half clone");
+        for _ in 0..N {
+            // Fresh read half each iteration, dropped at the end of the body —
+            // closesocket on a dup handle of an IOCP-associated socket.
+            let mut read_half = conn.try_clone().expect("server read-half clone");
+            let mut buf = [0u8; 4];
+            read_half.read_exact(&mut buf).unwrap();
+            write_half.write_all(&buf).unwrap();
+        }
+        done_tx.send(());
+    });
+
+    let client = TcpStream::connect(addr).unwrap();
+    let mut write_client = client.try_clone().expect("client write-half clone");
+    for i in 0..N {
+        let msg = [b'p', b'n', b'g', b'0' + i as u8];
+        write_client.write_all(&msg).unwrap();
+        // Re-clone a read half per request, mirroring the pooled-client path.
+        let mut read_client = client.try_clone().expect("client read-half clone");
+        let mut resp = [0u8; 4];
+        read_client.read_exact(&mut resp).unwrap();
+        assert_eq!(resp, msg, "echo mismatch on request {i}");
+    }
+
+    done_rx.recv();
+}
