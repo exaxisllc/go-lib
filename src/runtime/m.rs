@@ -49,7 +49,7 @@ use std::sync::{Condvar, Mutex};
 
 use super::g::{set_current_g, set_g0_sched, Stack, G};
 use super::p::P;
-use super::stack::{g0_stack_alloc, stack_free};
+use super::stack::{g0_stack_alloc, stack_pool_free};
 
 /// Size of the alternate signal stack allocated per M thread.
 /// Signals (SIGSEGV, SIGURG) are delivered on this stack, which keeps the
@@ -421,7 +421,7 @@ impl Drop for M {
             unsafe {
                 let lo = (*self.g0).stack.lo;
                 let hi = (*self.g0).stack.hi;
-                stack_free(&Stack { lo, hi });
+                stack_pool_free(&Stack { lo, hi });
                 drop(Box::from_raw(self.g0));
             }
         }
