@@ -10,9 +10,9 @@
 //! |----|-----|
 //! | `stack` — `newstack`, `copystack`, `sigsegv_handler` | Dynamic goroutine stack growth (Step 3) |
 //! | `m` — `pthread_id`, `setup_sigaltstack` | Per-M thread ID + 64 KiB alternate signal stack (Step 4) |
-//! | `sched` — `async_preempt2`, `sigurg_handler` | Non-cooperative goroutine preemption via SIGURG (Step 4) |
+//! | `sched` — `async_preempt2`, `sigurg_handler`, `preempt_m_windows` | Non-cooperative goroutine preemption (SIGURG on Unix; SuspendThread+SetThreadContext on Windows) (Step 4) |
 //! | `asm_amd64`/`asm_arm64` — `async_preempt_trampoline` | Save/restore all registers around the preemption yield (Step 4) |
-//! | `sysmon` — `pthread_kill(SIGURG)` in `preemptone` | Signal delivery for async preemption (Step 4) |
+//! | `sysmon` — `pthread_kill(SIGURG)` / `preempt_m_windows` in `preemptone` | Preemption delivery: signal (Unix) or thread suspend+context inject (Windows) (Step 4) |
 //! | `netpoll` | epoll (Linux) / kqueue (macOS) / IOCP (Windows) I/O backend (Step 5) |
 //!
 //! ## v0.3.0 additions

@@ -228,9 +228,20 @@ pub(crate) struct M {
     /// On Unix this holds the `pthread_t` value returned by `pthread_self()`,
     /// stored as `u64` so the field type is the same on every platform.
     /// `sysmon` sends `SIGURG` to this thread on Unix to preempt the goroutine.
-    /// On Windows async preemption via signals is not available; the field
-    /// stays `0` and `preemptone` skips the signal delivery.
+    /// On Windows there are no POSIX signals, so this field stays `0` and async
+    /// preemption uses [`thread_handle`](Self::thread_handle) instead.
     pub pthread_id: u64,
+
+    /// Win32 thread `HANDLE` used to deliver async preemption (Windows only).
+    ///
+    /// `M::start` duplicates the `GetCurrentThread()` pseudo-handle into a real,
+    /// process-lifetime handle and stores it here as `u64`.  `sysmon`'s
+    /// `preempt_m_windows` uses it to `SuspendThread` / `GetThreadContext` /
+    /// `SetThreadContext` / `ResumeThread` the M's OS thread — the Windows
+    /// analogue of delivering `SIGURG` to `pthread_id`.  Stays `0` on Unix
+    /// (and until `M::start` runs), where the field is unused.
+    #[allow(dead_code)] // read only on Windows x86_64 (preempt_m_windows)
+    pub thread_handle: u64,
 
     /// Number of scheduler-internal critical sections currently held on this M.
     ///
@@ -306,6 +317,7 @@ impl M {
             alllink:   std::ptr::null_mut(),
             schedlink: std::ptr::null_mut(),
             pthread_id: 0, // set by M::start() once the OS thread is running
+            thread_handle: 0, // Windows: set by M::start(); unused on Unix
             locks:     std::sync::atomic::AtomicI32::new(0),
         });
 
@@ -348,6 +360,32 @@ impl M {
                 self.pthread_id = libc::pthread_self() as u64;
                 setup_sigaltstack();
             }
+
+            // Windows: capture a real, sysmon-usable thread HANDLE so
+            // `preempt_m_windows` can Suspend/Resume this M's OS thread.
+            // `GetCurrentThread()` returns a pseudo-handle (constant −2) that is
+            // only meaningful on the calling thread, so we DuplicateHandle it
+            // into a real handle valid from any thread.  The handle is
+            // process-lifetime (M threads run until shutdown) and intentionally
+            // leaked — there is no teardown point that needs to close it.
+            #[cfg(windows)]
+            {
+                let mut h: *mut core::ffi::c_void = core::ptr::null_mut();
+                const DUPLICATE_SAME_ACCESS: u32 = 0x0000_0002;
+                let proc = win_preempt_sys::GetCurrentProcess();
+                let ok = win_preempt_sys::DuplicateHandle(
+                    proc,
+                    win_preempt_sys::GetCurrentThread(),
+                    proc,
+                    &mut h,
+                    0,
+                    0, // bInheritHandle = FALSE
+                    DUPLICATE_SAME_ACCESS,
+                );
+                if ok != 0 {
+                    self.thread_handle = h as u64;
+                }
+            }
         }
     }
 
@@ -371,6 +409,32 @@ impl M {
     /// Ported from the `notewakeup` call sites in `runtime/proc.go`.
     pub(crate) fn unpark(&self) {
         self.park.wakeup();
+    }
+}
+
+/// kernel32 imports for capturing the M's thread HANDLE (Windows async preempt).
+#[cfg(windows)]
+mod win_preempt_sys {
+    use core::ffi::c_void;
+    // Signatures match `net_windows.rs`'s kernel32 block (same symbols, same
+    // `*mut c_void` handle type) so the linker sees one consistent declaration.
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        /// Pseudo-handle (−2) for the current thread — only valid on the
+        /// calling thread, so it must be `DuplicateHandle`d for cross-thread use.
+        pub fn GetCurrentThread() -> *mut c_void;
+        /// Pseudo-handle for the current process.
+        pub fn GetCurrentProcess() -> *mut c_void;
+        /// Duplicate a handle so it is valid from another thread/process.
+        pub fn DuplicateHandle(
+            h_source_process: *mut c_void,
+            h_source:         *mut c_void,
+            h_target_process: *mut c_void,
+            lp_target_handle: *mut *mut c_void,
+            dw_desired_access: u32,
+            b_inherit_handle:  i32,
+            dw_options:        u32,
+        ) -> i32;
     }
 }
 
