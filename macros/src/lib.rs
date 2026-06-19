@@ -1,18 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Procedural macros for go-lib.
 //!
-//! Exported through `go_lib` — use as `#[go_lib::run]`.
+//! Exported through `go_lib` — use as `#[go_lib::main]`.
 
 use proc_macro::TokenStream;
 use quote::quote;
 use syn::{parse_macro_input, ItemFn, ReturnType};
 
-/// Attribute macro that wraps a function body in [`go_lib::run`].
+/// Attribute macro that promotes a function's body into the program's first
+/// goroutine on the process-wide go-lib scheduler.
+///
+/// This is the single blessed entry point: apply it to `fn main` (or any
+/// entry function) instead of manually wrapping the body. The scheduler is a
+/// process singleton, initialised on first use; the attribute runs the body
+/// as the "main goroutine" and blocks the calling OS thread until it returns,
+/// mirroring Go's `main`.
 ///
 /// The macro rewrites
 ///
 /// ```rust,ignore
-/// #[go_lib::run]
+/// #[go_lib::main]
 /// fn main() {
 ///     /* body */
 /// }
@@ -22,7 +29,7 @@ use syn::{parse_macro_input, ItemFn, ReturnType};
 ///
 /// ```rust,ignore
 /// fn main() {
-///     go_lib::run(move || {
+///     go_lib::__main_entry(move || {
 ///         /* body */
 ///     })
 /// }
@@ -32,14 +39,14 @@ use syn::{parse_macro_input, ItemFn, ReturnType};
 /// type so that `?` and explicit `return` expressions work as expected:
 ///
 /// ```rust,ignore
-/// #[go_lib::run]
+/// #[go_lib::main]
 /// fn main() -> Result<(), MyError> {
 ///     do_work()?;
 ///     Ok(())
 /// }
 /// // expands to:
 /// fn main() -> Result<(), MyError> {
-///     go_lib::run(move || -> Result<(), MyError> {
+///     go_lib::__main_entry(move || -> Result<(), MyError> {
 ///         do_work()?;
 ///         Ok(())
 ///     })
@@ -54,14 +61,14 @@ use syn::{parse_macro_input, ItemFn, ReturnType};
 /// Emits a compile error if the function is `async` (go-lib provides its own
 /// concurrency model and does not interact with an async executor).
 #[proc_macro_attribute]
-pub fn run(_attr: TokenStream, item: TokenStream) -> TokenStream {
+pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut func = parse_macro_input!(item as ItemFn);
 
     // Reject async functions — go-lib's scheduler is not an async executor.
     if let Some(async_token) = &func.sig.asyncness {
         return syn::Error::new_spanned(
             async_token,
-            "#[go_lib::run] does not support async functions; \
+            "#[go_lib::main] does not support async functions; \
              go-lib provides its own M:N scheduler",
         )
         .to_compile_error()
@@ -71,14 +78,14 @@ pub fn run(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let return_type = func.sig.output.clone();
     let body        = &*func.block;
 
-    // Build `go_lib::run(move || [-> ReturnType] { body })`.
+    // Build `go_lib::__main_entry(move || [-> ReturnType] { body })`.
     // The `move` ensures function parameters are captured into the closure.
     let run_call = match &return_type {
         ReturnType::Default => quote! {
-            go_lib::run(move || #body)
+            go_lib::__main_entry(move || #body)
         },
         ReturnType::Type(_, ty) => quote! {
-            go_lib::run(move || -> #ty #body)
+            go_lib::__main_entry(move || -> #ty #body)
         },
     };
 

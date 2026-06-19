@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Integration tests — exercise the full public API end-to-end.
 //!
-//! Each test runs the go-lib scheduler via `go_lib::run`, spawns goroutines
-//! with `go!`, communicates through channels, and synchronises with
-//! `WaitGroup` or atomic flags.  No `pub(crate)` symbols are used.
+//! Each test carries `#[go_lib::main]`, which runs the test body as the first
+//! goroutine on the process-wide scheduler.  Tests spawn goroutines with `go!`,
+//! communicate through channels, and synchronise with `WaitGroup` or atomic
+//! flags.  Assertions run inside the body (on the first goroutine), so a
+//! failure surfaces as a `goroutine panicked: …` test failure; tests that
+//! check the entry's return value return `Result` so the forwarded value is
+//! observed by the harness.  No `pub(crate)` symbols are used.
 
 use std::sync::{
     atomic::{AtomicI32, AtomicI64, Ordering},
@@ -25,12 +29,11 @@ use go_lib::{
 // ---------------------------------------------------------------------------
 
 #[test]
+#[go_lib::main]
 fn hello_goroutine() {
     let (tx, rx) = chan::<&'static str>(0);
-    go_lib::run(move || {
-        go!(move || { tx.send("hello"); });
-        assert_eq!(rx.recv(), Some("hello"));
-    });
+    go!(move || { tx.send("hello"); });
+    assert_eq!(rx.recv(), Some("hello"));
 }
 
 // ---------------------------------------------------------------------------
@@ -38,29 +41,24 @@ fn hello_goroutine() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[go_lib::main]
 fn fan_out() {
     const N: i32 = 8;
-    let sum = Arc::new(AtomicI32::new(0));
+    let (tx, rx) = chan::<i32>(N as usize);
 
-    let sum2 = Arc::clone(&sum);
-    go_lib::run(move || {
-        let (tx, rx) = chan::<i32>(N as usize);
+    for i in 1..=N {
+        let tx = tx.clone();
+        go!(move || { tx.send(i); });
+    }
 
-        for i in 1..=N {
-            let tx = tx.clone();
-            go!(move || { tx.send(i); });
-        }
-
-        // Collect all N values.
-        let mut total = 0_i32;
-        for _ in 0..N {
-            total += rx.recv().unwrap();
-        }
-        sum2.store(total, Ordering::Relaxed);
-    });
+    // Collect all N values.
+    let mut total = 0_i32;
+    for _ in 0..N {
+        total += rx.recv().unwrap();
+    }
 
     // 1+2+…+N = N*(N+1)/2
-    assert_eq!(sum.load(Ordering::Acquire), N * (N + 1) / 2);
+    assert_eq!(total, N * (N + 1) / 2);
 }
 
 // ---------------------------------------------------------------------------
@@ -68,41 +66,35 @@ fn fan_out() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[go_lib::main]
 fn pipeline_three_stage() {
-    let result = Arc::new(AtomicI64::new(0));
-    let result2 = Arc::clone(&result);
-
-    go_lib::run(move || {
-        // Stage 1: emit 1..=5
-        let (gen_tx, gen_rx) = chan::<i64>(0);
-        go!(move || {
-            for i in 1_i64..=5 {
-                gen_tx.send(i);
-            }
-            gen_tx.close();
-        });
-
-        // Stage 2: square each value
-        let (sq_tx, sq_rx) = chan::<i64>(0);
-        go!(move || {
-            loop {
-                match gen_rx.recv() {
-                    Some(v) => sq_tx.send(v * v),
-                    None    => { sq_tx.close(); break; }
-                }
-            }
-        });
-
-        // Stage 3: accumulate
-        let mut sum = 0_i64;
-        while let Some(v) = sq_rx.recv() {
-            sum += v;
+    // Stage 1: emit 1..=5
+    let (gen_tx, gen_rx) = chan::<i64>(0);
+    go!(move || {
+        for i in 1_i64..=5 {
+            gen_tx.send(i);
         }
-        // 1+4+9+16+25 = 55
-        result2.store(sum, Ordering::Relaxed);
+        gen_tx.close();
     });
 
-    assert_eq!(result.load(Ordering::Acquire), 55);
+    // Stage 2: square each value
+    let (sq_tx, sq_rx) = chan::<i64>(0);
+    go!(move || {
+        loop {
+            match gen_rx.recv() {
+                Some(v) => sq_tx.send(v * v),
+                None    => { sq_tx.close(); break; }
+            }
+        }
+    });
+
+    // Stage 3: accumulate
+    let mut sum = 0_i64;
+    while let Some(v) = sq_rx.recv() {
+        sum += v;
+    }
+    // 1+4+9+16+25 = 55
+    assert_eq!(sum, 55);
 }
 
 // ---------------------------------------------------------------------------
@@ -110,29 +102,24 @@ fn pipeline_three_stage() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[go_lib::main]
 fn waitgroup_fan_out() {
     const N: i32 = 16;
     let counter = Arc::new(AtomicI32::new(0));
-    let counter2 = Arc::clone(&counter);
+    let wg = Arc::new(WaitGroup::new());
 
-    go_lib::run(move || {
-        let wg = Arc::new(WaitGroup::new());
+    for _ in 0..N {
+        wg.add(1);
+        let wg2 = Arc::clone(&wg);
+        let c    = Arc::clone(&counter);
+        go!(move || {
+            c.fetch_add(1, Ordering::Relaxed);
+            wg2.done();
+        });
+    }
 
-        for _ in 0..N {
-            wg.add(1);
-            let wg2 = Arc::clone(&wg);
-            let c    = Arc::clone(&counter2);
-            go!(move || {
-                c.fetch_add(1, Ordering::Relaxed);
-                wg2.done();
-            });
-        }
-
-        wg.wait();
-        // All goroutines finished before wait() returned.
-        assert_eq!(counter2.load(Ordering::Acquire), N);
-    });
-
+    wg.wait();
+    // All goroutines finished before wait() returned.
     assert_eq!(counter.load(Ordering::Acquire), N);
 }
 
@@ -141,48 +128,46 @@ fn waitgroup_fan_out() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[go_lib::main]
 fn ping_pong() {
     let hops = Arc::new(AtomicI32::new(0));
-    let hops2 = Arc::clone(&hops);
 
-    go_lib::run(move || {
-        let (a_tx, a_rx) = chan::<i32>(0);
-        let (b_tx, b_rx) = chan::<i32>(0);
+    let (a_tx, a_rx) = chan::<i32>(0);
+    let (b_tx, b_rx) = chan::<i32>(0);
 
-        // Keep a clone for goroutine B; the original kicks off the exchange.
-        let a_tx_b = a_tx.clone();
+    // Keep a clone for goroutine B; the original kicks off the exchange.
+    let a_tx_b = a_tx.clone();
 
-        // Goroutine A: receive on a, send on b.
-        go!(move || {
-            while let Some(v) = a_rx.recv() {
-                b_tx.send(v + 1);
-            }
-        });
-
-        // Goroutine B: receive on b, send on a (until done).
-        let h = Arc::clone(&hops2);
-        go!(move || {
-            while let Some(v) = b_rx.recv() {
-                h.fetch_add(1, Ordering::Relaxed);
-                if v < 20 {
-                    a_tx_b.send(v + 1);
-                } else {
-                    a_tx_b.close();
-                }
-            }
-        });
-
-        // Kick off the ping-pong.
-        a_tx.send(0);
-        // Wait until goroutine B closes a_tx (indirectly, via a_rx draining).
-        // The main goroutine yields until both workers finish.
-        let deadline = Instant::now() + Duration::from_millis(500);
-        loop {
-            if hops2.load(Ordering::Acquire) >= 10 { break; }
-            if Instant::now() > deadline { panic!("ping-pong timed out"); }
-            go_lib::gosched();
+    // Goroutine A: receive on a, send on b.
+    go!(move || {
+        while let Some(v) = a_rx.recv() {
+            b_tx.send(v + 1);
         }
     });
+
+    // Goroutine B: receive on b, send on a (until done).
+    let h = Arc::clone(&hops);
+    go!(move || {
+        while let Some(v) = b_rx.recv() {
+            h.fetch_add(1, Ordering::Relaxed);
+            if v < 20 {
+                a_tx_b.send(v + 1);
+            } else {
+                a_tx_b.close();
+            }
+        }
+    });
+
+    // Kick off the ping-pong.
+    a_tx.send(0);
+    // Wait until goroutine B closes a_tx (indirectly, via a_rx draining).
+    // The main goroutine yields until both workers finish.
+    let deadline = Instant::now() + Duration::from_millis(500);
+    loop {
+        if hops.load(Ordering::Acquire) >= 10 { break; }
+        if Instant::now() > deadline { panic!("ping-pong timed out"); }
+        go_lib::gosched();
+    }
 
     assert!(hops.load(Ordering::Acquire) >= 10);
 }
@@ -192,28 +177,23 @@ fn ping_pong() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[go_lib::main]
 fn select_fan_in() {
-    let sum = Arc::new(AtomicI32::new(0));
-    let sum2 = Arc::clone(&sum);
+    let (tx1, rx1) = chan::<i32>(0);
+    let (tx2, rx2) = chan::<i32>(0);
 
-    go_lib::run(move || {
-        let (tx1, rx1) = chan::<i32>(0);
-        let (tx2, rx2) = chan::<i32>(0);
+    go!(move || { tx1.send(10); });
+    go!(move || { tx2.send(20); });
 
-        go!(move || { tx1.send(10); });
-        go!(move || { tx2.send(20); });
-
-        let mut total = 0_i32;
-        for _ in 0..2 {
-            select! {
-                recv(rx1) -> v => { total += v.unwrap(); }
-                recv(rx2) -> v => { total += v.unwrap(); }
-            }
+    let mut total = 0_i32;
+    for _ in 0..2 {
+        select! {
+            recv(rx1) -> v => { total += v.unwrap(); }
+            recv(rx2) -> v => { total += v.unwrap(); }
         }
-        sum2.store(total, Ordering::Relaxed);
-    });
+    }
 
-    assert_eq!(sum.load(Ordering::Acquire), 30);
+    assert_eq!(total, 30);
 }
 
 // ---------------------------------------------------------------------------
@@ -221,42 +201,41 @@ fn select_fan_in() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[go_lib::main]
 fn done_channel_cancels_goroutine() {
     let ticks = Arc::new(AtomicI32::new(0));
     let ticks2 = Arc::clone(&ticks); // moved into worker goroutine
-    let ticks3 = Arc::clone(&ticks); // used by polling loop inside run()
+    let ticks3 = Arc::clone(&ticks); // used by the polling loop below
 
-    go_lib::run(move || {
-        let (done_tx, done_rx) = chan::<()>(0);
-        let (tick_tx, tick_rx) = chan::<()>(4);
+    let (done_tx, done_rx) = chan::<()>(0);
+    let (tick_tx, tick_rx) = chan::<()>(4);
 
-        // Worker: keep ticking until done.
-        go!(move || {
-            loop {
-                select! {
-                    recv(done_rx) -> _v => { break; }
-                    recv(tick_rx) -> _v => { ticks2.fetch_add(1, Ordering::Relaxed); }
-                    default            => { go_lib::gosched(); }
-                }
-            }
-        });
-
-        // Send 3 ticks, then signal done.
-        for _ in 0..3 { tick_tx.send(()); }
-        // Wait until the worker has processed all 3 ticks before sending done.
-        // A fixed gosched-loop is not deterministic under parallel test load;
-        // polling on the atomic counter is race-free and works on every platform.
-        let deadline = Instant::now() + Duration::from_millis(500);
+    // Worker: keep ticking until done.
+    go!(move || {
         loop {
-            if ticks3.load(Ordering::Acquire) >= 3 { break; }
-            if Instant::now() > deadline { panic!("ticks not all processed in time"); }
-            go_lib::gosched();
+            select! {
+                recv(done_rx) -> _v => { break; }
+                recv(tick_rx) -> _v => { ticks2.fetch_add(1, Ordering::Relaxed); }
+                default            => { go_lib::gosched(); }
+            }
         }
-        done_tx.send(());
-
-        // Give the worker time to observe done and exit its loop.
-        for _ in 0..50 { go_lib::gosched(); }
     });
+
+    // Send 3 ticks, then signal done.
+    for _ in 0..3 { tick_tx.send(()); }
+    // Wait until the worker has processed all 3 ticks before sending done.
+    // A fixed gosched-loop is not deterministic under parallel test load;
+    // polling on the atomic counter is race-free and works on every platform.
+    let deadline = Instant::now() + Duration::from_millis(500);
+    loop {
+        if ticks3.load(Ordering::Acquire) >= 3 { break; }
+        if Instant::now() > deadline { panic!("ticks not all processed in time"); }
+        go_lib::gosched();
+    }
+    done_tx.send(());
+
+    // Give the worker time to observe done and exit its loop.
+    for _ in 0..50 { go_lib::gosched(); }
 
     assert_eq!(ticks.load(Ordering::Acquire), 3);
 }
@@ -266,30 +245,29 @@ fn done_channel_cancels_goroutine() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[go_lib::main]
 fn buffered_never_blocks_sender() {
     const N: usize = 64;
     let received  = Arc::new(AtomicI32::new(0));
     let received2 = Arc::clone(&received);
 
-    go_lib::run(move || {
-        let wg = Arc::new(WaitGroup::new());
-        let (tx, rx) = chan::<i32>(N);
+    let wg = Arc::new(WaitGroup::new());
+    let (tx, rx) = chan::<i32>(N);
 
-        // Fill the buffer from the main goroutine — should never block.
-        for i in 0..N as i32 { tx.send(i); }
+    // Fill the buffer from the main goroutine — should never block.
+    for i in 0..N as i32 { tx.send(i); }
 
-        // Drain in a separate goroutine.
-        wg.add(1);
-        let wg2 = Arc::clone(&wg);
-        go!(move || {
-            let mut count = 0_i32;
-            for _ in 0..N { rx.recv(); count += 1; }
-            received2.store(count, Ordering::Relaxed);
-            wg2.done();
-        });
-
-        wg.wait();
+    // Drain in a separate goroutine.
+    wg.add(1);
+    let wg2 = Arc::clone(&wg);
+    go!(move || {
+        let mut count = 0_i32;
+        for _ in 0..N { rx.recv(); count += 1; }
+        received2.store(count, Ordering::Relaxed);
+        wg2.done();
     });
+
+    wg.wait();
 
     assert_eq!(received.load(Ordering::Acquire), N as i32);
 }
@@ -299,33 +277,31 @@ fn buffered_never_blocks_sender() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[go_lib::main]
 fn sleep_completes() {
-    let elapsed_ms  = Arc::new(AtomicI64::new(-1));
-    let e2          = Arc::clone(&elapsed_ms);
-    let elapsed_ms3 = Arc::clone(&elapsed_ms); // kept for the assert after run()
+    let elapsed_ms = Arc::new(AtomicI64::new(-1));
+    let e2         = Arc::clone(&elapsed_ms);
 
-    go_lib::run(move || {
-        // Use WaitGroup so the main goroutine parks (gopark) rather than
-        // blocking the OS thread.  std::thread::sleep inside a goroutine
-        // holds the M+P without releasing them; under high scheduling
-        // pressure (many integration tests running concurrently) the timer
-        // that fires for the sleeper may find no idle M and starve past the
-        // timeout, causing an unrecoverable hang via the panic path.
-        let wg  = Arc::new(WaitGroup::new());
-        let wg2 = Arc::clone(&wg);
-        wg.add(1);
+    // Use WaitGroup so the main goroutine parks (gopark) rather than
+    // blocking the OS thread.  std::thread::sleep inside a goroutine
+    // holds the M+P without releasing them; under high scheduling
+    // pressure (many integration tests running concurrently) the timer
+    // that fires for the sleeper may find no idle M and starve past the
+    // timeout, causing an unrecoverable hang via the panic path.
+    let wg  = Arc::new(WaitGroup::new());
+    let wg2 = Arc::clone(&wg);
+    wg.add(1);
 
-        go!(move || {
-            let t0 = Instant::now();
-            go_lib::sleep(Duration::from_millis(10));
-            e2.store(t0.elapsed().as_millis() as i64, Ordering::Relaxed);
-            wg2.done();
-        });
-
-        wg.wait(); // parks this goroutine; the M is free to run the sleeper
+    go!(move || {
+        let t0 = Instant::now();
+        go_lib::sleep(Duration::from_millis(10));
+        e2.store(t0.elapsed().as_millis() as i64, Ordering::Relaxed);
+        wg2.done();
     });
 
-    let ms = elapsed_ms3.load(Ordering::Acquire);
+    wg.wait(); // parks this goroutine; the M is free to run the sleeper
+
+    let ms = elapsed_ms.load(Ordering::Acquire);
     assert!(ms >= 8, "slept too short: {ms} ms"); // allow ±2 ms slack
 }
 
@@ -334,24 +310,19 @@ fn sleep_completes() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[go_lib::main]
 fn select_send_drops_on_full_buffer() {
-    let dropped = Arc::new(AtomicI32::new(0));
-    let d2 = Arc::clone(&dropped);
+    let (tx, rx) = chan::<String>(1);
+    tx.send("first".to_string()); // fill the buffer
 
-    go_lib::run(move || {
-        let (tx, rx) = chan::<String>(1);
-        tx.send("first".to_string()); // fill the buffer
+    let val = "second".to_string();
+    let took_default = select! {
+        send(tx, val) => { panic!("buffer was full, should have taken default"); }
+        default       => { true }
+    };
 
-        let val = "second".to_string();
-        select! {
-            send(tx, val) => { panic!("buffer was full, should have taken default"); }
-            default       => { d2.store(1, Ordering::Relaxed); }
-        }
-
-        assert_eq!(rx.recv().unwrap(), "first");
-    });
-
-    assert_eq!(dropped.load(Ordering::Acquire), 1);
+    assert!(took_default, "buffer was full — default arm should have fired");
+    assert_eq!(rx.recv().unwrap(), "first");
 }
 
 // ---------------------------------------------------------------------------
@@ -359,28 +330,25 @@ fn select_send_drops_on_full_buffer() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[go_lib::main]
 fn waitgroup_reuse() {
     const ROUNDS: i32 = 3;
     const WORKERS: i32 = 4;
     let total = Arc::new(AtomicI32::new(0));
-    let total2 = Arc::clone(&total);
+    let wg = Arc::new(WaitGroup::new());
 
-    go_lib::run(move || {
-        let wg = Arc::new(WaitGroup::new());
-
-        for _round in 0..ROUNDS {
-            for _ in 0..WORKERS {
-                wg.add(1);
-                let wg2 = Arc::clone(&wg);
-                let t    = Arc::clone(&total2);
-                go!(move || {
-                    t.fetch_add(1, Ordering::Relaxed);
-                    wg2.done();
-                });
-            }
-            wg.wait();
+    for _round in 0..ROUNDS {
+        for _ in 0..WORKERS {
+            wg.add(1);
+            let wg2 = Arc::clone(&wg);
+            let t    = Arc::clone(&total);
+            go!(move || {
+                t.fetch_add(1, Ordering::Relaxed);
+                wg2.done();
+            });
         }
-    });
+        wg.wait();
+    }
 
     assert_eq!(total.load(Ordering::Acquire), ROUNDS * WORKERS);
 }
@@ -390,33 +358,32 @@ fn waitgroup_reuse() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[go_lib::main]
 fn with_syscall_unblocks_scheduler() {
     let other_ran = Arc::new(AtomicI32::new(0));
     let other2    = Arc::clone(&other_ran);
 
-    go_lib::run(move || {
-        // Spawn a goroutine that increments a counter.
-        go!(move || { other2.store(1, Ordering::Release); });
+    // Spawn a goroutine that increments a counter.
+    go!(move || { other2.store(1, Ordering::Release); });
 
-        // This thread briefly "blocks" in a syscall.  The spawned goroutine
-        // should be able to run while we're in here.
-        go_lib::with_syscall(|| {
-            std::thread::sleep(Duration::from_millis(5));
-        });
-
-        // After exiting the syscall, yield until the spawned goroutine is
-        // observed.  Use a wall-clock deadline so a slow macOS CI runner
-        // does not cause a panic that deadlocks run_impl.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while other_ran.load(Ordering::Acquire) != 1 && Instant::now() < deadline {
-            go_lib::gosched();
-        }
-        assert_eq!(
-            other_ran.load(Ordering::Acquire),
-            1,
-            "spawned goroutine should have run during with_syscall"
-        );
+    // This thread briefly "blocks" in a syscall.  The spawned goroutine
+    // should be able to run while we're in here.
+    go_lib::with_syscall(|| {
+        std::thread::sleep(Duration::from_millis(5));
     });
+
+    // After exiting the syscall, yield until the spawned goroutine is
+    // observed.  Use a wall-clock deadline so a slow macOS CI runner
+    // does not cause a panic that deadlocks the scheduler entry.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while other_ran.load(Ordering::Acquire) != 1 && Instant::now() < deadline {
+        go_lib::gosched();
+    }
+    assert_eq!(
+        other_ran.load(Ordering::Acquire),
+        1,
+        "spawned goroutine should have run during with_syscall"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -424,17 +391,16 @@ fn with_syscall_unblocks_scheduler() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[go_lib::main]
 fn scope_parallel_reduction() {
-    // `data` is inside `run` so the closure is 'static; scope then lets
-    // goroutines borrow halves of it without Arc or channels.
-    let sum = go_lib::run(|| {
-        let data: Vec<i64> = (1..=100).collect();
-        scope(|s| {
-            let mid = data.len() / 2;
-            let h1 = s.go(|| data[..mid].iter().sum::<i64>());
-            let h2 = s.go(|| data[mid..].iter().sum::<i64>());
-            h1.join().unwrap() + h2.join().unwrap()
-        })
+    // `data` lives on the first goroutine's stack; scope then lets goroutines
+    // borrow halves of it without Arc or channels.
+    let data: Vec<i64> = (1..=100).collect();
+    let sum = scope(|s| {
+        let mid = data.len() / 2;
+        let h1 = s.go(|| data[..mid].iter().sum::<i64>());
+        let h2 = s.go(|| data[mid..].iter().sum::<i64>());
+        h1.join().unwrap() + h2.join().unwrap()
     });
 
     assert_eq!(sum, 5050); // 1 + 2 + … + 100
@@ -445,14 +411,13 @@ fn scope_parallel_reduction() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[go_lib::main]
 fn scope_goroutine_panic_surfaces_via_join() {
-    go_lib::run(|| {
-        let result = scope(|s| {
-            let h = s.go(|| -> i32 { panic!("intentional scope panic") });
-            h.join() // should be Err, not a process abort
-        });
-        assert!(result.is_err(), "expected Err from panicking goroutine");
+    let result = scope(|s| {
+        let h = s.go(|| -> i32 { panic!("intentional scope panic") });
+        h.join() // should be Err, not a process abort
     });
+    assert!(result.is_err(), "expected Err from panicking goroutine");
 }
 
 // ---------------------------------------------------------------------------
@@ -460,32 +425,31 @@ fn scope_goroutine_panic_surfaces_via_join() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[go_lib::main]
 fn scope_channel_producer_consumer() {
     // A scoped producer/consumer pair: the producer closes tx after its last
     // send so the consumer's `while let Some` loop terminates.  `scope`
     // guarantees both goroutines finish before it returns — no Arc or
     // WaitGroup needed to coordinate the outer code.
-    let sum = go_lib::run(|| {
-        let (tx, rx) = chan::<i32>(0); // unbuffered
+    let (tx, rx) = chan::<i32>(0); // unbuffered
 
-        scope(|s| {
-            s.go(move || {
-                for i in 0..10 {
-                    tx.send(i);
-                }
-                tx.close(); // signals receiver: no more values
-            });
+    let sum = scope(|s| {
+        s.go(move || {
+            for i in 0..10 {
+                tx.send(i);
+            }
+            tx.close(); // signals receiver: no more values
+        });
 
-            s.go(move || {
-                let mut total = 0_i32;
-                while let Some(v) = rx.recv() {
-                    total += v;
-                }
-                total
-            })
-            .join()
-            .expect("consumer goroutine panicked")
+        s.go(move || {
+            let mut total = 0_i32;
+            while let Some(v) = rx.recv() {
+                total += v;
+            }
+            total
         })
+        .join()
+        .expect("consumer goroutine panicked")
     });
 
     assert_eq!(sum, 45); // 0 + 1 + … + 9 = 45
@@ -494,27 +458,47 @@ fn scope_channel_producer_consumer() {
 // ---------------------------------------------------------------------------
 // 16. run return value — result propagates to caller
 // ---------------------------------------------------------------------------
+// Value-return propagation, split into three single-call `#[go_lib::main]`
+// tests.  The body's return value is shuttled out of the first goroutine by the
+// entry; with the attribute the *caller* that receives it is the test harness,
+// so returning `Ok`/`Err` (rather than asserting inside) is what actually
+// exercises that shuttle — a dropped value would fail the test.
+
+/// Scalar return: a value computed across goroutines is forwarded out of the
+/// entry to the caller (the test harness).
 #[test]
-fn run_returns_value() {
-    // Scalar return: the sum computed inside the scheduler reaches the caller.
-    let sum = go_lib::run(|| {
-        let (tx, rx) = chan::<i32>(4);
-        for i in 1..=4 {
-            let t = tx.clone();
-            go!(move || { t.send(i); });
-        }
-        (0..4).filter_map(|_| rx.recv()).sum::<i32>()
-    });
-    assert_eq!(sum, 10);
+#[go_lib::main]
+fn entry_forwards_scalar_return() -> Result<(), String> {
+    let (tx, rx) = chan::<i32>(4);
+    for i in 1..=4 {
+        let t = tx.clone();
+        go!(move || { t.send(i); });
+    }
+    let sum = (0..4).filter_map(|_| rx.recv()).sum::<i32>();
+    (sum == 10).then_some(()).ok_or_else(|| format!("expected 10, got {sum}"))
+}
 
-    // Move-capture: parameters reach the goroutine via closure capture.
+/// Move-capture: a local from the entry body is moved into a spawned goroutine.
+#[test]
+#[go_lib::main]
+fn entry_moves_captures_into_goroutine() {
     let base = 7_i32;
-    let doubled = go_lib::run(move || base * 2);
-    assert_eq!(doubled, 14);
+    let (tx, rx) = chan::<i32>(1);
+    go!(move || { tx.send(base * 2); });
+    assert_eq!(rx.recv(), Some(14));
+}
 
-    // String return: heap-allocated value crosses the goroutine boundary.
-    let s: String = go_lib::run(|| "hello from goroutine".to_string());
-    assert_eq!(s, "hello from goroutine");
+/// Heap value: a `String` crosses the goroutine boundary via a channel and is
+/// returned out of the entry to the caller.
+#[test]
+#[go_lib::main]
+fn entry_forwards_heap_value() -> Result<(), String> {
+    let (tx, rx) = chan::<String>(1);
+    go!(move || { tx.send("hello from goroutine".to_string()); });
+    match rx.recv().as_deref() {
+        Some("hello from goroutine") => Ok(()),
+        other => Err(format!("unexpected value: {other:?}")),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -538,33 +522,32 @@ fn run_returns_value() {
 //     and the assertion checks the exact value rather than just sign.
 // ---------------------------------------------------------------------------
 #[test]
+#[go_lib::main]
 fn many_goroutines() {
     const WORKERS: i32 = 75_000;
-    go_lib::run(|| {
-        go_lib::scope(|s| {
-            // Use i64 throughout so the assertion arithmetic does not
-            // overflow at WORKERS ≥ 46_341 (where `i * (i + 1)` first
-            // exceeds `i32::MAX = 2_147_483_647`).  The final triangular
-            // number `i*(i+1)/2` for `i = 49_999` is 1,249,975,000 — well
-            // within i64.
-            let handles: Vec<ScopedJoinHandle<i64>> = (0..WORKERS)
-                .map(|i| s.go(move || {
-                    // Compute the triangular number i*(i+1)/2.
-                    // Range 0..=i is never empty: every goroutine does real work.
-                    (0_i64..=i as i64).sum::<i64>()
-                }))
-                .collect();
+    go_lib::scope(|s| {
+        // Use i64 throughout so the assertion arithmetic does not
+        // overflow at WORKERS ≥ 46_341 (where `i * (i + 1)` first
+        // exceeds `i32::MAX = 2_147_483_647`).  The final triangular
+        // number `i*(i+1)/2` for `i = 49_999` is 1,249,975,000 — well
+        // within i64.
+        let handles: Vec<ScopedJoinHandle<i64>> = (0..WORKERS)
+            .map(|i| s.go(move || {
+                // Compute the triangular number i*(i+1)/2.
+                // Range 0..=i is never empty: every goroutine does real work.
+                (0_i64..=i as i64).sum::<i64>()
+            }))
+            .collect();
 
-            for (i, handle) in handles.into_iter().enumerate() {
-                let sum = handle.join().expect("goroutine panicked");
-                let i   = i as i64;
-                assert_eq!(
-                    sum,
-                    i * (i + 1) / 2,
-                    "goroutine {i}: expected triangular number, got {sum}"
-                );
-            }
-        });
+        for (i, handle) in handles.into_iter().enumerate() {
+            let sum = handle.join().expect("goroutine panicked");
+            let i   = i as i64;
+            assert_eq!(
+                sum,
+                i * (i + 1) / 2,
+                "goroutine {i}: expected triangular number, got {sum}"
+            );
+        }
     });
 }
 
@@ -587,43 +570,41 @@ fn many_goroutines() {
 // closes.  Before the conversion this hung intermittently in debug builds.
 // ---------------------------------------------------------------------------
 #[test]
+#[go_lib::main]
 fn select_preemption_storm() {
     const WORKERS: i64 = 5_000;
-    let done  = Arc::new(AtomicI64::new(0));
-    let done2 = Arc::clone(&done);
+    let done = Arc::new(AtomicI64::new(0));
 
-    go_lib::run(move || {
-        scope(|s| {
-            for i in 0..WORKERS {
-                let (tx, rx)            = chan::<i64>(0);
-                // A channel whose sender is never used: its recv case in the
-                // select below is never ready, so it cannot satisfy the
-                // select.  Keep the sender alive (no close) by moving it into
-                // the consumer so the channel is never reported closed.
-                let (idle_tx, idle_rx)  = chan::<i64>(0);
-                let done = Arc::clone(&done2);
+    scope(|s| {
+        for i in 0..WORKERS {
+            let (tx, rx)            = chan::<i64>(0);
+            // A channel whose sender is never used: its recv case in the
+            // select below is never ready, so it cannot satisfy the
+            // select.  Keep the sender alive (no close) by moving it into
+            // the consumer so the channel is never reported closed.
+            let (idle_tx, idle_rx)  = chan::<i64>(0);
+            let done = Arc::clone(&done);
 
-                // Producer: CPU-bound work, then send the triangular number.
-                s.go(move || {
-                    let mut acc = 0_i64;
-                    for k in 0..=i { acc = acc.wrapping_add(k); }
-                    tx.send(acc);
-                });
+            // Producer: CPU-bound work, then send the triangular number.
+            s.go(move || {
+                let mut acc = 0_i64;
+                for k in 0..=i { acc = acc.wrapping_add(k); }
+                tx.send(acc);
+            });
 
-                // Consumer: CPU-bound work, then block in a 2-case select.
-                s.go(move || {
-                    let _keep = idle_tx; // hold the idle sender; never send/close
-                    let mut acc = 0_i64;
-                    for k in 0..=i { acc = acc.wrapping_add(k); }
-                    let got = select! {
-                        recv(rx) -> v => { v.expect("rx closed unexpectedly") }
-                        recv(idle_rx) -> _v => { -1_i64 }
-                    };
-                    assert_eq!(got, acc, "select worker {i}: wrong value (lost wakeup?)");
-                    done.fetch_add(1, Ordering::Relaxed);
-                });
-            }
-        });
+            // Consumer: CPU-bound work, then block in a 2-case select.
+            s.go(move || {
+                let _keep = idle_tx; // hold the idle sender; never send/close
+                let mut acc = 0_i64;
+                for k in 0..=i { acc = acc.wrapping_add(k); }
+                let got = select! {
+                    recv(rx) -> v => { v.expect("rx closed unexpectedly") }
+                    recv(idle_rx) -> _v => { -1_i64 }
+                };
+                assert_eq!(got, acc, "select worker {i}: wrong value (lost wakeup?)");
+                done.fetch_add(1, Ordering::Relaxed);
+            });
+        }
     });
 
     assert_eq!(
@@ -664,50 +645,48 @@ fn select_preemption_storm() {
 // GWAITING before notify_one can pop it.
 // ---------------------------------------------------------------------------
 #[test]
+#[go_lib::main]
 fn cond_preemption_storm() {
     use go_lib::sync::Cond;
     use std::sync::Mutex;
 
     const WORKERS: i64 = 5_000;
-    let woke  = Arc::new(AtomicI64::new(0));
-    let woke2 = Arc::clone(&woke);
+    let woke = Arc::new(AtomicI64::new(0));
 
-    go_lib::run(move || {
-        scope(|s| {
-            for i in 0..WORKERS {
-                let mu  = Arc::new(Mutex::new(false));
-                let cnd = Arc::new(Cond::new());
+    scope(|s| {
+        for i in 0..WORKERS {
+            let mu  = Arc::new(Mutex::new(false));
+            let cnd = Arc::new(Cond::new());
 
-                // Waiter: CPU-bound work, then park until the predicate holds.
-                {
-                    let mu   = Arc::clone(&mu);
-                    let cnd  = Arc::clone(&cnd);
-                    let woke = Arc::clone(&woke2);
-                    s.go(move || {
-                        let mut acc = 0_i64;
-                        for k in 0..=(i % 512) { acc = acc.wrapping_add(k); }
-                        std::hint::black_box(acc);
-
-                        let mut guard = mu.lock().unwrap();
-                        while !*guard {
-                            guard = cnd.wait(&mu, guard);
-                        }
-                        drop(guard);
-                        woke.fetch_add(1, Ordering::Relaxed);
-                    });
-                }
-
-                // Notifier: CPU-bound work, set predicate, one notify_one.
+            // Waiter: CPU-bound work, then park until the predicate holds.
+            {
+                let mu   = Arc::clone(&mu);
+                let cnd  = Arc::clone(&cnd);
+                let woke = Arc::clone(&woke);
                 s.go(move || {
                     let mut acc = 0_i64;
                     for k in 0..=(i % 512) { acc = acc.wrapping_add(k); }
                     std::hint::black_box(acc);
 
-                    *mu.lock().unwrap() = true;
-                    cnd.notify_one();
+                    let mut guard = mu.lock().unwrap();
+                    while !*guard {
+                        guard = cnd.wait(&mu, guard);
+                    }
+                    drop(guard);
+                    woke.fetch_add(1, Ordering::Relaxed);
                 });
             }
-        });
+
+            // Notifier: CPU-bound work, set predicate, one notify_one.
+            s.go(move || {
+                let mut acc = 0_i64;
+                for k in 0..=(i % 512) { acc = acc.wrapping_add(k); }
+                std::hint::black_box(acc);
+
+                *mu.lock().unwrap() = true;
+                cnd.notify_one();
+            });
+        }
     });
 
     assert_eq!(

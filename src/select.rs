@@ -601,7 +601,6 @@ mod tests {
     use super::*;
     use crate::chan::{chan, Hchan};
     use crate::runtime::sudog::Sudog;
-    use crate::runtime::sched::run_impl;
     use std::ptr;
     use std::sync::atomic::{AtomicI32, Ordering};
     use std::sync::Arc;
@@ -745,150 +744,144 @@ mod tests {
 
     /// select { rx.recv() => ... ; default } on a buffered channel with data.
     #[test]
+    #[go_lib::main]
     fn fast_recv_buffered() {
-        run_impl(|| {
-            let (tx, rx) = chan::<i32>(4);
-            tx.send(42);
+        let (tx, rx) = chan::<i32>(4);
+        tx.send(42);
 
-            let mut slot: Option<i32> = None;
-            let mut cases = [recv_case(rx.hchan(), &mut slot)];
-            let (idx, ok) = selectgo(&mut cases, true);
+        let mut slot: Option<i32> = None;
+        let mut cases = [recv_case(rx.hchan(), &mut slot)];
+        let (idx, ok) = selectgo(&mut cases, true);
 
-            assert_eq!(idx, 0, "should pick recv case");
-            assert!(ok,        "should be ok (not closed)");
-            assert_eq!(slot.unwrap(), 42);
-        });
+        assert_eq!(idx, 0, "should pick recv case");
+        assert!(ok,        "should be ok (not closed)");
+        assert_eq!(slot.unwrap(), 42);
     }
 
     /// select { tx.send(v) => ... ; default } on a channel with buffer space.
     #[test]
+    #[go_lib::main]
     fn fast_send_buffered() {
-        run_impl(|| {
-            let (tx, rx) = chan::<i32>(4);
+        let (tx, rx) = chan::<i32>(4);
 
-            let mut val = 99_i32;
-            let mut cases = [send_case(tx.hchan(), &mut val)];
-            let (idx, ok) = selectgo(&mut cases, true);
+        let mut val = 99_i32;
+        let mut cases = [send_case(tx.hchan(), &mut val)];
+        let (idx, ok) = selectgo(&mut cases, true);
 
-            assert_eq!(idx, 0);
-            assert!(ok, "buffered send completes with ok=true");
-            assert_eq!(rx.recv(), Some(99));
-        });
+        assert_eq!(idx, 0);
+        assert!(ok, "buffered send completes with ok=true");
+        assert_eq!(rx.recv(), Some(99));
     }
 
     /// select { ... ; default } when no case is ready → default taken.
     #[test]
+    #[go_lib::main]
     fn default_taken_when_not_ready() {
-        run_impl(|| {
-            let (_tx, rx) = chan::<i32>(0);
+        let (_tx, rx) = chan::<i32>(0);
 
-            let mut slot: Option<i32> = None;
-            let mut cases = [recv_case(rx.hchan(), &mut slot)];
-            let (idx, ok) = selectgo(&mut cases, true);
+        let mut slot: Option<i32> = None;
+        let mut cases = [recv_case(rx.hchan(), &mut slot)];
+        let (idx, ok) = selectgo(&mut cases, true);
 
-            assert_eq!(idx, CASE_DEFAULT);
-            assert!(!ok);
-        });
+        assert_eq!(idx, CASE_DEFAULT);
+        assert!(!ok);
     }
 
     /// select recv on closed+empty channel returns ok=false.
     #[test]
+    #[go_lib::main]
     fn recv_closed_empty() {
-        run_impl(|| {
-            let (tx, rx) = chan::<i32>(0);
-            tx.close();
+        let (tx, rx) = chan::<i32>(0);
+        tx.close();
 
-            let mut slot: Option<i32> = None;
-            let mut cases = [recv_case(rx.hchan(), &mut slot)];
-            let (idx, ok) = selectgo(&mut cases, false);
+        let mut slot: Option<i32> = None;
+        let mut cases = [recv_case(rx.hchan(), &mut slot)];
+        let (idx, ok) = selectgo(&mut cases, false);
 
-            assert_eq!(idx, 0);
-            assert!(!ok, "recv from closed returns ok=false");
-            assert!(slot.is_none(), "closed recv slot must stay None");
-        });
+        assert_eq!(idx, 0);
+        assert!(!ok, "recv from closed returns ok=false");
+        assert!(slot.is_none(), "closed recv slot must stay None");
     }
 
     // ── Multi-case selection ──────────────────────────────────────────────────
 
     /// Two recv cases; only one channel has data — that case wins.
     #[test]
+    #[go_lib::main]
     fn multi_case_first_ready_wins() {
-        run_impl(|| {
-            let (tx1, rx1) = chan::<i32>(1);
-            let (_tx2, rx2) = chan::<i32>(1);
+        let (tx1, rx1) = chan::<i32>(1);
+        let (_tx2, rx2) = chan::<i32>(1);
 
-            tx1.send(7);
+        tx1.send(7);
 
-            let mut s1: Option<i32> = None;
-            let mut s2: Option<i32> = None;
-            let mut cases = [
-                recv_case(rx1.hchan(), &mut s1),
-                recv_case(rx2.hchan(), &mut s2),
-            ];
-            let (idx, ok) = selectgo(&mut cases, false);
+        let mut s1: Option<i32> = None;
+        let mut s2: Option<i32> = None;
+        let mut cases = [
+            recv_case(rx1.hchan(), &mut s1),
+            recv_case(rx2.hchan(), &mut s2),
+        ];
+        let (idx, ok) = selectgo(&mut cases, false);
 
-            assert_eq!(idx, 0);
-            assert!(ok);
-            assert_eq!(s1.unwrap(), 7);
-        });
+        assert_eq!(idx, 0);
+        assert!(ok);
+        assert_eq!(s1.unwrap(), 7);
     }
 
     // ── Blocking path tests (goroutine park/unpark) ───────────────────────────
 
     /// Goroutine blocks on select recv, then a sender unblocks it.
     #[test]
+    #[go_lib::main]
     fn blocking_recv_unblocked_by_send() {
         use crate::runtime::sched::spawn_goroutine;
 
         let result = Arc::new(AtomicI32::new(-1));
         let result2 = Arc::clone(&result);
 
-        run_impl(move || {
-            let (tx, rx) = chan::<i32>(0);
+        let (tx, rx) = chan::<i32>(0);
 
-            spawn_goroutine(move || {
-                // Sender: wait a bit, then send.
-                crate::gosched();
-                tx.send(55);
-            });
-
-            let mut slot: Option<i32> = None;
-            let mut cases = [recv_case(rx.hchan(), &mut slot)];
-            // No default → will block.
-            let (idx, ok) = selectgo(&mut cases, false);
-
-            assert_eq!(idx, 0);
-            assert!(ok);
-            result2.store(slot.unwrap(), Ordering::Relaxed);
+        spawn_goroutine(move || {
+            // Sender: wait a bit, then send.
+            crate::gosched();
+            tx.send(55);
         });
+
+        let mut slot: Option<i32> = None;
+        let mut cases = [recv_case(rx.hchan(), &mut slot)];
+        // No default → will block.
+        let (idx, ok) = selectgo(&mut cases, false);
+
+        assert_eq!(idx, 0);
+        assert!(ok);
+        result2.store(slot.unwrap(), Ordering::Relaxed);
 
         assert_eq!(result.load(Ordering::Acquire), 55);
     }
 
     /// Goroutine blocks on select send, then a receiver unblocks it.
     #[test]
+    #[go_lib::main]
     fn blocking_send_unblocked_by_recv() {
         use crate::runtime::sched::spawn_goroutine;
 
-        run_impl(|| {
-            let (tx, rx) = chan::<i32>(0);
+        let (tx, rx) = chan::<i32>(0);
 
-            spawn_goroutine(move || {
-                crate::gosched();
-                // Consume the value the select sends.
-                let _ = rx.recv();
-            });
-
-            let mut val = 77_i32;
-            let mut cases = [send_case(tx.hchan(), &mut val)];
-            let (idx, _ok) = selectgo(&mut cases, false);
-
-            assert_eq!(idx, 0);
+        spawn_goroutine(move || {
+            crate::gosched();
+            // Consume the value the select sends.
+            let _ = rx.recv();
         });
+
+        let mut val = 77_i32;
+        let mut cases = [send_case(tx.hchan(), &mut val)];
+        let (idx, _ok) = selectgo(&mut cases, false);
+
+        assert_eq!(idx, 0);
     }
 
     /// Two goroutines racing on the same channel; exactly one wins via select.
     #[test]
+    #[go_lib::main]
     fn select_race_one_winner() {
         use crate::runtime::sched::spawn_goroutine;
 
@@ -897,46 +890,44 @@ mod tests {
         let wins3 = Arc::clone(&wins);
         let wins4 = Arc::clone(&wins);
 
-        run_impl(move || {
-            let (tx, rx) = chan::<i32>(1);
-            tx.send(1); // one value in the buffer
+        let (tx, rx) = chan::<i32>(1);
+        tx.send(1); // one value in the buffer
 
-            spawn_goroutine({
-                let wins = Arc::clone(&wins2);
-                let rx = rx.clone();
-                move || {
-                    let mut slot: Option<i32> = None;
-                    let mut cases = [recv_case(rx.hchan(), &mut slot)];
-                    let (idx, ok) = selectgo(&mut cases, true);
-                    if idx == 0 && ok { wins.fetch_add(1, Ordering::Relaxed); }
-                }
-            });
-
-            spawn_goroutine({
-                let wins = Arc::clone(&wins3);
-                let rx = rx.clone();
-                move || {
-                    let mut slot: Option<i32> = None;
-                    let mut cases = [recv_case(rx.hchan(), &mut slot)];
-                    let (idx, ok) = selectgo(&mut cases, true);
-                    if idx == 0 && ok { wins.fetch_add(1, Ordering::Relaxed); }
-                }
-            });
-
-            // Poll on the atomic with a wall-clock deadline so the test is
-            // robust to per-goroutine startup latency (a one-shot stack
-            // pre-grow + scheduler wakeup is ~50 µs, and the loser goroutine
-            // blocks forever in selectgo — we just need the winner to record
-            // its win).  Five seconds is comfortable headroom even on slow
-            // CI runners.
-            let deadline =
-                std::time::Instant::now() + std::time::Duration::from_secs(5);
-            while wins4.load(Ordering::Acquire) < 1
-                && std::time::Instant::now() < deadline
-            {
-                crate::gosched();
+        spawn_goroutine({
+            let wins = Arc::clone(&wins2);
+            let rx = rx.clone();
+            move || {
+                let mut slot: Option<i32> = None;
+                let mut cases = [recv_case(rx.hchan(), &mut slot)];
+                let (idx, ok) = selectgo(&mut cases, true);
+                if idx == 0 && ok { wins.fetch_add(1, Ordering::Relaxed); }
             }
         });
+
+        spawn_goroutine({
+            let wins = Arc::clone(&wins3);
+            let rx = rx.clone();
+            move || {
+                let mut slot: Option<i32> = None;
+                let mut cases = [recv_case(rx.hchan(), &mut slot)];
+                let (idx, ok) = selectgo(&mut cases, true);
+                if idx == 0 && ok { wins.fetch_add(1, Ordering::Relaxed); }
+            }
+        });
+
+        // Poll on the atomic with a wall-clock deadline so the test is
+        // robust to per-goroutine startup latency (a one-shot stack
+        // pre-grow + scheduler wakeup is ~50 µs, and the loser goroutine
+        // blocks forever in selectgo — we just need the winner to record
+        // its win).  Five seconds is comfortable headroom even on slow
+        // CI runners.
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while wins4.load(Ordering::Acquire) < 1
+            && std::time::Instant::now() < deadline
+        {
+            crate::gosched();
+        }
 
         // Exactly one goroutine should have received the value.
         assert_eq!(wins.load(Ordering::Acquire), 1);

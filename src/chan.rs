@@ -611,7 +611,6 @@ pub(crate) unsafe fn closechan<T: Send + 'static>(c: &Arc<Hchan<T>>) {
 #[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
-    use crate::runtime::sched::run_impl;
     use std::sync::atomic::{AtomicI32, Ordering};
     use std::sync::Arc;
 
@@ -619,69 +618,63 @@ mod tests {
 
     /// Single send + recv completes without blocking.
     #[test]
+    #[go_lib::main]
     fn buffered_send_recv() {
-        run_impl(|| {
-            let (tx, rx) = chan::<i32>(1);
-            tx.send(42);
-            assert_eq!(rx.recv(), Some(42));
-        });
+        let (tx, rx) = chan::<i32>(1);
+        tx.send(42);
+        assert_eq!(rx.recv(), Some(42));
     }
 
     /// Values arrive in FIFO order.
     #[test]
+    #[go_lib::main]
     fn buffered_fifo_order() {
-        run_impl(|| {
-            let (tx, rx) = chan::<i32>(4);
-            for i in 0..4_i32 { tx.send(i); }
-            for i in 0..4_i32 { assert_eq!(rx.recv(), Some(i)); }
-        });
+        let (tx, rx) = chan::<i32>(4);
+        for i in 0..4_i32 { tx.send(i); }
+        for i in 0..4_i32 { assert_eq!(rx.recv(), Some(i)); }
     }
 
     /// Close drains buffered values, then recv returns None.
     #[test]
+    #[go_lib::main]
     fn buffered_close_drains_then_none() {
-        run_impl(|| {
-            let (tx, rx) = chan::<i32>(2);
-            tx.send(1);
-            tx.send(2);
-            tx.close();
-            assert_eq!(rx.recv(), Some(1));
-            assert_eq!(rx.recv(), Some(2));
-            assert_eq!(rx.recv(), None);
-            assert_eq!(rx.recv(), None); // idempotent
-        });
+        let (tx, rx) = chan::<i32>(2);
+        tx.send(1);
+        tx.send(2);
+        tx.close();
+        assert_eq!(rx.recv(), Some(1));
+        assert_eq!(rx.recv(), Some(2));
+        assert_eq!(rx.recv(), None);
+        assert_eq!(rx.recv(), None); // idempotent
     }
 
     // ── Non-blocking ops ──────────────────────────────────────────────────────
 
     /// try_recv on an empty open channel returns None (would block).
     #[test]
+    #[go_lib::main]
     fn try_recv_empty() {
-        run_impl(|| {
-            let (_tx, rx) = chan::<i32>(4);
-            assert_eq!(rx.try_recv(), None);
-        });
+        let (_tx, rx) = chan::<i32>(4);
+        assert_eq!(rx.try_recv(), None);
     }
 
     /// try_recv on a closed empty channel returns Some(None).
     #[test]
+    #[go_lib::main]
     fn try_recv_closed_empty() {
-        run_impl(|| {
-            let (tx, rx) = chan::<i32>(4);
-            tx.close();
-            assert_eq!(rx.try_recv(), Some(None));
-        });
+        let (tx, rx) = chan::<i32>(4);
+        tx.close();
+        assert_eq!(rx.try_recv(), Some(None));
     }
 
     /// try_send to a full channel returns false.
     #[test]
+    #[go_lib::main]
     fn try_send_full() {
-        run_impl(|| {
-            let (tx, _rx) = chan::<i32>(2);
-            assert!(tx.try_send(1));
-            assert!(tx.try_send(2));
-            assert!(!tx.try_send(3));
-        });
+        let (tx, _rx) = chan::<i32>(2);
+        assert!(tx.try_send(1));
+        assert!(tx.try_send(2));
+        assert!(!tx.try_send(3));
     }
 
     // ── Panic paths ───────────────────────────────────────────────────────────
@@ -711,43 +704,42 @@ mod tests {
 
     /// Unbuffered send and recv across two goroutines.
     #[test]
+    #[go_lib::main]
     fn unbuffered_rendezvous() {
         use crate::runtime::sched::spawn_goroutine;
 
-        run_impl(|| {
-            let (tx, rx) = chan::<i32>(0);
-            spawn_goroutine(move || { tx.send(99); });
-            assert_eq!(rx.recv(), Some(99));
-        });
+        let (tx, rx) = chan::<i32>(0);
+        spawn_goroutine(move || { tx.send(99); });
+        assert_eq!(rx.recv(), Some(99));
     }
 
     /// Ping-pong ten rounds across two goroutines.
     #[test]
+    #[go_lib::main]
     fn unbuffered_ping_pong() {
         use crate::runtime::sched::spawn_goroutine;
 
-        run_impl(|| {
-            let (ping_tx, ping_rx) = chan::<i32>(0);
-            let (pong_tx, pong_rx) = chan::<i32>(0);
+        let (ping_tx, ping_rx) = chan::<i32>(0);
+        let (pong_tx, pong_rx) = chan::<i32>(0);
 
-            spawn_goroutine(move || {
-                for _ in 0..10 {
-                    let v = ping_rx.recv().unwrap();
-                    pong_tx.send(v + 1);
-                }
-            });
-
-            let mut n = 0_i32;
+        spawn_goroutine(move || {
             for _ in 0..10 {
-                ping_tx.send(n);
-                n = pong_rx.recv().unwrap();
+                let v = ping_rx.recv().unwrap();
+                pong_tx.send(v + 1);
             }
-            assert_eq!(n, 10);
         });
+
+        let mut n = 0_i32;
+        for _ in 0..10 {
+            ping_tx.send(n);
+            n = pong_rx.recv().unwrap();
+        }
+        assert_eq!(n, 10);
     }
 
     /// Buffered producer/consumer: 20 values summed by a goroutine.
     #[test]
+    #[go_lib::main]
     fn producer_consumer() {
         use crate::runtime::sched::spawn_goroutine;
 
@@ -755,39 +747,38 @@ mod tests {
         let sum = Arc::new(AtomicI32::new(0));
         let sum2 = Arc::clone(&sum);
 
-        run_impl(move || {
-            let (tx, rx) = chan::<i32>(4);
-            let sum3 = Arc::clone(&sum2);
+        let (tx, rx) = chan::<i32>(4);
+        let sum3 = Arc::clone(&sum2);
 
-            spawn_goroutine(move || {
-                for i in 0..N { tx.send(i); }
-                tx.close();
-            });
+        spawn_goroutine(move || {
+            for i in 0..N { tx.send(i); }
+            tx.close();
+        });
 
-            spawn_goroutine(move || {
-                while let Some(v) = rx.recv() {
-                    sum3.fetch_add(v, Ordering::Relaxed);
-                }
-            });
-
-            // A wall-clock deadline is robust across CI runner speeds and
-            // build profiles (debug, coverage/nightly) where frame sizes and
-            // instrumentation overhead can make goroutines run much slower.
-            let expected = N * (N - 1) / 2;
-            let deadline =
-                std::time::Instant::now() + std::time::Duration::from_secs(5);
-            while sum2.load(Ordering::Acquire) != expected
-                && std::time::Instant::now() < deadline
-            {
-                crate::gosched();
+        spawn_goroutine(move || {
+            while let Some(v) = rx.recv() {
+                sum3.fetch_add(v, Ordering::Relaxed);
             }
         });
+
+        // A wall-clock deadline is robust across CI runner speeds and
+        // build profiles (debug, coverage/nightly) where frame sizes and
+        // instrumentation overhead can make goroutines run much slower.
+        let expected = N * (N - 1) / 2;
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while sum2.load(Ordering::Acquire) != expected
+            && std::time::Instant::now() < deadline
+        {
+            crate::gosched();
+        }
 
         assert_eq!(sum.load(Ordering::Acquire), N * (N - 1) / 2);
     }
     
     /// multi-producer, single consumer: 10 producers summing 10 values
     #[test]
+    #[go_lib::main]
     fn multi_producer_single_consumer() {
         use crate::runtime::sched::spawn_goroutine;
         use crate::sync::WaitGroup;
@@ -797,46 +788,44 @@ mod tests {
         let sum = Arc::new(AtomicI32::new(0));
         let sum2 = Arc::clone(&sum);
 
-        run_impl(move || {
-            let (tx, rx) = chan::<i32>(4);
-            let sum3 = Arc::clone(&sum2);
-            let wg  = Arc::new(WaitGroup::new());
+        let (tx, rx) = chan::<i32>(4);
+        let sum3 = Arc::clone(&sum2);
+        let wg  = Arc::new(WaitGroup::new());
 
-            for g in 0 .. N {
-                let start = N*g;
-                let end = start+N;
-                let tx_clone = tx.clone();
-                let wg_clone = Arc::clone(&wg);
-                // add(1) must happen before spawn_goroutine so that wg.wait()
-                // cannot return before all producers have registered themselves.
-                wg_clone.add(1);
-                spawn_goroutine(move || {
-                    for i in start..end { tx_clone.send(i); }
-                    wg_clone.done()
-                });
-            }
-            
+        for g in 0 .. N {
+            let start = N*g;
+            let end = start+N;
+            let tx_clone = tx.clone();
+            let wg_clone = Arc::clone(&wg);
+            // add(1) must happen before spawn_goroutine so that wg.wait()
+            // cannot return before all producers have registered themselves.
+            wg_clone.add(1);
             spawn_goroutine(move || {
-                while let Some(v) = rx.recv() {
-                    sum3.fetch_add(v, Ordering::Relaxed);
-                }
+                for i in start..end { tx_clone.send(i); }
+                wg_clone.done()
             });
-
-            wg.wait();
-            tx.close();
-            
-            // A wall-clock deadline is robust across CI runner speeds and
-            // build profiles (debug, coverage/nightly) where frame sizes and
-            // instrumentation overhead can make goroutines run much slower.
-            let expected = total * (total - 1) / 2;
-            let deadline =
-                std::time::Instant::now() + std::time::Duration::from_secs(5);
-            while sum2.load(Ordering::Acquire) != expected
-                && std::time::Instant::now() < deadline
-            {
-                crate::gosched();
+        }
+        
+        spawn_goroutine(move || {
+            while let Some(v) = rx.recv() {
+                sum3.fetch_add(v, Ordering::Relaxed);
             }
         });
+
+        wg.wait();
+        tx.close();
+        
+        // A wall-clock deadline is robust across CI runner speeds and
+        // build profiles (debug, coverage/nightly) where frame sizes and
+        // instrumentation overhead can make goroutines run much slower.
+        let expected = total * (total - 1) / 2;
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while sum2.load(Ordering::Acquire) != expected
+            && std::time::Instant::now() < deadline
+        {
+            crate::gosched();
+        }
 
         assert_eq!(sum.load(Ordering::Acquire), total * (total - 1) / 2);
 
@@ -844,6 +833,7 @@ mod tests {
 
     /// Close wakes a goroutine that is blocked on recv.
     #[test]
+    #[go_lib::main]
     fn close_wakes_blocked_receiver() {
         use crate::runtime::sched::spawn_goroutine;
 
@@ -851,31 +841,29 @@ mod tests {
         let got2 = Arc::clone(&got_none);
         let got3 = Arc::clone(&got_none); // checked inside run_impl to bound the post-close loop
 
-        run_impl(move || {
-            let (tx, rx) = chan::<i32>(0);
+        let (tx, rx) = chan::<i32>(0);
 
-            spawn_goroutine(move || {
-                // Block on recv until the channel is closed.
-                if rx.recv().is_none() {
-                    got2.fetch_add(1, Ordering::Relaxed);
-                }
-            });
-
-            // Give the spawned goroutine time to start and block on recv.
-            // More iterations than before because parallel test load on CI can
-            // starve goroutines for many scheduler rounds.
-            for _ in 0..500 { crate::gosched(); }
-            tx.close();
-            // Wait for the goroutine to observe the close and record its result.
-            // A wall-clock deadline is robust across CI runner speeds.
-            let deadline =
-                std::time::Instant::now() + std::time::Duration::from_secs(5);
-            while got3.load(Ordering::Acquire) == 0
-                && std::time::Instant::now() < deadline
-            {
-                crate::gosched();
+        spawn_goroutine(move || {
+            // Block on recv until the channel is closed.
+            if rx.recv().is_none() {
+                got2.fetch_add(1, Ordering::Relaxed);
             }
         });
+
+        // Give the spawned goroutine time to start and block on recv.
+        // More iterations than before because parallel test load on CI can
+        // starve goroutines for many scheduler rounds.
+        for _ in 0..500 { crate::gosched(); }
+        tx.close();
+        // Wait for the goroutine to observe the close and record its result.
+        // A wall-clock deadline is robust across CI runner speeds.
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while got3.load(Ordering::Acquire) == 0
+            && std::time::Instant::now() < deadline
+        {
+            crate::gosched();
+        }
 
         assert_eq!(got_none.load(Ordering::Acquire), 1);
     }

@@ -44,7 +44,8 @@
 //! # Example
 //!
 //! ```no_run
-//! go_lib::run(|| {
+//! #[go_lib::main]
+//! fn main() {
 //!     let data = vec![1_i64, 2, 3, 4, 5];
 //!
 //!     let sum = go_lib::scope(|s| {
@@ -54,7 +55,7 @@
 //!     });
 //!
 //!     assert_eq!(sum, 15);
-//! });
+//! }
 //! ```
 
 use std::marker::PhantomData;
@@ -234,7 +235,8 @@ impl<'scope, 'env: 'scope> Scope<'scope, 'env> {
 /// # Example — parallel slice reduction
 ///
 /// ```no_run
-/// go_lib::run(|| {
+/// #[go_lib::main]
+/// fn main() {
 ///     let data = vec![1_i64, 2, 3, 4, 5];
 ///
 ///     let sum = go_lib::scope(|s| {
@@ -244,7 +246,7 @@ impl<'scope, 'env: 'scope> Scope<'scope, 'env> {
 ///     });
 ///
 ///     assert_eq!(sum, 15);
-/// });
+/// }
 /// ```
 ///
 /// # Example — fire-and-forget goroutines with shared stack state
@@ -252,7 +254,8 @@ impl<'scope, 'env: 'scope> Scope<'scope, 'env> {
 /// ```no_run
 /// use std::sync::atomic::{AtomicI32, Ordering};
 ///
-/// go_lib::run(|| {
+/// #[go_lib::main]
+/// fn main() {
 ///     let counter = std::sync::atomic::AtomicI32::new(0);
 ///
 ///     go_lib::scope(|s| {
@@ -263,7 +266,7 @@ impl<'scope, 'env: 'scope> Scope<'scope, 'env> {
 ///     });
 ///
 ///     assert_eq!(counter.load(Ordering::SeqCst), 8);
-/// });
+/// }
 /// ```
 pub fn scope<'env, F, R>(f: F) -> R
 where
@@ -310,117 +313,110 @@ where
 #[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
-    use crate::runtime::sched::run_impl;
     use std::sync::atomic::{AtomicI32, Ordering};
 
     /// Basic borrow: goroutines read a local Vec without cloning it.
     #[test]
+    #[go_lib::main]
     fn borrow_local_data() {
-        run_impl(|| {
-            let data = [1_i64, 2, 3, 4, 5];
+        let data = [1_i64, 2, 3, 4, 5];
 
-            let sum = scope(|s| {
-                let h1 = s.go(|| data[..3].iter().sum::<i64>());
-                let h2 = s.go(|| data[3..].iter().sum::<i64>());
-                h1.join().unwrap() + h2.join().unwrap()
-            });
-
-            assert_eq!(sum, 15);
-            // `data` is still accessible here — scope guarantees it lives long enough.
-            assert_eq!(data.len(), 5);
+        let sum = scope(|s| {
+            let h1 = s.go(|| data[..3].iter().sum::<i64>());
+            let h2 = s.go(|| data[3..].iter().sum::<i64>());
+            h1.join().unwrap() + h2.join().unwrap()
         });
+
+        assert_eq!(sum, 15);
+        // `data` is still accessible here — scope guarantees it lives long enough.
+        assert_eq!(data.len(), 5);
     }
 
     /// Fire-and-forget: drop all handles; scope still waits for goroutines.
     #[test]
+    #[go_lib::main]
     fn fire_and_forget() {
-        run_impl(|| {
-            let counter = AtomicI32::new(0);
+        let counter = AtomicI32::new(0);
 
-            scope(|s| {
-                for _ in 0..8 {
-                    s.go(|| { counter.fetch_add(1, Ordering::Relaxed); });
-                }
-                // All handles dropped here; scope will wait for all goroutines.
-            });
-
-            assert_eq!(counter.load(Ordering::SeqCst), 8);
+        scope(|s| {
+            for _ in 0..8 {
+                s.go(|| { counter.fetch_add(1, Ordering::Relaxed); });
+            }
+            // All handles dropped here; scope will wait for all goroutines.
         });
+
+        assert_eq!(counter.load(Ordering::SeqCst), 8);
     }
 
     /// Panic in a scoped goroutine is retrievable via join() as Err.
     /// Panic in a scoped goroutine is retrievable via join() as Err.
     #[test]
+    #[go_lib::main]
     fn goroutine_panic_via_join() {
-        run_impl(|| {
-            let result = scope(|s| {
-                let h = s.go(|| -> i32 { panic!("scoped panic") });
-                // join() returns Result — no resume_unwind across scheduling boundaries
-                h.join()
-            });
-            assert!(result.is_err(), "expected Err from a panicking goroutine");
-            let payload = result.unwrap_err();
-            let msg = payload
-                .downcast_ref::<&str>()
-                .copied()
-                .or_else(|| payload.downcast_ref::<String>().map(String::as_str));
-            assert_eq!(msg, Some("scoped panic"), "panic payload should be 'scoped panic'");
+        let result = scope(|s| {
+            let h = s.go(|| -> i32 { panic!("scoped panic") });
+            // join() returns Result — no resume_unwind across scheduling boundaries
+            h.join()
         });
+        assert!(result.is_err(), "expected Err from a panicking goroutine");
+        let payload = result.unwrap_err();
+        let msg = payload
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| payload.downcast_ref::<String>().map(String::as_str));
+        assert_eq!(msg, Some("scoped panic"), "panic payload should be 'scoped panic'");
     }
 
     /// Panic in a scoped goroutine whose handle is dropped is silently discarded.
     #[test]
+    #[go_lib::main]
     fn goroutine_panic_dropped_handle() {
-        run_impl(|| {
-            // Should not propagate — the handle is dropped without join().
-            scope(|s| {
-                let _h = s.go(|| -> i32 { panic!("silent panic") });
-                // _h dropped here
-            });
-            // scope returns normally
+        // Should not propagate — the handle is dropped without join().
+        scope(|s| {
+            let _h = s.go(|| -> i32 { panic!("silent panic") });
+            // _h dropped here
         });
+        // scope returns normally
     }
 
     /// Nested scopes work correctly.
     #[test]
+    #[go_lib::main]
     fn nested_scopes() {
-        run_impl(|| {
-            let outer = [10_i64, 20, 30];
+        let outer = [10_i64, 20, 30];
 
-            let total = scope(|s_outer| {
-                let h = s_outer.go(|| {
-                    // Inner scope borrows both `outer` and its own locals.
-                    let inner = [1_i64, 2, 3];
-                    scope(|s_inner| {
-                        let h1 = s_inner.go(|| inner.iter().sum::<i64>());
-                        let h2 = s_inner.go(|| outer.iter().sum::<i64>());
-                        h1.join().unwrap() + h2.join().unwrap()
-                    })
-                });
-                h.join().unwrap()
+        let total = scope(|s_outer| {
+            let h = s_outer.go(|| {
+                // Inner scope borrows both `outer` and its own locals.
+                let inner = [1_i64, 2, 3];
+                scope(|s_inner| {
+                    let h1 = s_inner.go(|| inner.iter().sum::<i64>());
+                    let h2 = s_inner.go(|| outer.iter().sum::<i64>());
+                    h1.join().unwrap() + h2.join().unwrap()
+                })
             });
-
-            // inner.sum = 6, outer.sum = 60
-            assert_eq!(total, 66);
+            h.join().unwrap()
         });
+
+        // inner.sum = 6, outer.sum = 60
+        assert_eq!(total, 66);
     }
 
     /// scope propagates a panic from the outer closure after waiting for goroutines.
     #[test]
+    #[go_lib::main]
     fn outer_closure_panic_waits_for_goroutines() {
-        run_impl(|| {
-            let finished = AtomicI32::new(0);
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                scope(|s| {
-                    s.go(|| { finished.fetch_add(1, Ordering::Relaxed); });
-                    panic!("outer panic");
-                    #[allow(unreachable_code)]
-                    42_i32
-                })
-            }));
-            assert!(result.is_err());
-            // The goroutine must have finished despite the outer panic.
-            assert_eq!(finished.load(Ordering::SeqCst), 1);
-        });
+        let finished = AtomicI32::new(0);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            scope(|s| {
+                s.go(|| { finished.fetch_add(1, Ordering::Relaxed); });
+                panic!("outer panic");
+                #[allow(unreachable_code)]
+                42_i32
+            })
+        }));
+        assert!(result.is_err());
+        // The goroutine must have finished despite the outer panic.
+        assert_eq!(finished.load(Ordering::SeqCst), 1);
     }
 }

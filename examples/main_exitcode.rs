@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
-//! main_exitcode — return `ExitCode` from `main` via `go_lib::run`.
+//! main_exitcode — return `ExitCode` from a `#[go_lib::main]` entry point.
 //!
-//! Pattern: `go_lib::run` returns whatever its closure returns.  Here the
-//! closure returns a `bool`; `main` converts that to `ExitCode::SUCCESS` or
+//! Pattern: the attribute forwards the entry function's return type to the
+//! first goroutine.  Here the body returns `ExitCode::SUCCESS` or
 //! `ExitCode::FAILURE` and the process exits with the appropriate status code.
 //!
 //! `go_lib::scope` runs the N tasks concurrently and collects their results
@@ -16,35 +16,32 @@
 
 use std::process::ExitCode;
 
+#[go_lib::main]
 fn main() -> ExitCode {
-    // go_lib::run returns the closure's return value directly.
-    let all_passed = go_lib::run(|| {
-        const N: usize = 5;
+    const N: usize = 5;
 
-        // Spawn N tasks concurrently; collect (id, ok) from each join handle.
-        let results = go_lib::scope(|s| {
-            let handles: Vec<_> = (0..N)
-                .map(|id| s.go(move || (id, run_task(id))))
-                .collect();
-            handles
-                .into_iter()
-                .map(|h| h.join().expect("task goroutine panicked"))
-                .collect::<Vec<_>>()
-        });
-
-        let mut failures = 0_usize;
-        for (id, ok) in results {
-            println!("  task {id}: {}", if ok { "ok" } else { "FAIL" });
-            if !ok {
-                failures += 1;
-            }
-        }
-        println!("{}/{N} tasks passed", N - failures);
-        failures == 0 // ← this bool is the return value of run()
+    // Spawn N tasks concurrently; collect (id, ok) from each join handle.
+    let results = go_lib::scope(|s| {
+        let handles: Vec<_> = (0..N)
+            .map(|id| s.go(move || (id, run_task(id))))
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("task goroutine panicked"))
+            .collect::<Vec<_>>()
     });
 
-    // Map the boolean result to a process exit code.
-    if all_passed {
+    let mut failures = 0_usize;
+    for (id, ok) in results {
+        println!("  task {id}: {}", if ok { "ok" } else { "FAIL" });
+        if !ok {
+            failures += 1;
+        }
+    }
+    println!("{}/{N} tasks passed", N - failures);
+
+    // Map the result to a process exit code.
+    if failures == 0 {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE

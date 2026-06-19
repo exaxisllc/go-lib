@@ -416,18 +416,17 @@ mod tests {
     /// `retake` on a freshly initialised scheduler (all Ps PRUNNING or PIDLE,
     /// schedtick freshly set) must find nothing to retake on a first pass.
     #[test]
+    #[go_lib::main]
     fn retake_finds_nothing_on_first_pass() {
-        crate::runtime::sched::run_impl(|| {
-            let rt = crate::runtime::sched::sched();
-            let mut ticks = Vec::new();
-            let now = monotonic_ns();
-            // First call: all schedtick/syscalltick observations are brand-new,
-            // elapsed == 0 for every P — nothing should be retaken or preempted.
-            let _ = retake(rt, now, &mut ticks);
-            // Second call immediately after: elapsed is still < thresholds.
-            let n = retake(rt, monotonic_ns(), &mut ticks);
-            assert_eq!(n, 0, "retake must return 0 when all Ps just started their tick");
-        });
+        let rt = crate::runtime::sched::sched();
+        let mut ticks = Vec::new();
+        let now = monotonic_ns();
+        // First call: all schedtick/syscalltick observations are brand-new,
+        // elapsed == 0 for every P — nothing should be retaken or preempted.
+        let _ = retake(rt, now, &mut ticks);
+        // Second call immediately after: elapsed is still < thresholds.
+        let n = retake(rt, monotonic_ns(), &mut ticks);
+        assert_eq!(n, 0, "retake must return 0 when all Ps just started their tick");
     }
 
     /// `preemptone` sets `preempt = true` and `stackguard0 = STACK_PREEMPT`

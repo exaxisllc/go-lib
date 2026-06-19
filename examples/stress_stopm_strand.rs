@@ -24,32 +24,31 @@
 
 use go_lib::{chan::chan, go};
 
+#[go_lib::main]
 fn main() {
-    let r: u64 = go_lib::run(|| {
-        let (start_tx, start_rx) = chan::<u64>(0);
-        let (result_tx, result_rx) = chan::<u64>(0);
+    let (start_tx, start_rx) = chan::<u64>(0);
+    let (result_tx, result_rx) = chan::<u64>(0);
 
-        // Detached hog: wait for the go-ahead, wake the target, then spin
-        // forever holding its P (never cycles back to the scheduler).
-        go!(move || {
-            let _ = start_rx.recv();
-            result_tx.send(42);          // <-- the wake that can be lost
-            let mut x = 0u64;
-            loop {
-                x = x.wrapping_mul(2862933555777941757).wrapping_add(1);
-                std::hint::black_box(x);
-            }
+    // Detached hog: wait for the go-ahead, wake the target, then spin
+    // forever holding its P (never cycles back to the scheduler).
+    go!(move || {
+        let _ = start_rx.recv();
+        result_tx.send(42);          // <-- the wake that can be lost
+        let mut x = 0u64;
+        loop {
+            x = x.wrapping_mul(2862933555777941757).wrapping_add(1);
+            std::hint::black_box(x);
+        }
+    });
+
+    // Hand the round to the hog, then block on the target's result.  If the
+    // wake is stranded, this recv never returns and the entry hangs forever.
+    let r: u64 = go_lib::scope(|s| {
+        let h = s.go(move || {
+            start_tx.send(0);        // release the hog
+            result_rx.recv().unwrap_or(0)
         });
-
-        // Hand the round to the hog, then block on the target's result.  If the
-        // wake is stranded, this recv never returns and run() hangs forever.
-        go_lib::scope(|s| {
-            let h = s.go(move || {
-                start_tx.send(0);        // release the hog
-                result_rx.recv().unwrap_or(0)
-            });
-            h.join().unwrap_or(0)
-        })
+        h.join().unwrap_or(0)
     });
 
     println!("strand ok: result={r}");

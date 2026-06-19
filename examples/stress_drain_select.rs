@@ -25,6 +25,10 @@
 //!   cargo run --release --example stress_drain_select 15 100000000
 //!
 //! A correct runtime prints "stress completed without crash".
+//!
+//! Each worker OS thread drives its own bootstrap, so this harness calls the
+//! internal `go_lib::__main_entry` (what `#[go_lib::main]` expands to) directly
+//! rather than the entry attribute, which only fits a single `main`.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -50,7 +54,7 @@ fn select_rt(seed: u64, max_iters: u64) {
         // are parking and senders are handing off.
         let wait_us = 50 + (x % 500);
 
-        go_lib::run(move || {
+        go_lib::__main_entry(move || {
             // Three unbuffered channels; selectors multiplex across them.
             let (a_tx, a_rx) = chan::<u64>(0);
             let (b_tx, b_rx) = chan::<u64>(0);
