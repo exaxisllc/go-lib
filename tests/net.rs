@@ -574,3 +574,56 @@ fn net_leaked_select_dispatch_servers() {
     assert_eq!(*results.lock().unwrap(), N);
     // Servers are intentionally left running (leaked), like go-http's tests.
 }
+
+// ---------------------------------------------------------------------------
+// N+4. Minimal leaked forever-accept servers (no select!, no try_clone)
+//
+// Isolates the trigger from N+3: are leaked goroutines parked forever in an
+// overlapped accept() (AcceptEx/IOCP) enough to wedge the Windows scheduler,
+// or is select! required?  Each server loops on accept() forever and is never
+// joined; after one client exchange the test returns, leaving the accept
+// goroutines parked on a pending AcceptEx.
+// ---------------------------------------------------------------------------
+#[test]
+#[go_lib::main]
+fn net_leaked_forever_accept() {
+    use std::time::Duration;
+    const N: usize = 8;
+
+    let mut addrs = Vec::new();
+    for _ in 0..N {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        addrs.push(listener.local_addr().unwrap());
+        // Forever-accepting server, never joined (leaked).
+        go!(move || loop {
+            match listener.accept() {
+                Ok(conn) => {
+                    go!(move || {
+                        let mut c = conn;
+                        let mut buf = [0u8; 4];
+                        if c.read(&mut buf).unwrap_or(0) > 0 {
+                            let _ = c.write(&buf);
+                        }
+                    });
+                }
+                Err(_) => break,
+            }
+        });
+    }
+    go_lib::sleep(Duration::from_millis(50));
+
+    let wg = Arc::new(WaitGroup::new());
+    for addr in addrs {
+        wg.add(1);
+        let wg2 = Arc::clone(&wg);
+        go!(move || {
+            let mut c = TcpStream::connect(addr).unwrap();
+            c.write_all(b"ping").unwrap();
+            let mut resp = [0u8; 4];
+            c.read_exact(&mut resp).unwrap();
+            wg2.done();
+        });
+    }
+    wg.wait();
+    // Accept goroutines intentionally leaked (still parked in accept()).
+}
