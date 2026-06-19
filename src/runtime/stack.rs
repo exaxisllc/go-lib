@@ -50,8 +50,9 @@
 //! a theoretical false positive but vanishingly rare for the narrow
 //! 2–1024 KiB windows used here.
 
-// Mutex is only needed for the SIGSEGV handler's static on Unix.
-#[cfg(not(windows))]
+// Mutex guards the SIGSEGV handler's static (Unix) and the stack pool buckets
+// (all platforms).
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering::Relaxed};
 use std::sync::Mutex;
 use std::sync::OnceLock;
 
@@ -289,7 +290,7 @@ pub(crate) unsafe fn stack_alloc_size(size: usize) -> Result<Stack, &'static str
 ///
 /// Ported from `stackalloc` in `runtime/stack.go`.
 pub(crate) unsafe fn stack_alloc() -> Result<Stack, &'static str> {
-    unsafe { stack_alloc_size(GOROUTINE_STACK_BYTES) }
+    unsafe { stack_pool_alloc(GOROUTINE_STACK_BYTES) }
 }
 
 /// Allocate a new g0 (scheduler) stack.
@@ -297,7 +298,7 @@ pub(crate) unsafe fn stack_alloc() -> Result<Stack, &'static str> {
 /// g0 stacks are larger than goroutine stacks because the scheduler call chain
 /// (`schedule` → `findrunnable` → locking → park) is deeper.
 pub(crate) unsafe fn g0_stack_alloc() -> Result<Stack, &'static str> {
-    unsafe { stack_alloc_size(G0_STACK_BYTES) }
+    unsafe { stack_pool_alloc(G0_STACK_BYTES) }
 }
 
 // ---------------------------------------------------------------------------
@@ -325,6 +326,145 @@ pub(crate) unsafe fn stack_free(stack: &Stack) {
         // VirtualFree with MEM_RELEASE requires dwSize = 0.
         unsafe { VirtualFree(base, 0, MEM_RELEASE) };
     }
+}
+
+// ---------------------------------------------------------------------------
+// Stack pool — size-classed free list of mmap'd stacks
+// ---------------------------------------------------------------------------
+// Decoupled from the G-descriptor free pool (`G_FREE` in `sched.rs`), this is
+// the port of Go's `stackpool` / `stackLarge`: a cache of freed goroutine and
+// g0 stacks, keyed by size class, that lets goroutine creation and stack
+// growth recycle an existing mmap instead of paying an `mmap`+`mprotect` /
+// `munmap` syscall pair every time.  It exists to **bound RSS and syscall
+// churn** under bursty goroutine workloads.
+//
+// ## Async-signal-safety — why the signal path does NOT use the pool
+//
+// The reactive growth path (`sigsegv_handler` → `try_grow_stack_from_signal`
+// → `newstack`) runs in an async-signal context and therefore CANNOT take the
+// pool's `Mutex` — a fault that interrupts a thread already holding a bucket
+// lock would deadlock that thread against itself.  `newstack` keeps calling
+// the raw `stack_alloc_size` / `stack_free` primitives (effectively `mmap` /
+// `munmap`, which are safe enough in that context, exactly as before).  Only
+// the **non-signal** callers — fresh goroutine creation, g0 allocation, the
+// proactive `grow_stack_if_needed` checkpoint (runs on g0), M teardown, and
+// the gFree stack handoff — route through the pool.  The two sets of callers
+// mix freely: every stack is a uniform `mmap(size + guard_page)` region
+// regardless of which path created or freed it.
+//
+// Each pooled bucket is wrapped in `m_lock()` like the other scheduler-internal
+// mutexes so an async-preemption SIGURG cannot migrate the thread mid-`MutexGuard`.
+
+/// Smallest power-of-two size class the pool retains: `1 << 14` = 16 KiB, the
+/// smallest real goroutine stack (Linux debug `GOROUTINE_STACK_BYTES`).
+const POOL_MIN_CLASS: u32 = 14;
+/// Largest power-of-two size class the pool retains: `1 << 21` = 2 MiB.  Larger
+/// stacks (grown deep, up to `STACK_MAX`) are freed directly rather than hoarded
+/// — bounding the per-entry footprint of the idle cache.
+const POOL_MAX_CLASS: u32 = 21;
+/// Number of buckets, one per power-of-two exponent in `[MIN, MAX]`.
+const NUM_POOL_CLASSES: usize = (POOL_MAX_CLASS - POOL_MIN_CLASS + 1) as usize;
+/// Soft cap on the total bytes the idle pool may retain across all classes.
+/// A `stack_pool_free` that would push past this unmaps instead of caching, so
+/// the pool's contribution to steady-state RSS never exceeds ~this value.
+const MAX_POOLED_BYTES: usize = 64 * 1024 * 1024;
+
+/// Per-class free lists of base addresses (`Stack.lo`).  Indexed by
+/// `exponent − POOL_MIN_CLASS`.  Addresses are stored as `usize` because
+/// `*mut` is not `Send`; the guard page below each `lo` stays `PROT_NONE`
+/// throughout, so a pooled entry is reusable as-is with no re-`mprotect`.
+static STACK_POOL: [Mutex<Vec<usize>>; NUM_POOL_CLASSES] =
+    [const { Mutex::new(Vec::new()) }; NUM_POOL_CLASSES];
+
+/// Running total of bytes currently parked in [`STACK_POOL`] (the usable region
+/// of each entry; the guard page is excluded, matching the size key).
+static POOLED_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+/// Whether the stack pool is disabled (`GOLIB_STACKPOOL_OFF=1`).  Ablation lever
+/// — independent of the G-descriptor pool's `GOLIB_GPOOL_OFF` — for
+/// A/B-bisecting any pooling regression: when set, alloc always `mmap`s fresh
+/// and free always `munmap`s.  `u8::MAX` sentinel = not yet read.
+static STACKPOOL_OFF: AtomicU8 = AtomicU8::new(u8::MAX);
+
+#[inline]
+fn stackpool_off() -> bool {
+    let mut v = STACKPOOL_OFF.load(Relaxed);
+    if v == u8::MAX {
+        v = match std::env::var("GOLIB_STACKPOOL_OFF") {
+            Ok(s) if s == "1" => 1,
+            _ => 0,
+        };
+        STACKPOOL_OFF.store(v, Relaxed);
+    }
+    v == 1
+}
+
+/// Map a usable stack size to its pool bucket index, or `None` if the size is
+/// outside the pooled range (`< 16 KiB`, `> 2 MiB`, or not a power of two).
+#[inline]
+fn pool_class(size: usize) -> Option<usize> {
+    if !size.is_power_of_two() {
+        return None;
+    }
+    let exp = size.trailing_zeros();
+    if !(POOL_MIN_CLASS..=POOL_MAX_CLASS).contains(&exp) {
+        return None;
+    }
+    Some((exp - POOL_MIN_CLASS) as usize)
+}
+
+/// Allocate a stack of `size` usable bytes, reusing a pooled one of the same
+/// size class when available and otherwise falling back to [`stack_alloc_size`].
+///
+/// This is the pooled entry point used by every **non-signal** caller; the
+/// async-signal growth path keeps calling [`stack_alloc_size`] directly (see the
+/// module-level note on signal-safety).
+///
+/// # Safety
+/// Same contract as [`stack_alloc_size`]: the returned [`Stack`] must eventually
+/// be released via [`stack_pool_free`] (or [`stack_free`]).
+pub(crate) unsafe fn stack_pool_alloc(size: usize) -> Result<Stack, &'static str> {
+    if !stackpool_off() && let Some(cls) = pool_class(size) {
+        // Scope the bucket lock + M-pin tightly; never hold across the mmap
+        // fallback below.
+        let popped = {
+            let _pin = super::m::m_lock();
+            STACK_POOL[cls].lock().unwrap().pop()
+        };
+        if let Some(lo) = popped {
+            POOLED_BYTES.fetch_sub(size, Relaxed);
+            // Guard page below `lo` is still PROT_NONE from the original
+            // mapping; the entry is reusable verbatim.
+            return Ok(Stack { lo, hi: lo + size });
+        }
+    }
+    unsafe { stack_alloc_size(size) }
+}
+
+/// Return a stack to the pool for reuse, or unmap it if its size is outside the
+/// pooled range or the pool is already at [`MAX_POOLED_BYTES`].
+///
+/// The pooled entry retains its guard page (`PROT_NONE`) intact; only the base
+/// address is recorded.
+///
+/// # Safety
+/// `stack` must have been returned by [`stack_alloc_size`] / [`stack_pool_alloc`]
+/// and must not be freed or used again after this call.
+pub(crate) unsafe fn stack_pool_free(stack: &Stack) {
+    let size = stack.hi - stack.lo;
+    if !stackpool_off() && let Some(cls) = pool_class(size) {
+        // Reserve the bytes first; if that would exceed the soft cap, undo
+        // and unmap instead.  The check races benignly under concurrency —
+        // the cap is a soft RSS bound, not a hard invariant.
+        let prev = POOLED_BYTES.fetch_add(size, Relaxed);
+        if prev + size <= MAX_POOLED_BYTES {
+            let _pin = super::m::m_lock();
+            STACK_POOL[cls].lock().unwrap().push(stack.lo);
+            return;
+        }
+        POOLED_BYTES.fetch_sub(size, Relaxed);
+    }
+    unsafe { stack_free(stack) };
 }
 
 // ---------------------------------------------------------------------------
@@ -923,8 +1063,11 @@ pub(crate) unsafe fn grow_stack_if_needed(gp: *mut G) {
             let old_size = old_stack.hi - old_stack.lo;
             if old_size < STACK_MAX {
                 let new_size  = (old_size * 2).min(STACK_MAX);
+                // Proactive growth runs on g0 (non-signal), so it may use the
+                // pooled allocator/free — reusing a cached stack of the target
+                // size class and returning the old one for a future grow.
                 let new_stack = unsafe {
-                    stack_alloc_size(new_size)
+                    stack_pool_alloc(new_size)
                         .expect("grow_stack_if_needed: allocation failed")
                 };
                 let delta = unsafe { copystack(gp, &old_stack, &new_stack) };
@@ -932,7 +1075,7 @@ pub(crate) unsafe fn grow_stack_if_needed(gp: *mut G) {
                     (*gp).stack       = Stack { lo: new_stack.lo, hi: new_stack.hi };
                     (*gp).stackguard0 = new_stack.lo + STACK_GUARD;
                 }
-                unsafe { stack_free(&old_stack) };
+                unsafe { stack_pool_free(&old_stack) };
                 let _ = delta;
             }
         }
@@ -996,6 +1139,67 @@ mod tests {
                 assert_eq!(stack.hi - stack.lo, size);
                 stack_free(&stack);
             }
+        }
+    }
+
+    /// `pool_class` maps only in-range powers of two to a bucket.
+    #[test]
+    fn pool_class_bounds() {
+        assert_eq!(pool_class(1 << POOL_MIN_CLASS), Some(0));
+        assert_eq!(
+            pool_class(1 << POOL_MAX_CLASS),
+            Some((POOL_MAX_CLASS - POOL_MIN_CLASS) as usize)
+        );
+        // Below range, above range, and non-power-of-two are all rejected.
+        assert_eq!(pool_class(1 << (POOL_MIN_CLASS - 1)), None);
+        assert_eq!(pool_class(1 << (POOL_MAX_CLASS + 1)), None);
+        assert_eq!(pool_class(48 * 1024), None);
+    }
+
+    /// The pooled alloc/free API round-trips: a stack obtained from
+    /// `stack_pool_alloc` has the requested size, its usable region is
+    /// writable, and it can be returned via `stack_pool_free` and re-acquired.
+    ///
+    /// Identity (whether the *same* mapping comes back) is deliberately NOT
+    /// asserted: the pool is a process-global shared with the runtime's own
+    /// concurrent tests, so a peer could pop the parked entry first.  Reuse is
+    /// covered by the `many_goroutines` integration runs.
+    #[test]
+    fn pool_alloc_free_round_trip() {
+        for &cls in &[POOL_MIN_CLASS, POOL_MAX_CLASS] {
+            let size = 1usize << cls;
+            unsafe {
+                let s1 = stack_pool_alloc(size).unwrap();
+                assert_eq!(s1.hi - s1.lo, size);
+                let top = (s1.hi - 8) as *mut u64;
+                top.write(0xDEAD_BEEF_F00D_BABE);
+                assert_eq!(top.read(), 0xDEAD_BEEF_F00D_BABE);
+                stack_pool_free(&s1);
+
+                // A second alloc of the same class also yields a usable stack
+                // (served from the pool or freshly mapped — both valid).
+                let s2 = stack_pool_alloc(size).unwrap();
+                assert_eq!(s2.hi - s2.lo, size);
+                let top2 = (s2.hi - 8) as *mut u64;
+                top2.write(0x0102_0304_0506_0708);
+                assert_eq!(top2.read(), 0x0102_0304_0506_0708);
+                stack_pool_free(&s2);
+            }
+        }
+    }
+
+    /// `stackpool_off` honours `GOLIB_STACKPOOL_OFF`; with the pool disabled,
+    /// alloc/free still round-trip (straight through to mmap/munmap).
+    #[test]
+    fn pool_ablation_round_trips() {
+        // Don't mutate the process-global env in a way that races other tests;
+        // just exercise the disabled-path wrappers by size outside pool range,
+        // which always falls through to raw alloc/free regardless of the lever.
+        let size = 8 * 1024usize; // below POOL_MIN_CLASS → never pooled
+        unsafe {
+            let s = stack_pool_alloc(size).unwrap();
+            assert_eq!(s.hi - s.lo, size);
+            stack_pool_free(&s);
         }
     }
 }

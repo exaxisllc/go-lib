@@ -49,10 +49,10 @@ use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, AtomicU8, Ordering::*};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use super::g::{casgstatus, current_g, readgstatus, set_current_g, G, GDEAD, GPREEMPTED, GRUNNABLE, GRUNNING, STACK_GUARD};
+use super::g::{casgstatus, current_g, readgstatus, set_current_g, Stack, G, GDEAD, GPREEMPTED, GRUNNABLE, GRUNNING, STACK_GUARD};
 use super::m::{current_m, M};
 use super::p::{GlobalRunQueue, P, PIDLE, PRUNNING};
-use super::stack::{grow_stack_if_needed, stack_alloc, stack_free};
+use super::stack::{grow_stack_if_needed, stack_alloc, stack_pool_free, GOROUTINE_STACK_BYTES};
 #[cfg(not(windows))]
 use super::stack::{install_sigsegv_handler, try_grow_stack_from_signal};
 use super::sysmon::start_sysmon;
@@ -2090,9 +2090,15 @@ static NEXT_GOID: AtomicU64 = AtomicU64::new(1);
 /// force-killed (parked) descriptors, which DID have live external references;
 /// those paths no longer exist.
 ///
-/// Each entry carries its mmap'd stack intact (the stack is pooled with the
-/// descriptor, as in Go), so a reused G also skips a `stack_alloc`/`stack_free`
-/// pair.  Stored as `usize` addresses because `*mut G` is not `Send`.
+/// A pooled descriptor keeps its mmap'd stack ONLY when that stack is still the
+/// default initial size, so a reused G also skips a `stack_alloc`/`stack_free`
+/// pair.  A descriptor whose goroutine *grew* its stack parks stackless: the
+/// oversized stack is handed to the size-classed stack pool (`stack_pool_free`)
+/// and re-acquired at default size on reuse.  This mirrors Go's `gfput`/`gfget`
+/// (`stksize != startingStackSize` → `stackfree`) and is what stops grown
+/// stacks from accumulating in this unbounded pool — the RSS bound lives in the
+/// stack pool's cap, not here.  Stored as `usize` addresses because `*mut G` is
+/// not `Send`.
 static G_FREE: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
 /// Whether descriptor reuse is disabled (`GOLIB_GPOOL_OFF=1`).  Ablation lever
@@ -2128,15 +2134,25 @@ fn gpool_off() -> bool {
 /// the historical leak avoided the freed-descriptor sysmon UAF by never freeing).
 unsafe fn gfree_put(gp: *mut G) {
     if gpool_off() {
-        // Ablation: behave like the historical leak path — free the stack and
-        // leak the descriptor (never recycle, never free) so sysmon's blind
-        // write can never hit freed memory.
+        // Ablation: behave like the historical leak path — release the stack
+        // (to the stack pool, or unmapped; independent of this lever) and leak
+        // the descriptor (never recycle, never free) so sysmon's blind write
+        // can never hit freed memory.
         let stack = unsafe { (*gp).stack };
-        unsafe { stack_free(&stack) };
+        unsafe { stack_pool_free(&stack) };
         // Leak the descriptor on purpose (immortal); do not drop the Box.
         return;
     }
-    // Reuse path: keep the stack, push the descriptor address onto the pool.
+    // Reuse path.  If the goroutine grew its stack beyond the default size,
+    // hand that oversized stack to the size-classed stack pool and park the
+    // descriptor stackless (Go's `gfput`: `stksize != startingStackSize` →
+    // `stackfree`).  This bounds the memory the unbounded `G_FREE` pool can
+    // retain; the descriptor re-acquires a default stack on reuse.
+    let stack = unsafe { (*gp).stack };
+    if stack.hi - stack.lo != GOROUTINE_STACK_BYTES {
+        unsafe { stack_pool_free(&stack) };
+        unsafe { (*gp).stack = Stack { lo: 0, hi: 0 } };
+    }
     // `m_lock` pins this M so SIGURG cannot migrate us mid-`MutexGuard` (a std
     // MutexGuard must unlock on the thread that locked it).
     let _lk = super::m::m_lock();
@@ -2145,8 +2161,10 @@ unsafe fn gfree_put(gp: *mut G) {
 
 /// Pop a retired descriptor from [`G_FREE`], or `None` if the pool is empty.
 ///
-/// The returned descriptor still owns its pooled stack; the caller reinitialises
-/// the `G` in place (via `G::value`) for the new goroutine.
+/// The returned descriptor still owns its pooled stack UNLESS its goroutine grew
+/// the stack (then it parked stackless — `stack.lo == 0` — and the caller must
+/// allocate a fresh default stack).  Either way the caller reinitialises the `G`
+/// in place (via `G::value`) for the new goroutine.
 unsafe fn gfree_get() -> Option<*mut G> {
     if gpool_off() {
         return None;
@@ -2330,10 +2348,18 @@ pub(crate) fn new_goroutine(f: impl FnOnce() + Send + 'static) -> *mut G {
     // sysmon write the dormant descriptor may have received.
     let gp: *mut G = match unsafe { gfree_get() } {
         Some(gp) => {
-            // Recycle: reuse the pooled stack, reset all fields in place, then
-            // re-point the self-referential `sched.g` at this allocation (the
-            // reuse contract documented on `G::value`).
-            let stack = unsafe { (*gp).stack };
+            // Recycle: reuse the pooled stack when the descriptor kept one
+            // (default-sized); if it parked stackless (its goroutine had grown
+            // the stack, which `gfree_put` returned to the stack pool), acquire
+            // a fresh default stack — itself likely served from the stack pool.
+            let mut stack = unsafe { (*gp).stack };
+            if stack.lo == 0 {
+                stack = unsafe {
+                    stack_alloc().expect("new_goroutine: stack_alloc failed (reuse)")
+                };
+            }
+            // Reset all fields in place, then re-point the self-referential
+            // `sched.g` at this allocation (the reuse contract on `G::value`).
             unsafe { ptr::write(gp, G::value(stack, goid)) };
             unsafe { (*gp).sched.g = gp };
             gp
