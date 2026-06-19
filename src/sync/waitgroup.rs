@@ -98,7 +98,8 @@ pub struct WaitGroup {
 }
 
 // SAFETY: `state` is only accessed while `mu` is held; the `*mut G` waiters
-// are scheduler-owned and dereferenced only under RCU (see `add`).
+// are scheduler-owned and only ever passed to `goready` (which dereferences
+// the `G` descriptor, never the waiter's stack — see `add`).
 unsafe impl Send for WaitGroup {}
 unsafe impl Sync for WaitGroup {}
 

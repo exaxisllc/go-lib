@@ -133,7 +133,7 @@ thread_local! {
     /// `spawn_m`), the sysmon thread (via `start_sysmon`), and the
     /// `run_impl` calling thread (via `schedinit`).  Never set on bare OS
     /// threads that have no scheduler role.
-    static CURRENT_RT: Cell<*const Rt> = Cell::new(ptr::null());
+    static CURRENT_RT: Cell<*const Rt> = const { Cell::new(ptr::null()) };
 }
 
 /// The process-wide singleton scheduler.  Initialised by the first
@@ -911,7 +911,7 @@ fn pc_in_our_text(pc: usize) -> bool {
     if anchor == 0 {
         return true; // not yet initialised — fail-open
     }
-    let diff = if pc > anchor { pc - anchor } else { anchor - pc };
+    let diff = pc.abs_diff(anchor);
     diff < TEXT_RANGE_BYTES
 }
 
@@ -934,7 +934,7 @@ fn pc_in_scheduler_asm(pc: usize) -> bool {
 
     #[inline]
     fn near(pc: usize, fn_addr: usize) -> bool {
-        let diff = if pc > fn_addr { pc - fn_addr } else { fn_addr - pc };
+        let diff = pc.abs_diff(fn_addr);
         diff < ASM_FN_MAX_BYTES
     }
 
@@ -2063,16 +2063,16 @@ unsafe extern "system" fn windows_veh_handler(ep: *mut u8) -> i32 {
 /// * The `Box::leak`'d `Rt` and mmap'd g0 stack are process-lifetime allocations.
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn m_thread_exit() -> ! {
+    // Both `pthread_exit` and `ExitThread` are declared `-> !`, so the matching
+    // cfg block is the function's diverging tail — no fallback needed.
     #[cfg(not(windows))]
     unsafe {
-        libc::pthread_exit(core::ptr::null_mut());
+        libc::pthread_exit(core::ptr::null_mut())
     }
     #[cfg(windows)]
     unsafe {
-        m_thread_exit_sys::ExitThread(0);
+        m_thread_exit_sys::ExitThread(0)
     }
-    #[allow(unreachable_code)]
-    loop {}
 }
 
 #[cfg(windows)]
@@ -2152,10 +2152,10 @@ fn extract_panic_msg(payload: &(dyn Any + Send)) -> String {
         if let Some(s) = p.downcast_ref::<&str>() {
             return Some((*s).to_string());
         }
-        if depth < MAX_DEPTH {
-            if let Some(inner) = p.downcast_ref::<Box<dyn Any + Send + 'static>>() {
-                return recurse(inner.as_ref(), depth + 1);
-            }
+        if depth < MAX_DEPTH
+            && let Some(inner) = p.downcast_ref::<Box<dyn Any + Send + 'static>>()
+        {
+            return recurse(inner.as_ref(), depth + 1);
         }
         None
     }
@@ -2783,7 +2783,7 @@ where
     // share the same Ps and M-threads.  Goroutines are process-global and are
     // never force-reclaimed — `run()` returning only unblocks the caller (see
     // the Go-faithful semantics note after `park()` below).
-    let rt: &'static Rt = *GLOBAL_RT.get_or_init(|| schedinit(nprocs));
+    let rt: &'static Rt = GLOBAL_RT.get_or_init(|| schedinit(nprocs));
     set_current_rt(rt as *const Rt);
 
     // Drop guard: unparks the calling thread whether `f` returns or panics.
@@ -2840,7 +2840,6 @@ where
 #[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
-    use std::sync::atomic::Ordering;
 
     // ── Global run-queue round-trip ───────────────────────────────────────
 

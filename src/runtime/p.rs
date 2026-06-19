@@ -149,7 +149,7 @@ impl GlobalRunQueue {
 /// Ported from `p` in `runtime/runtime2.go`.
 pub(crate) struct P {
     // ── identity ──────────────────────────────────────────────────────────
-    #[allow(dead_code)] // printed in debug traces; wired when P logging lands
+    /// Used to shard timers across Ps (see `time::timer_shard`) and in traces.
     pub id:     i32,
 
     // ── status ────────────────────────────────────────────────────────────

@@ -71,7 +71,7 @@ No `async`, no Tokio, no executor. Every goroutine starts with a **32 KiB stack*
 | `GOMAXPROCS` env var + runtime adjustment | ✅ |
 | Goroutine panic handler (process does not abort) | ✅ |
 | Dynamic goroutine stack growth (32 KiB → 1 GiB) | ✅ v0.2.0 |
-| Async preemption via `SIGURG` | ✅ v0.2.0 |
+| Async preemption (`SIGURG` on Unix; `SuspendThread`+`SetThreadContext` on Windows x86-64) | ✅ v0.2.0 |
 | Netpoll — `epoll`/`kqueue`/IOCP I/O integration | ✅ v0.3.0 |
 | `net::TcpListener` / `net::TcpStream` | ✅ v0.2.0 |
 | `TcpStream`: `std::io::Read` + `std::io::Write` (`&mut` and `&`) | ✅ v0.5.0 |
@@ -1042,7 +1042,9 @@ go_lib::run(f)
     │                       install SIGSEGV + SIGURG handlers
     │                       start sysmon thread; start timer thread
     │
-    ├─ spawn_goroutine(f)   allocate 32 KiB stack + 128 B G; push to global run queue
+    ├─ spawn_goroutine(f)   reuse (or allocate) a 32 KiB stack + 128 B G from the
+    │                       gFree / size-classed stack pool; push to global run queue
+    │                       (descriptors are immortal — recycled, never freed)
     │
     └─ thread::park()       calling thread sleeps until f() returns
 
@@ -1085,10 +1087,15 @@ Stack growth (Step 3):
 Async preemption (Step 4):
     sysmon: goroutine running > 10 ms
       gp.preempt = true; gp.stackguard0 = STACK_PREEMPT
-      pthread_kill(m.pthread_id, SIGURG)   → sigurg_handler
-    sigurg_handler
-      redirect_to_async_preempt(gp, ucontext)
+      Unix:    pthread_kill(m.pthread_id, SIGURG)        → sigurg_handler
+      Windows: preempt_m_windows(m) on the sysmon thread → SuspendThread +
+               GetThreadContext + SetThreadContext + ResumeThread (x86-64 only;
+               no POSIX signals) — injects the same redirect into the target's
+               CONTEXT directly
+    sigurg_handler / preempt_m_windows
+      redirect_to_async_preempt(gp, context)
         write original RIP → [RSP-8]; RSP -= 8; RIP = async_preempt_trampoline
+        (Win64 variant reserves +32 B shadow space for the injected call)
     async_preempt_trampoline (naked asm, 392 B frame)
       pushfq  (save RFLAGS — required to round-trip condition flags across preemption)
       push all 15 GPRs + save 16 XMM regs → goroutine stack
@@ -1124,7 +1131,7 @@ Netpoll (Step 5):
 | `runtime::netpoll` | `runtime/netpoll_epoll.go`, `runtime/netpoll_kqueue.go`, `runtime/netpoll_windows.go` | epoll (Linux) / kqueue (macOS) / IOCP (Windows) |
 | `runtime::sudog` | `runtime/runtime2.go` | Sudog waiter records + per-P pool |
 | `runtime::syscall` | `runtime/proc.go` | entersyscall, exitsyscall, handoffp |
-| `runtime::sysmon` | `runtime/proc.go` | sysmon, retake, async preemption via `pthread_kill(SIGURG)` |
+| `runtime::sysmon` | `runtime/proc.go` | sysmon, retake, async preemption via `pthread_kill(SIGURG)` (Unix) / `preempt_m_windows` (Windows x86-64) |
 | `runtime::time` | `runtime/time.go` | 4-ary min-heap timer, goroutine_sleep |
 | `runtime::asm_amd64` | `runtime/asm_amd64.s`, `runtime/preempt_amd64.s` | gogo, mcall, systemstack, async_preempt_trampoline (AMD64) |
 | `runtime::asm_arm64` | `runtime/asm_arm64.s`, `runtime/preempt_arm64.s` | gogo, mcall, systemstack, async_preempt_trampoline (AArch64) |

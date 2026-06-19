@@ -81,8 +81,7 @@ pub(crate) fn gopark(reason: WaitReason) {
 /// waker can reach the sudog before the park is committed.
 ///
 /// `unlock_fn(unlock_arg)` is invoked exactly once, on g0's stack, after the
-/// status transition (or after the parking G is reaped by a dead-invocation
-/// drain — the lock must be released in that path too).
+/// status transition to `GWAITING`.
 ///
 /// # Contract: m.locks transfer
 ///
