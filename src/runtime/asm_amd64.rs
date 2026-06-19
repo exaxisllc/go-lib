@@ -551,9 +551,10 @@ pub(crate) unsafe fn systemstack<F: FnOnce()>(f: F) {
 
 /// Trampoline injected by the SIGURG handler to preempt a running goroutine.
 ///
-/// Windows has no POSIX signal mechanism so this trampoline is not compiled
-/// there.  Async preemption is a no-op on Windows; goroutines yield only
-/// cooperatively via `gosched` / channel operations.
+/// This is the Unix (System V) body.  Windows has no POSIX signals, so there
+/// the equivalent trampoline is injected via `SuspendThread` + `SetThreadContext`
+/// (`preempt_m_windows` in `sched.rs`) and the body differs only in its call-site
+/// shadow space — see the `#[cfg(windows)]` sibling at the end of this file.
 #[cfg(not(windows))]
 ///
 /// The SIGURG handler redirects the goroutine's `RIP` to this function and
@@ -738,6 +739,131 @@ pub(crate) unsafe extern "C" fn async_preempt_trampoline() {
         // that this trampoline's 392-byte frame cannot clobber the System V
         // red zone of an interrupted leaf function).  After the pop + add,
         // RSP is exactly the interrupted RSP.
+        "ret 128",
+
+        ap2 = sym crate::runtime::sched::async_preempt2,
+    )
+}
+
+/// Win64 variant of [`async_preempt_trampoline`] (non-Windows version above).
+///
+/// `preempt_m_windows` (in `sched.rs`) injects a call to this function by
+/// editing the suspended thread's `CONTEXT`: it stores the resume `RIP` at
+/// `rsp − 128 − 8` and points `RIP` here — exactly the same scheme as the Unix
+/// `redirect_to_async_preempt` amd64 branch, so the entry invariant
+/// (`[RSP]` = resume PC, `RSP % 16 == 8`) and the closing `ret 128` are
+/// identical to the Unix body.  Win64 has no red zone, so skipping 128 bytes is
+/// merely harmless slack that keeps the trampoline byte-identical to the Unix
+/// one apart from the one delta below.
+///
+/// **The only difference from the Unix body** is the call site: the Win64 ABI
+/// requires the caller to reserve **32 bytes of shadow space** above the return
+/// address for the callee to spill its register parameters into.  The Unix body
+/// reserves none (System V has no shadow space); doing the same here would let
+/// `async_preempt2`'s prologue write through the shadow region and clobber the
+/// saved frame-base (`push rax`).  We therefore allocate `8 + 32 = 40` bytes
+/// (8 to restore call-site alignment, 32 shadow) instead of 8.
+///
+/// Like the Unix version this over-saves every register Win64 marks
+/// callee-saved (RBX/RBP/RSI/RDI/R12–R15, XMM6–15) plus all caller-saved ones,
+/// which is exactly what an arbitrary interrupted point requires.
+#[unsafe(naked)]
+#[cfg(windows)]
+pub(crate) unsafe extern "C" fn async_preempt_trampoline() {
+    core::arch::naked_asm!(
+        // ── save RFLAGS first (see Unix body for the full rationale) ─────────
+        "pushfq",                    // RSP % 16 == 0
+
+        // ── save all 15 GPRs (120 B) ─────────────────────────────────────────
+        "push rbp",
+        "push r15",
+        "push r14",
+        "push r13",
+        "push r12",
+        "push r11",
+        "push r10",
+        "push r9",
+        "push r8",
+        "push rdi",
+        "push rsi",
+        "push rdx",
+        "push rcx",
+        "push rbx",
+        "push rax",                  // RSP % 16 == 8
+
+        // ── allocate + save XMM0–15 (264 B: 256 data + 8 pad) ─────────────────
+        "sub rsp, 264",              // RSP % 16 == 0
+        "movdqu [rsp + 0],   xmm0",
+        "movdqu [rsp + 16],  xmm1",
+        "movdqu [rsp + 32],  xmm2",
+        "movdqu [rsp + 48],  xmm3",
+        "movdqu [rsp + 64],  xmm4",
+        "movdqu [rsp + 80],  xmm5",
+        "movdqu [rsp + 96],  xmm6",
+        "movdqu [rsp + 112], xmm7",
+        "movdqu [rsp + 128], xmm8",
+        "movdqu [rsp + 144], xmm9",
+        "movdqu [rsp + 160], xmm10",
+        "movdqu [rsp + 176], xmm11",
+        "movdqu [rsp + 192], xmm12",
+        "movdqu [rsp + 208], xmm13",
+        "movdqu [rsp + 224], xmm14",
+        "movdqu [rsp + 240], xmm15",
+
+        // ── call async_preempt2 with Win64 shadow space ──────────────────────
+        // Dynamically align (the interrupted RSP parity is unknown) and stash
+        // the pre-alignment RSP in STACK memory so copystack can relocate it —
+        // see the Unix body.  The sole delta is `sub rsp, 40` (8 realign + 32
+        // shadow) in place of the Unix `sub rsp, 8`.
+        "mov rax, rsp",              // rax = frame base (user RAX already saved)
+        "and rsp, -16",              // RSP % 16 == 0
+        "push rax",                  // save frame base (RSP % 16 == 8)
+        "sub rsp, 40",               // 8 realign + 32 shadow → RSP % 16 == 0
+        "call {ap2}",
+        "add rsp, 40",
+        "pop rax",                   // frame base back (adjusted by copystack)
+        "mov rsp, rax",              // undo alignment
+
+        // ── restore XMM0–15 ──────────────────────────────────────────────────
+        "movdqu xmm0,  [rsp + 0]",
+        "movdqu xmm1,  [rsp + 16]",
+        "movdqu xmm2,  [rsp + 32]",
+        "movdqu xmm3,  [rsp + 48]",
+        "movdqu xmm4,  [rsp + 64]",
+        "movdqu xmm5,  [rsp + 80]",
+        "movdqu xmm6,  [rsp + 96]",
+        "movdqu xmm7,  [rsp + 112]",
+        "movdqu xmm8,  [rsp + 128]",
+        "movdqu xmm9,  [rsp + 144]",
+        "movdqu xmm10, [rsp + 160]",
+        "movdqu xmm11, [rsp + 176]",
+        "movdqu xmm12, [rsp + 192]",
+        "movdqu xmm13, [rsp + 208]",
+        "movdqu xmm14, [rsp + 224]",
+        "movdqu xmm15, [rsp + 240]",
+        "add rsp, 264",
+
+        // ── restore GPRs ─────────────────────────────────────────────────────
+        "pop rax",
+        "pop rbx",
+        "pop rcx",
+        "pop rdx",
+        "pop rsi",
+        "pop rdi",
+        "pop r8",
+        "pop r9",
+        "pop r10",
+        "pop r11",
+        "pop r12",
+        "pop r13",
+        "pop r14",
+        "pop r15",
+        "pop rbp",
+
+        // ── restore RFLAGS, then return to the interrupted PC ────────────────
+        "popfq",
+        // `ret 128` pops the resume PC and undoes the 128-byte skip applied by
+        // preempt_m_windows — identical to the Unix body.
         "ret 128",
 
         ap2 = sym crate::runtime::sched::async_preempt2,

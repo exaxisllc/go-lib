@@ -330,33 +330,46 @@ unsafe fn preempt_mark_and_signal(pp: *mut super::p::P) {
     if gp.is_null() {
         return;
     }
-    let pthread_id = unsafe { (*mp).pthread_id };
-    if pthread_id == 0 {
-        // M::start() has not run yet — no OS thread to signal.
-        return;
+
+    // Unix: an OS thread that has not run `M::start` yet has no `pthread_id` to
+    // signal, so bail.  On Windows the equivalent check (a captured
+    // `thread_handle`) lives inside `preempt_m_windows`, so don't gate on
+    // `pthread_id` there — it stays `0` on Windows.
+    #[cfg(not(windows))]
+    {
+        if unsafe { (*mp).pthread_id } == 0 {
+            return;
+        }
     }
 
-    // Mark the goroutine for preemption.  The SIGURG handler reads this flag.
+    // Mark the goroutine for preemption.  The SIGURG handler (Unix) /
+    // `windows_should_preempt` both read this flag.
     unsafe {
         (*gp).preempt     = true;
         (*gp).stackguard0 = STACK_PREEMPT;
     }
 
-    // Unix only: send SIGURG to the M's OS thread.  Windows has no pthread_kill;
-    // the preempt flag is set above and the goroutine will yield cooperatively.
+    // Unix: send SIGURG to the M's OS thread; the handler redirects the
+    // goroutine to `async_preempt_trampoline`.
     //
-    // Linux/aarch64 is ALSO cooperative-only: the async-preempt trampoline's
-    // final branch needs a scratch register the interrupted code can afford
-    // to lose, and we use x18 — reserved (never register-allocated) on
+    // Linux/aarch64 is cooperative-only: the async-preempt trampoline's final
+    // branch needs a scratch register the interrupted code can afford to lose,
+    // and we use x18 — reserved (never register-allocated) on
     // Darwin/Windows/Android/Fuchsia, but allocatable on
     // aarch64-unknown-linux-gnu, where an interrupt with live x18 would be
     // silently corrupted.  Re-enable once builds can require
     // `-Ctarget-feature=+reserve-x18` (or a REGTMP-style scheme exists).
     // See `async_preempt_trampoline` in asm_arm64.rs.
     #[cfg(all(not(windows), not(all(target_os = "linux", target_arch = "aarch64"))))]
-    unsafe { libc::pthread_kill(pthread_id as libc::pthread_t, libc::SIGURG) };
-    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-    let _ = pthread_id;
+    unsafe {
+        libc::pthread_kill((*mp).pthread_id as libc::pthread_t, libc::SIGURG)
+    };
+
+    // Windows: suspend the M's OS thread and inject a call to the trampoline via
+    // SetThreadContext (no POSIX signals).  x86_64 only — aarch64-windows is
+    // not a supported async-preempt target.
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    unsafe { crate::runtime::sched::preempt_m_windows(mp) };
 }
 
 // ---------------------------------------------------------------------------

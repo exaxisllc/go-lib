@@ -20,15 +20,22 @@
 //! belt-and-suspenders complement to the reactive SIGSEGV/SIGBUS handler in
 //! `stack.rs`.
 //!
-//! ### Async preemption (SIGURG)
-//! `schedinit` installs a `SIGURG` handler via [`install_sigurg_handler`].
+//! ### Async preemption
 //! When `sysmon` detects that a goroutine has run for more than 10 ms it sets
-//! `gp.preempt = true` then calls `pthread_kill(m.pthread_id, SIGURG)`.  The
-//! signal handler ([`sigurg_handler`]) calls [`redirect_to_async_preempt`],
-//! which pushes the goroutine's original PC onto its own stack and sets PC to
-//! `async_preempt_trampoline`.  The trampoline (in `asm_amd64.rs` /
-//! `asm_arm64.rs`) saves all live registers, calls [`async_preempt2`], and
-//! restores them on resume — a transparent non-cooperative yield.
+//! `gp.preempt = true` and forces the goroutine into `async_preempt_trampoline`.
+//! How that redirect is delivered is platform-specific:
+//! * **Unix:** `schedinit` installs a `SIGURG` handler via
+//!   [`install_sigurg_handler`]; `sysmon` calls `pthread_kill(m.pthread_id,
+//!   SIGURG)`; the handler ([`sigurg_handler`]) runs *on the target thread* and
+//!   calls [`redirect_to_async_preempt`] to push the resume PC and set PC to the
+//!   trampoline.
+//! * **Windows:** no POSIX signals — `sysmon` calls `preempt_m_windows`, which
+//!   runs *on the sysmon thread*, `SuspendThread`s the target, reads its
+//!   `CONTEXT`, and injects the same redirect via `SetThreadContext`.
+//!
+//! Either way the trampoline (in `asm_amd64.rs` / `asm_arm64.rs`) saves all live
+//! registers, calls [`async_preempt2`], and restores them on resume — a
+//! transparent non-cooperative yield.
 //!
 //! ### Netpoll integration (`findrunnable`)
 //! After the three work-stealing steps, `findrunnable` calls
@@ -58,11 +65,10 @@ use super::stack::{install_sigsegv_handler, try_grow_stack_from_signal};
 use super::sysmon::start_sysmon;
 use super::time::start_timer_thread;
 
-// On Windows: no signal-based async preemption → don't import the trampoline.
-#[cfg(all(target_arch = "x86_64", not(windows)))]
+// x86_64 (Unix or Windows): the async-preempt trampoline is injected via SIGURG
+// on Unix and via SuspendThread/SetThreadContext on Windows (preempt_m_windows).
+#[cfg(target_arch = "x86_64")]
 use super::asm_amd64::{async_preempt_trampoline, gogo, mcall};
-#[cfg(all(target_arch = "x86_64", windows))]
-use super::asm_amd64::{gogo, mcall};
 #[cfg(target_arch = "aarch64")]
 use super::asm_arm64::{async_preempt_trampoline, gogo, mcall};
 
@@ -759,7 +765,8 @@ static PREV_SIGURG: Mutex<Option<libc::sigaction>> = Mutex::new(None);
 /// 4096 covers all of that with margin while still being well under the
 /// smallest stack we ever run on (16 KiB Linux debug).  The equivalent of
 /// Go's `asyncPreemptStack` used by `isAsyncSafePoint`.
-#[cfg(not(windows))]
+// Compiled on Unix (SIGURG handler) and Windows x86_64 (preempt_m_windows).
+#[cfg(any(not(windows), target_arch = "x86_64"))]
 const ASYNC_PREEMPT_HEADROOM: usize = 4096;
 
 /// Install the runtime's SIGURG handler for async goroutine preemption.
@@ -879,12 +886,13 @@ fn ucontext_pc(ctx: *mut libc::c_void) -> usize {
 ///
 /// 256 MiB is far larger than any plausible Rust binary's TEXT and far
 /// smaller than the gap to system-library VM space.
-#[cfg(not(windows))]
+#[cfg(any(not(windows), target_arch = "x86_64"))]
 const TEXT_RANGE_BYTES: usize = 256 * 1024 * 1024;
 
 /// One-time capture of a known address in our binary's TEXT segment.
-/// Initialised by `install_sigurg_handler` to `goroutine_entry as usize`.
-#[cfg(not(windows))]
+/// Initialised by `install_sigurg_handler` (Unix) or `install_windows_veh`
+/// (Windows) to `goroutine_entry as usize`.
+#[cfg(any(not(windows), target_arch = "x86_64"))]
 static OUR_TEXT_ANCHOR: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
@@ -896,7 +904,7 @@ static OUR_TEXT_ANCHOR: std::sync::atomic::AtomicUsize =
 /// all of the main executable's code (Rust std, our crate, the test
 /// harness) contiguously, while macOS's dyld shared cache places system
 /// libraries hundreds of GiB away.
-#[cfg(not(windows))]
+#[cfg(any(not(windows), target_arch = "x86_64"))]
 #[inline]
 fn pc_in_our_text(pc: usize) -> bool {
     let anchor = OUR_TEXT_ANCHOR.load(std::sync::atomic::Ordering::Relaxed);
@@ -918,7 +926,7 @@ fn pc_in_our_text(pc: usize) -> bool {
 ///
 /// The heuristic is the same as `pc_in_our_text`: assume each function is at
 /// most 4 KiB (these are short asm fns) and check `|pc − fn_start| < 4096`.
-#[cfg(not(windows))]
+#[cfg(any(not(windows), target_arch = "x86_64"))]
 #[inline]
 fn pc_in_scheduler_asm(pc: usize) -> bool {
     /// Maximum reasonable size of a scheduler asm trampoline (bytes).
@@ -1532,6 +1540,148 @@ unsafe extern "C" fn sigbus_handler(
 }
 
 // ---------------------------------------------------------------------------
+// Windows async preemption — SuspendThread + SetThreadContext injection
+// ---------------------------------------------------------------------------
+
+/// kernel32 imports for Windows async preemption.
+#[cfg(all(windows, target_arch = "x86_64"))]
+mod win_suspend_sys {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        /// Suspend a thread; returns its previous suspend count (`u32::MAX` on
+        /// error).  Suspension is asynchronous but `GetThreadContext` below
+        /// forces it to complete.
+        pub fn SuspendThread(hThread: *mut u8) -> u32;
+        /// Resume a previously suspended thread.
+        pub fn ResumeThread(hThread: *mut u8) -> u32;
+        /// Read the (suspended) thread's CPU context.  `lpContext.ContextFlags`
+        /// selects which register groups are returned.
+        pub fn GetThreadContext(hThread: *mut u8, lpContext: *mut u8) -> i32;
+        /// Write back the (suspended) thread's CPU context.
+        pub fn SetThreadContext(hThread: *mut u8, lpContext: *const u8) -> i32;
+    }
+}
+
+/// 16-byte-aligned backing store for an x64 `CONTEXT` (sizeof ≈ 1232 B; padded
+/// generously).  `GetThreadContext`/`SetThreadContext` require 16-byte
+/// alignment because the CONTEXT embeds the XMM save area.
+#[cfg(all(windows, target_arch = "x86_64"))]
+#[repr(C, align(16))]
+struct CtxBuf([u8; 1280]);
+
+/// Apply the same async-safe-point guard ladder as `sigurg_handler`, but against
+/// the suspended M's `mp`/`gp` directly (the sysmon thread has no TLS view of
+/// the target).  Returns `true` only when it is safe to inject the preempt call.
+///
+/// `rip`/`rsp` are the suspended thread's interrupted PC/SP read from its
+/// `CONTEXT`.  See `sigurg_handler` for the full rationale behind each guard.
+#[cfg(all(windows, target_arch = "x86_64"))]
+unsafe fn windows_should_preempt(mp: *mut M, rip: usize, rsp: usize) -> bool {
+    let gp = unsafe { (*mp).curg };
+    if gp.is_null() || !unsafe { (*gp).preempt } {
+        return false; // no goroutine, or not marked for preemption
+    }
+    // Guard 0: M must not hold a scheduler-internal lock (else preemptm's
+    // push_batch self-deadlocks re-acquiring the same Mutex).
+    if unsafe { (*mp).locks.load(Relaxed) } > 0 {
+        return false;
+    }
+    // Guard 0.5: interrupted PC must be in our own TEXT (not a system DLL whose
+    // non-reentrant lock another goroutine could then deadlock on).
+    if !pc_in_our_text(rip) {
+        return false;
+    }
+    // Guard 1: goroutine must be GRUNNING.
+    if unsafe { readgstatus(gp) } != GRUNNING {
+        return false;
+    }
+    // Guard 2: interrupted SP must be within the goroutine's own stack (not on
+    // g0 mid mcall_asm SP-switch).
+    let (lo, hi) = unsafe { ((*gp).stack.lo, (*gp).stack.hi) };
+    if rsp < lo || rsp > hi {
+        return false;
+    }
+    // Guard 2.5: enough headroom below SP for the whole preempt machinery.
+    if rsp < lo + ASYNC_PREEMPT_HEADROOM {
+        return false;
+    }
+    // Guard 2.6: SP must be 8-byte aligned (we push a usize at rsp − 136).
+    if rsp & 7 != 0 {
+        return false;
+    }
+    // Guard 3: PC must not be inside a scheduler asm trampoline.
+    if pc_in_scheduler_asm(rip) {
+        return false;
+    }
+    true
+}
+
+/// Windows analogue of delivering `SIGURG`: asynchronously preempt the goroutine
+/// running on `mp` by suspending its OS thread and rewriting its `CONTEXT` to
+/// call [`async_preempt_trampoline`].
+///
+/// Runs on the **sysmon thread** (never on `mp`'s thread), so — unlike the Unix
+/// signal handler, which executes on the target thread itself — it cannot read
+/// the target's thread-locals and instead drives everything off `mp`.
+///
+/// Injection mirrors `redirect_to_async_preempt`'s amd64 branch: store the
+/// resume `RIP` at `rsp − 128 − 8` (the trampoline's `ret 128` undoes the skip)
+/// and point `RIP` at the trampoline.  When the resumed thread reaches the
+/// trampoline it saves all registers, `mcall`s into `preemptm`, and on
+/// reschedule restores and returns to the original `RIP`.
+///
+/// Ported from `preemptM` in `runtime/os_windows.go`.  We omit Go's
+/// `preemptExtLock` (no cgo / external callbacks here).
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub(crate) unsafe fn preempt_m_windows(mp: *mut M) {
+    let h = unsafe { (*mp).thread_handle } as *mut u8;
+    if h.is_null() {
+        return; // M::start has not captured a handle yet
+    }
+
+    // x64 CONTEXT constants / field offsets (WinNT.h — stable; the same Rsp/Rip
+    // offsets the VEH handler relies on).
+    const CONTEXT_AMD64:   u32 = 0x0010_0000;
+    const CONTEXT_CONTROL: u32 = CONTEXT_AMD64 | 0x1; // Rsp, Rbp, Rip, EFlags, Seg*
+    const OFF_FLAGS: usize = 48;
+    const OFF_RSP:   usize = 152;
+    const OFF_RIP:   usize = 248;
+
+    let mut buf = CtxBuf([0u8; 1280]);
+    let base = buf.0.as_mut_ptr();
+    unsafe { (base.add(OFF_FLAGS) as *mut u32).write(CONTEXT_CONTROL) };
+
+    unsafe { win_suspend_sys::SuspendThread(h) };
+
+    // GetThreadContext forces the (async) suspend to complete and returns the
+    // interrupted register state.  On failure, just resume and let sysmon retry.
+    if unsafe { win_suspend_sys::GetThreadContext(h, base) } == 0 {
+        unsafe { win_suspend_sys::ResumeThread(h) };
+        return;
+    }
+
+    let rsp = unsafe { (base.add(OFF_RSP) as *const u64).read() } as usize;
+    let rip = unsafe { (base.add(OFF_RIP) as *const u64).read() } as usize;
+
+    if unsafe { windows_should_preempt(mp, rip, rsp) } {
+        // Inject the call by editing the suspended thread's stack + CONTEXT.
+        // Writing `*new_rsp = rip` touches the *target* thread's stack, which is
+        // safe: same address space, the thread is suspended, and Guard 2.5
+        // guarantees new_rsp is clear of the guard page.
+        let new_rsp = rsp - 128 - 8;
+        unsafe {
+            (new_rsp as *mut usize).write(rip);
+            (base.add(OFF_RSP) as *mut u64).write(new_rsp as u64);
+            (base.add(OFF_RIP) as *mut u64)
+                .write(async_preempt_trampoline as *const () as u64);
+            win_suspend_sys::SetThreadContext(h, base);
+        }
+    }
+
+    unsafe { win_suspend_sys::ResumeThread(h) };
+}
+
+// ---------------------------------------------------------------------------
 // Windows VEH — vectored exception handler for STATUS_ACCESS_VIOLATION
 // ---------------------------------------------------------------------------
 
@@ -1686,6 +1836,12 @@ unsafe fn veh_write_hex(h: *mut u8, val: u64) {
 /// Call once during `schedinit`.
 #[cfg(windows)]
 pub(crate) fn install_windows_veh() {
+    // Capture a TEXT anchor so `pc_in_our_text` (used by the async-preempt
+    // guards) can tell our own code from system DLLs.  Mirrors the Unix
+    // `install_sigurg_handler`.  x86_64 only — the guard helpers are gated to it.
+    #[cfg(target_arch = "x86_64")]
+    OUR_TEXT_ANCHOR.store(goroutine_entry as *const () as usize, Relaxed);
+
     unsafe {
         win_veh_sys::AddVectoredExceptionHandler(1, windows_veh_handler);
 
