@@ -169,6 +169,41 @@ unsafe fn park_on_fd(fd: RawFd, mode: u32) {
 }
 
 // ---------------------------------------------------------------------------
+// Address resolution
+// ---------------------------------------------------------------------------
+
+/// Resolve `addr` to its first concrete [`SocketAddr`], running the lookup on a
+/// dedicated OS thread.
+///
+/// [`ToSocketAddrs::to_socket_addrs`] may invoke the platform resolver
+/// (`getaddrinfo`), which can consume tens of kilobytes of stack — far more
+/// than a goroutine's small fixed stack (32 KiB in release builds; see
+/// [`crate::runtime::stack`]).  go-lib has no compiler-inserted `morestack`
+/// checks, so a stack-hungry C function whose prologue jumps past the guard
+/// page in a single `sub rsp, N` faults in unmapped memory and the SIGSEGV
+/// handler cannot recover.  Resolving a hostname directly on a goroutine
+/// therefore crashes in release builds.
+///
+/// To avoid this we perform the resolution on a freshly spawned OS thread,
+/// which has a full-size (≈8 MiB) system stack that `getaddrinfo` cannot
+/// overflow.  The calling goroutine's M blocks in `join()` for the (usually
+/// brief) duration of the lookup, mirroring Go's use of a dedicated thread for
+/// blocking `cgo`/resolver calls.  A scoped thread is used so non-`'static`
+/// inputs (e.g. `&str`) can be borrowed without allocation.
+fn resolve_first_addr<A: ToSocketAddrs + Send>(addr: A) -> io::Result<SocketAddr> {
+    std::thread::scope(|scope| {
+        scope
+            .spawn(move || {
+                addr.to_socket_addrs()?.next().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "no address given")
+                })
+            })
+            .join()
+            .map_err(|_| io::Error::other("address resolution thread panicked"))?
+    })
+}
+
+// ---------------------------------------------------------------------------
 // TcpListener
 // ---------------------------------------------------------------------------
 
@@ -184,11 +219,8 @@ impl TcpListener {
     /// Bind a non-blocking TCP listener to `addr`.
     ///
     /// Equivalent to `net.Listen("tcp", addr)` in Go.
-    pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<Self> {
-        let addr = addr
-            .to_socket_addrs()?
-            .next()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no address given"))?;
+    pub fn bind<A: ToSocketAddrs + Send>(addr: A) -> io::Result<Self> {
+        let addr = resolve_first_addr(addr)?;
 
         let fd = nonblocking_tcp_socket(addr_family(addr))?;
         set_reuseaddr(fd)?;
@@ -278,11 +310,8 @@ impl TcpStream {
     /// complete immediately (which is typical for non-blocking `connect`).
     ///
     /// Equivalent to `net.Dial("tcp", addr)` in Go.
-    pub fn connect<A: ToSocketAddrs>(addr: A) -> io::Result<Self> {
-        let addr = addr
-            .to_socket_addrs()?
-            .next()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no address given"))?;
+    pub fn connect<A: ToSocketAddrs + Send>(addr: A) -> io::Result<Self> {
+        let addr = resolve_first_addr(addr)?;
 
         let fd = nonblocking_tcp_socket(addr_family(addr))?;
         let (sa, sa_len) = to_sockaddr(addr);
