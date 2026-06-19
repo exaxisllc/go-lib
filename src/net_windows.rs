@@ -40,6 +40,7 @@
 use std::ffi::c_void;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, ToSocketAddrs};
+use std::sync::OnceLock;
 
 use crate::runtime::g::WaitReason;
 use crate::runtime::netpoll::{netpoll_iocp_associate, IocpOp, WinOverlapped};
@@ -132,7 +133,6 @@ unsafe extern "system" {
     ) -> Socket;
     fn bind(s: Socket, name: *const c_void, namelen: i32) -> i32;
     fn listen(s: Socket, backlog: i32) -> i32;
-    fn accept(s: Socket, addr: *mut c_void, addrlen: *mut i32) -> Socket;
     fn connect(s: Socket, name: *const c_void, namelen: i32) -> i32;
     fn closesocket(s: Socket) -> i32;
     fn setsockopt(
@@ -160,6 +160,19 @@ unsafe extern "system" {
         dw_buffer_count: u32,
         lp_number_of_bytes_sent: *mut u32,
         dw_flags: u32,
+        lp_overlapped: *mut WinOverlapped,
+        lp_completion_routine: *mut c_void,
+    ) -> i32;
+    /// Used here only to fetch the `AcceptEx` extension function pointer via
+    /// `SIO_GET_EXTENSION_FUNCTION_POINTER`.
+    fn WSAIoctl(
+        s: Socket,
+        dw_io_control_code: u32,
+        lpvi_in_buffer: *mut c_void,
+        cb_in_buffer: u32,
+        lpv_out_buffer: *mut c_void,
+        cb_out_buffer: u32,
+        lpcb_bytes_returned: *mut u32,
         lp_overlapped: *mut WinOverlapped,
         lp_completion_routine: *mut c_void,
     ) -> i32;
@@ -269,6 +282,168 @@ fn wsa_last_error() -> io::Error {
 fn ntstatus_to_error(ntstatus: u32) -> io::Error {
     let win32 = unsafe { RtlNtStatusToDosError(ntstatus) };
     io::Error::from_raw_os_error(win32 as i32)
+}
+
+// ---------------------------------------------------------------------------
+// AcceptEx — overlapped accept so the goroutine parks (instead of blocking an
+// OS thread in the synchronous `accept`, which would exhaust the M pool when
+// many listeners are accepting at once).
+// ---------------------------------------------------------------------------
+
+/// `WSAIoctl` control code to fetch a Winsock extension function pointer.
+const SIO_GET_EXTENSION_FUNCTION_POINTER: u32 = 0xC800_0006;
+/// `setsockopt` option that makes an `AcceptEx`'d socket inherit the listener's
+/// properties (required before `getpeername`/`getsockname`/`recv` work on it).
+const SO_UPDATE_ACCEPT_CONTEXT: i32 = 0x700B;
+/// Address slot length passed to `AcceptEx`.  Must be at least 16 bytes larger
+/// than the largest `sockaddr` used (here `sockaddr_in6` = 28).  128 (our
+/// `SockAddrStorage`) is comfortably large enough for both IPv4 and IPv6.
+const ACCEPTEX_ADDR_LEN: u32 = 128;
+
+/// A Windows GUID (used to identify the `AcceptEx` extension function).
+#[repr(C)]
+struct Guid {
+    data1: u32,
+    data2: u16,
+    data3: u16,
+    data4: [u8; 8],
+}
+
+/// `WSAID_ACCEPTEX` = {b5367df1-cbac-11cf-95ca-00805f48a192}.
+const WSAID_ACCEPTEX: Guid = Guid {
+    data1: 0xb536_7df1,
+    data2: 0xcbac,
+    data3: 0x11cf,
+    data4: [0x95, 0xca, 0x00, 0x80, 0x5f, 0x48, 0xa1, 0x92],
+};
+
+/// Signature of the `AcceptEx` extension function.
+type AcceptExFn = unsafe extern "system" fn(
+    s_listen_socket: Socket,
+    s_accept_socket: Socket,
+    lp_output_buffer: *mut c_void,
+    dw_receive_data_length: u32,
+    dw_local_address_length: u32,
+    dw_remote_address_length: u32,
+    lpdw_bytes_received: *mut u32,
+    lp_overlapped: *mut WinOverlapped,
+) -> i32;
+
+/// Fetch (once, process-wide) the `AcceptEx` function pointer.  It is exported
+/// only via `WSAIoctl`, not as a normal symbol, so it must be loaded at runtime
+/// using any valid socket `s`.
+fn load_acceptex(s: Socket) -> io::Result<AcceptExFn> {
+    static ACCEPTEX: OnceLock<usize> = OnceLock::new();
+    if let Some(&p) = ACCEPTEX.get() {
+        return Ok(unsafe { std::mem::transmute::<usize, AcceptExFn>(p) });
+    }
+
+    let mut func_ptr: usize = 0;
+    let mut bytes: u32 = 0;
+    let rc = unsafe {
+        WSAIoctl(
+            s,
+            SIO_GET_EXTENSION_FUNCTION_POINTER,
+            &WSAID_ACCEPTEX as *const Guid as *mut c_void,
+            std::mem::size_of::<Guid>() as u32,
+            &mut func_ptr as *mut usize as *mut c_void,
+            std::mem::size_of::<usize>() as u32,
+            &mut bytes,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if rc == SOCKET_ERROR || func_ptr == 0 {
+        return Err(wsa_last_error());
+    }
+    // First writer wins; all callers get the same pointer.
+    let stored = *ACCEPTEX.get_or_init(|| func_ptr);
+    Ok(unsafe { std::mem::transmute::<usize, AcceptExFn>(stored) })
+}
+
+/// Issue an overlapped `AcceptEx` on `listener`, park the goroutine until the
+/// completion fires, and return the accepted socket.
+///
+/// `family` is the listener's address family (`AF_INET`/`AF_INET6`), used to
+/// pre-create the accept socket that `AcceptEx` requires.
+///
+/// # Safety
+/// Must be called from a live goroutine context.  `listener` must already be
+/// associated with the process IOCP (done in `TcpListener::bind`).
+unsafe fn overlapped_accept(listener: Socket, family: i32) -> io::Result<Socket> {
+    let gp = crate::runtime::g::current_g();
+    debug_assert!(!gp.is_null(), "overlapped_accept: not running on a goroutine");
+
+    let accept_ex = load_acceptex(listener)?;
+
+    // AcceptEx needs a pre-created socket to accept into.
+    let accepted = create_overlapped_socket(family)?;
+
+    // Per-operation state + address output buffer, both heap-pinned across the
+    // park.  AcceptEx writes the local+remote addresses into `addr_buf`.
+    let mut op: Box<IocpOp> = Box::new(unsafe { std::mem::zeroed() });
+    op.gp = gp;
+    let op_ptr = Box::into_raw(op);
+    let addr_buf: Box<[u8; (ACCEPTEX_ADDR_LEN as usize) * 2]> =
+        Box::new([0u8; (ACCEPTEX_ADDR_LEN as usize) * 2]);
+    let addr_buf_ptr = Box::into_raw(addr_buf);
+
+    let mut received: u32 = 0;
+    let ok = unsafe {
+        accept_ex(
+            listener,
+            accepted,
+            addr_buf_ptr as *mut c_void,
+            0, // dwReceiveDataLength = 0: don't wait for the first data packet
+            ACCEPTEX_ADDR_LEN,
+            ACCEPTEX_ADDR_LEN,
+            &mut received,
+            &mut (*op_ptr).overlapped,
+        )
+    };
+
+    // AcceptEx returns FALSE + WSA_IO_PENDING for the normal async path.  Any
+    // other failure means no completion will be queued — clean up now.
+    if ok == 0 {
+        let err = unsafe { WSAGetLastError() };
+        if err != WSA_IO_PENDING {
+            drop(unsafe { Box::from_raw(op_ptr) });
+            drop(unsafe { Box::from_raw(addr_buf_ptr) });
+            unsafe { closesocket(accepted) };
+            return Err(io::Error::from_raw_os_error(err));
+        }
+    }
+
+    // Either it completed synchronously (ok != 0) or is pending; in both cases
+    // an IOCP completion is queued because the listener is IOCP-associated, so
+    // we always park and resume from the completion.
+    gopark(WaitReason::IOWait);
+
+    let op = unsafe { Box::from_raw(op_ptr) };
+    drop(unsafe { Box::from_raw(addr_buf_ptr) });
+    if op.ntstatus != 0 {
+        unsafe { closesocket(accepted) };
+        return Err(ntstatus_to_error(op.ntstatus));
+    }
+
+    // Required after AcceptEx so the socket behaves like one from accept():
+    // SO_UPDATE_ACCEPT_CONTEXT copies the listener's context onto it.
+    let rc = unsafe {
+        setsockopt(
+            accepted,
+            SOL_SOCKET,
+            SO_UPDATE_ACCEPT_CONTEXT,
+            &listener as *const Socket as *const c_void,
+            std::mem::size_of::<Socket>() as i32,
+        )
+    };
+    if rc == SOCKET_ERROR {
+        let e = wsa_last_error();
+        unsafe { closesocket(accepted) };
+        return Err(e);
+    }
+
+    Ok(accepted)
 }
 
 // ---------------------------------------------------------------------------
@@ -430,30 +605,37 @@ impl TcpListener {
             return Err(wsa_last_error());
         }
 
+        // Associate the listener with the IOCP so overlapped `AcceptEx`
+        // completions (issued in `accept`) are delivered to the poller.
+        if !netpoll_iocp_associate(s) {
+            unsafe { closesocket(s) };
+            return Err(io::Error::other("failed to associate listener with IOCP"));
+        }
+
         Ok(TcpListener { socket: s })
     }
 
     /// Accept the next incoming connection.
     ///
-    /// Wraps the blocking Winsock `accept` in
-    /// [`with_syscall`][crate::with_syscall] so the scheduler can hand the P
-    /// off to another M while the OS thread waits.  The accepted socket is
-    /// then associated with the global IOCP for overlapped reads/writes.
+    /// Issues an overlapped `AcceptEx` and **parks the goroutine** until the
+    /// completion fires via IOCP — it does not block the OS thread.  This
+    /// matters because a server that holds a goroutine in `accept()` (the
+    /// common "accept loop" pattern) would otherwise pin an M for the lifetime
+    /// of the listener; with many concurrent listeners that exhausts the M
+    /// pool and starves the scheduler.  Parking mirrors the Unix netpoll path
+    /// and go-lib's own overlapped `recv`/`send`.  The accepted socket is then
+    /// associated with the global IOCP for its own overlapped reads/writes.
     pub fn accept(&self) -> io::Result<TcpStream> {
-        let listener = self.socket;
-        let accepted = crate::with_syscall(|| {
-            let s = unsafe { accept(listener, std::ptr::null_mut(), std::ptr::null_mut()) };
-            if s == INVALID_SOCKET {
-                Err(wsa_last_error())
-            } else {
-                Ok(s)
-            }
-        })?;
+        let family = match self.local_addr()? {
+            SocketAddr::V4(_) => AF_INET,
+            SocketAddr::V6(_) => AF_INET6,
+        };
+
+        let accepted = unsafe { overlapped_accept(self.socket, family)? };
 
         if !netpoll_iocp_associate(accepted) {
             unsafe { closesocket(accepted) };
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(io::Error::other(
                 "failed to associate accepted socket with IOCP",
             ));
         }

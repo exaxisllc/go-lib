@@ -25,6 +25,7 @@ use go_lib::{
     chan::chan,
     go,
     net::{TcpListener, TcpStream},
+    select,
     sync::WaitGroup,
 };
 
@@ -374,4 +375,142 @@ fn net_connect_hostname_does_not_overflow_stack() {
         result.is_err(),
         "connecting to an unresolvable hostname should return Err, not succeed",
     );
+}
+
+// ---------------------------------------------------------------------------
+// Accept must park, not pin an M: leaked forever-running select!-dispatch
+// servers (go-http's server model)
+//
+// Regression test for a Windows deadlock — accept() must park the goroutine
+// (overlapped AcceptEx) rather than block an OS thread.  Each server is an
+// accept goroutine feeding a `select!`-based dispatch loop that spawns a
+// per-connection goroutine (try_clone read/write split).  The servers run
+// *forever* and are never shut down — when the test body returns they leak,
+// leaving goroutines parked in accept()/select().  Several run concurrently,
+// mirroring go-http's middleware/server_client binaries.  If accept blocked an
+// M, the leaked accept goroutines would exhaust the M pool and the whole
+// scheduler would deadlock (only observed on Windows).  Must not deadlock.
+// ---------------------------------------------------------------------------
+#[test]
+#[go_lib::main]
+fn net_leaked_select_dispatch_servers() {
+    use std::time::Duration;
+    const N: usize = 8;
+
+    fn spawn_forever_server() -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr     = listener.local_addr().unwrap();
+
+        let (conn_tx, conn_rx) = chan::<TcpStream>(8);
+        // Accept goroutine — loops forever (never joined).
+        go!(move || {
+            while let Ok(s) = listener.accept() {
+                conn_tx.send(s);
+            }
+        });
+
+        // Dispatch loop with select! — also forever (never shut down).
+        let (_shutdown_tx, shutdown_rx) = chan::<()>(1);
+        let mut stop = false;
+        go!(move || loop {
+            select! {
+                recv(shutdown_rx) -> _sig => { stop = true; }
+                recv(conn_rx) -> conn => {
+                    match conn {
+                        None    => { stop = true; }
+                        Some(s) => {
+                            go!(move || {
+                                let mut w = s.try_clone().unwrap();
+                                let mut r = s.try_clone().unwrap();
+                                let mut buf = [0u8; 4];
+                                // byte-by-byte read, mirroring read_line/read_request
+                                for k in 0..4 {
+                                    r.read_exact(&mut buf[k..k + 1]).unwrap();
+                                }
+                                w.write_all(&buf).unwrap();
+                            });
+                        }
+                    }
+                }
+            }
+            if stop { break; }
+        });
+        addr
+    }
+
+    let addrs: Vec<_> = (0..N).map(|_| spawn_forever_server()).collect();
+    go_lib::sleep(Duration::from_millis(50)); // let listeners bind
+
+    let results   = Arc::new(Mutex::new(0usize));
+    let client_wg = Arc::new(WaitGroup::new());
+    for (i, addr) in addrs.into_iter().enumerate() {
+        client_wg.add(1);
+        let results2 = Arc::clone(&results);
+        let wg2      = Arc::clone(&client_wg);
+        go!(move || {
+            let client = TcpStream::connect(addr).unwrap();
+            let mut wc = client.try_clone().unwrap();
+            let mut rc = client.try_clone().unwrap();
+            let tag = [i as u8; 4];
+            wc.write_all(&tag).unwrap();
+            let mut resp = [0u8; 4];
+            rc.read_exact(&mut resp).unwrap();
+            if resp == tag { *results2.lock().unwrap() += 1; }
+            wg2.done();
+        });
+    }
+
+    client_wg.wait();
+    assert_eq!(*results.lock().unwrap(), N);
+    // Servers are intentionally left running (leaked), like go-http's tests.
+}
+
+// ---------------------------------------------------------------------------
+// Accept must park, not pin an M: minimal leaked forever-accept servers
+//
+// The minimal form of the regression above — no select!, no try_clone, no
+// channels.  Each server loops on accept() forever and is never joined; after
+// one client exchange the test returns, leaving the accept goroutines parked
+// on a pending overlapped AcceptEx.  Several concurrent leaked accept loops
+// must not exhaust the M pool / deadlock the scheduler.
+// ---------------------------------------------------------------------------
+#[test]
+#[go_lib::main]
+fn net_leaked_forever_accept() {
+    use std::time::Duration;
+    const N: usize = 8;
+
+    let mut addrs = Vec::new();
+    for _ in 0..N {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        addrs.push(listener.local_addr().unwrap());
+        // Forever-accepting server, never joined (leaked).
+        go!(move || {
+            while let Ok(conn) = listener.accept() {
+                go!(move || {
+                    let mut c = conn;
+                    let mut buf = [0u8; 4];
+                    if c.read(&mut buf).unwrap_or(0) > 0 {
+                        let _ = c.write(&buf);
+                    }
+                });
+            }
+        });
+    }
+    go_lib::sleep(Duration::from_millis(50));
+
+    let wg = Arc::new(WaitGroup::new());
+    for addr in addrs {
+        wg.add(1);
+        let wg2 = Arc::clone(&wg);
+        go!(move || {
+            let mut c = TcpStream::connect(addr).unwrap();
+            c.write_all(b"ping").unwrap();
+            let mut resp = [0u8; 4];
+            c.read_exact(&mut resp).unwrap();
+            wg2.done();
+        });
+    }
+    wg.wait();
+    // Accept goroutines intentionally leaked (still parked in accept()).
 }
