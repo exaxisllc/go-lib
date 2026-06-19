@@ -234,6 +234,16 @@ The culprit was stack size, not optimization. `TcpStream::connect` / `TcpListene
 
 **Fix:** resolution moved off the goroutine stack entirely. `resolve_first_addr` runs `to_socket_addrs` on a freshly spawned OS thread (full ≈8 MiB system stack) via `std::thread::scope`, mirroring Go's use of a dedicated thread for blocking `cgo`/resolver calls. The calling goroutine's M blocks in `join()` for the brief lookup. Regression test: `net_connect_hostname_does_not_overflow_stack` drives a `*.invalid` name (offline per RFC 6761) through `connect` and asserts a clean error instead of a crash.
 
+### The Windows Accept That Pinned a Thread
+
+Also surfaced by the go-http port: its server/client integration tests **hung** on Windows (10-minute CI timeout) while passing on macOS and Linux. The unit tests passed; the hang was in the goroutine-per-connection integration binaries, and it took the *whole* test binary down — even simple tests stalled — which pointed at a scheduler-wide deadlock rather than one bad test.
+
+Bisecting in go-lib's own `tests/net.rs` ruled the suspects out one by one (each validated on the Windows CI runner, since the failure never reproduced on macOS/Linux): single-connection `try_clone` splits passed, keep-alive re-clone loops passed, `try_clone` splits under concurrent load passed. The reproduction needed one specific shape: servers that run an **accept loop forever** and are never shut down — exactly go-http's `listen_and_serve`, whose accept goroutine is leaked when a test returns. A minimal probe (leaked forever-`accept()` goroutines, no `select!`, no `try_clone`) hung; the same servers bounded to N accepts did not.
+
+The culprit was the Windows `accept` itself. Unlike `recv`/`send`/`connect` — which issue overlapped `WSARecv`/`WSASend`/`ConnectEx` and **park** the goroutine via IOCP — `TcpListener::accept` wrapped the *synchronous* Winsock `accept()` in `with_syscall`, blocking the OS thread (M) for as long as the goroutine sat in accept. On Unix `accept` parks through the netpoll (epoll/kqueue) and costs no thread, so the leak was harmless there. On Windows each leaked accept loop pinned an M forever; with several concurrent listeners the M pool drained and the scheduler had no threads left to run anything — global deadlock.
+
+**Fix:** `accept` now issues an overlapped `AcceptEx` (loaded once via `WSAIoctl`/`SIO_GET_EXTENSION_FUNCTION_POINTER`) into a pre-created socket and `gopark`s until the IOCP completion fires, mirroring the overlapped `recv`/`send` path — so it consumes no M while waiting. The listener is associated with the IOCP in `bind`, and the accepted socket gets `SO_UPDATE_ACCEPT_CONTEXT`. Regression tests: `net_leaked_select_dispatch_servers` (the full go-http server model) and `net_leaked_forever_accept` (the minimal form).
+
 ### The Callee-Saved Register False Positive
 
 With async preemption working, the stress test at 75 000 workers surfaced a new crash pattern: `drop_in_place<Box<dyn Any>>` crashing because the vtable pointer was actually the bytes of an `i64` partial sum. The `Result<i64, Box<dyn Any>>` in a channel buffer had its discriminant flipped from 0 (Ok) to non-zero (Err).
