@@ -294,7 +294,7 @@ impl WaitQ {
         // really in, so splicing through them while operating on the wrong queue
         // corrupts that queue's head/tail and leaves a dangling `last` (see the
         // `Sudog.q` doc-comment).
-        if unsafe { (*sgp).q } != self as *mut WaitQ {
+        if !std::ptr::eq(unsafe { (*sgp).q }, self) {
             return false;
         }
 

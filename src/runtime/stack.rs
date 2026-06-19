@@ -21,9 +21,9 @@
 //!    a. Allocates a new stack double the current size (capped at 1 GiB).
 //!    b. Copies the live portion of the old stack to the new one.
 //!    c. Adjusts pointer-sized words in the new stack (conservative scan: full
-//!       range `[old_guard_lo, old_hi)` for RSP/RBP; guard-page-only range
-//!       `[old_guard_lo, old_lo)` for all other GPRs to avoid false-positive
-//!       adjustment of heap pointers that coincide with the old stack range).
+//!    range `[old_guard_lo, old_hi)` for RSP/RBP; guard-page-only range
+//!    `[old_guard_lo, old_lo)` for all other GPRs to avoid false-positive
+//!    adjustment of heap pointers that coincide with the old stack range).
 //!    d. Updates `G.stack`, `G.stackguard0`, and SP in `ucontext_t` (OS retries the instruction).
 //! 3. The SIGSEGV handler returns; the OS restores the updated register state;
 //!    the faulting instruction is re-executed and now succeeds.
